@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Document Parser</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 flex h-screen overflow-hidden">
+
+    <aside class="w-64 bg-gray-900 text-white flex flex-col">
+        <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">🤖 DocParser AI</div>
+        <nav class="flex-1 p-4 space-y-2">
+            <a href="/" class="block py-2.5 px-4 rounded transition bg-gray-800">새 변환 작업</a>
+            <a href="/history" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">변환 이력</a>
+        </nav>
+    </aside>
+
+    <main class="flex-1 flex flex-col items-center justify-center p-8 overflow-y-auto">
+        <div class="w-full max-w-3xl bg-white p-8 rounded-2xl shadow-sm border border-gray-100 relative">
+            <h1 class="text-3xl font-bold mb-6 text-center">문서를 구조화된 데이터로 변환하세요</h1>
+            
+            <form id="uploadForm" class="space-y-6">
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">출력 포맷</label>
+                        <select name="format" id="outputFormat" class="w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500">
+                            <option value="json">JSON</option>
+                            <option value="xml">XML</option>
+                            <option value="markdown">Markdown</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">VLM 모델 선택</label>
+                        <select name="model" class="w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500">
+                            <option value="Qwen/Qwen3-VL-8B-Instruct">Qwen3-VL-8B-Instruct</option>
+                            <option value="google/gemma-3n-E4B-it">Gemma-3n-E4B-it</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div id="chunkSection">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">텍스트 분할 방식 <span class="text-gray-400 font-normal">(JSON 포맷 선택 시 적용, 복수 선택 가능)</span></label>
+                    <div class="flex gap-6">
+                        <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                            <input type="checkbox" name="chunk" value="page" class="w-4 h-4 text-blue-600 rounded">
+                            페이지 단위
+                        </label>
+                        <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                            <input type="checkbox" name="chunk" value="toc" class="w-4 h-4 text-blue-600 rounded">
+                            목차 기반
+                        </label>
+                        <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                            <input type="checkbox" name="chunk" value="tree" class="w-4 h-4 text-blue-600 rounded">
+                            트리 구조
+                        </label>
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-center w-full">
+                    <label for="dropzone-file" class="flex flex-col items-center justify-center w-full h-48 border-2 border-gray-300 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100 transition">
+                        <div class="flex flex-col items-center justify-center pt-5 pb-6">
+                            <svg class="w-10 h-10 mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                            <p class="mb-2 text-sm text-gray-500"><span class="font-semibold">클릭하여 업로드</span> 하거나 드래그 앤 드롭</p>
+                        </div>
+                        <input id="dropzone-file" type="file" name="files" multiple class="hidden" />
+                    </label>
+                </div>
+                
+                <div id="fileList" class="text-sm text-gray-600 font-semibold"></div>
+
+                <button type="submit" id="submitBtn" class="w-full text-white bg-blue-600 hover:bg-blue-700 font-medium rounded-lg text-lg px-5 py-3 transition">
+                    변환 시작
+                </button>
+            </form>
+
+            <div id="statusContainer" class="hidden mt-6 space-y-3">
+                <!-- 전체 진행률 -->
+                <div class="flex justify-between mb-1">
+                    <span id="statusText" class="text-sm font-medium text-blue-700">작업 준비 중...</span>
+                    <span id="statusPercent" class="text-sm font-bold text-blue-700">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-3">
+                    <div id="progressBar" class="bg-blue-600 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <!-- 문서별 진행률 (병렬 처리 시) -->
+                <div id="docProgressList" class="space-y-2 mt-2"></div>
+            </div>
+            
+            <div id="finalActions" class="hidden mt-6 space-y-3">
+                <div id="finalMessage" class="p-4 rounded-lg text-center font-bold"></div>
+                
+                <div class="grid grid-cols-2 gap-3">
+                    <button id="previewBtn" class="w-full text-center text-gray-700 bg-gray-100 hover:bg-gray-200 border border-gray-300 font-medium rounded-lg text-lg px-5 py-3 transition shadow-sm">
+                        👀 결과 미리보기
+                    </button>
+                    <a id="downloadBtn" href="#" class="block w-full text-center text-white bg-green-600 hover:bg-green-700 font-medium rounded-lg text-lg px-5 py-3 transition shadow-sm">
+                        ⬇️ 파일 다운로드 (ZIP)
+                    </a>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div id="viewerModal" class="fixed inset-0 bg-black bg-opacity-70 hidden flex items-center justify-center z-50">
+        <div class="bg-gray-900 w-11/12 max-w-5xl h-5/6 rounded-xl shadow-2xl flex flex-col overflow-hidden border border-gray-700">
+            <div class="flex justify-between items-center p-4 border-b border-gray-800 bg-gray-950">
+                <h2 class="text-xl font-bold text-white tracking-wider">📄 결과 뷰어</h2>
+                <button id="closeModalBtn" class="text-gray-400 hover:text-white transition p-1">
+                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div id="viewerContent" class="flex-1 p-6 overflow-y-auto bg-gray-900 text-gray-200">
+                </div>
+        </div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('dropzone-file');
+        const form = document.getElementById('uploadForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const statusContainer = document.getElementById('statusContainer');
+        const statusText = document.getElementById('statusText');
+        const statusPercent = document.getElementById('statusPercent');
+        const progressBar = document.getElementById('progressBar');
+        const finalActions = document.getElementById('finalActions');
+        const finalMessage = document.getElementById('finalMessage');
+        const downloadBtn = document.getElementById('downloadBtn');
+        
+        // 뷰어 관련 요소
+        const previewBtn = document.getElementById('previewBtn');
+        const viewerModal = document.getElementById('viewerModal');
+        const closeModalBtn = document.getElementById('closeModalBtn');
+        const viewerContent = document.getElementById('viewerContent');
+        const outputFormatSelect = document.getElementById('outputFormat');
+        const chunkSection = document.getElementById('chunkSection');
+
+        function updateChunkVisibility() {
+            const isJson = outputFormatSelect.value === 'json';
+            chunkSection.style.opacity = isJson ? '1' : '0.4';
+            chunkSection.querySelectorAll('input[type=checkbox]').forEach(cb => cb.disabled = !isJson);
+            document.querySelector('#chunkSection label span').textContent = isJson ? '(JSON 포맷 선택 시 적용, 복수 선택 가능)' : '(JSON 포맷에서만 적용 가능)';
+        }
+        outputFormatSelect.addEventListener('change', updateChunkVisibility);
+        updateChunkVisibility();
+
+        let currentTaskId = null; // 결과 확인을 위해 taskId 보관
+
+        // XML 태그가 깨지지 않게 화면용 문자로 치환하는 함수
+        function escapeHtml(unsafe) {
+            return unsafe
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
+        fileInput.addEventListener('change', e => {
+            document.getElementById('fileList').innerHTML = Array.from(e.target.files).map(f => `📄 ${f.name}`).join('<br>');
+        });
+
+        // 미리보기 버튼 클릭 시 
+        previewBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            if (!currentTaskId) return;
+
+            viewerModal.classList.remove('hidden');
+            viewerContent.innerHTML = '<div class="flex justify-center items-center h-full"><div class="animate-spin w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full"></div></div>';
+
+            try {
+                const res = await fetch(`/api/view/${currentTaskId}`);
+                const data = await res.json();
+                
+                if (data.error) {
+                    viewerContent.innerHTML = `<p class="text-red-400 text-center mt-10">${data.error}</p>`;
+                    return;
+                }
+
+                const currentFormat = outputFormatSelect.value; // xml or json
+                let html = '';
+                
+                // 받아온 여러 페이지의 코드를 순서대로 렌더링
+                for (const [filename, codeContent] of Object.entries(data)) {
+                    html += `
+                        <div class="mb-8">
+                            <h3 class="text-lg font-semibold text-blue-400 mb-2 border-b border-gray-700 pb-1">${filename}</h3>
+                            <pre><code class="language-${currentFormat} rounded-lg shadow-inner !bg-gray-950">${escapeHtml(codeContent)}</code></pre>
+                        </div>
+                    `;
+                }
+                
+                viewerContent.innerHTML = html;
+                
+                // highlight.js 적용
+                viewerContent.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightElement(block);
+                });
+
+            } catch (err) {
+                viewerContent.innerHTML = `<p class="text-red-400 text-center mt-10">데이터를 불러오는 중 에러가 발생했습니다.</p>`;
+            }
+        });
+
+        // 모달 닫기 버튼
+        closeModalBtn.addEventListener('click', () => {
+            viewerModal.classList.add('hidden');
+        });
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if(fileInput.files.length === 0) return alert("파일을 선택해주세요.");
+
+            submitBtn.disabled = true;
+            submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            statusContainer.classList.remove('hidden');
+            finalActions.classList.add('hidden');
+            progressBar.style.width = '0%';
+            statusPercent.innerText = '0%';
+
+            try {
+                const response = await fetch('/api/process', { method: 'POST', body: new FormData(form) });
+                const result = await response.json();
+                if(result.error) throw new Error(result.error);
+                
+                currentTaskId = result.task_id; // 변수 저장
+                
+                const pollInterval = setInterval(async () => {
+                    const progRes = await fetch(`/api/progress/${currentTaskId}`);
+                    const progData = await progRes.json();
+                    
+                    progressBar.style.width = `${progData.progress}%`;
+                    statusPercent.innerText = `${progData.progress}%`;
+                    statusText.innerText = progData.status || "처리 중...";
+
+                    // 문서별 진행바 렌더링
+                    const docList = document.getElementById('docProgressList');
+                    const docs = progData.docs || {};
+                    if (Object.keys(docs).length > 1) {
+                        docList.innerHTML = Object.entries(docs).map(([name, d]) => `
+                            <div>
+                                <div class="flex justify-between text-xs text-gray-600 mb-0.5">
+                                    <span class="truncate max-w-xs">${name}</span>
+                                    <span class="font-medium">${d.progress}%</span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-2">
+                                    <div class="h-2 rounded-full transition-all duration-300 ${d.progress === 100 ? 'bg-green-500' : 'bg-blue-400'}" style="width: ${d.progress}%"></div>
+                                </div>
+                                <p class="text-xs text-gray-400 truncate">${d.status}</p>
+                            </div>`).join('');
+                    } else {
+                        docList.innerHTML = '';
+                    }
+
+                    if (progData.is_done) {
+                        clearInterval(pollInterval);
+                        statusContainer.classList.add('hidden');
+                        finalActions.classList.remove('hidden');
+
+                        if (progData.error) {
+                            finalMessage.className = "p-4 rounded-lg text-center font-bold bg-red-100 text-red-800";
+                            finalMessage.innerHTML = `❌ 오류 발생: ${progData.error}`;
+                            downloadBtn.classList.add('hidden');
+                            previewBtn.classList.add('hidden');
+                        } else {
+                            finalMessage.className = "p-4 rounded-lg text-center font-bold bg-green-100 text-green-800";
+                            finalMessage.innerHTML = `✅ 변환이 모두 완료되었습니다!`;
+                            downloadBtn.classList.remove('hidden');
+                            previewBtn.classList.remove('hidden');
+                            downloadBtn.href = `/api/download/${currentTaskId}`;
+                        }
+                        
+                        submitBtn.disabled = false;
+                        submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    }
+                }, 1000);
+            } catch (error) {
+                statusText.innerText = "❌ 에러 발생: " + error.message;
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('opacity-50');
+            }
+        });
+    </script>
+</body>
+</html>
