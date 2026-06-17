@@ -1,4 +1,3 @@
-# app.py
 import os
 import io
 import json
@@ -19,8 +18,8 @@ HISTORY_FILE = 'history.json'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
-# 🔑 API 키
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
+VLM_BASE_URL = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
+API_KEY = os.environ.get("VLM_API_KEY", "local-vllm-noauth-key")
 
 tasks_progress = {}
 
@@ -55,15 +54,15 @@ def get_progress(task_id):
 
 @app.route('/api/process', methods=['POST'])
 def process_files():
-    if not TOGETHER_API_KEY or "여기에_" in TOGETHER_API_KEY:
-        return jsonify({"error": "app.py 파일에 Together API 키를 먼저 입력해주세요!"}), 400
+    if not API_KEY or "여기에_" in API_KEY:
+        return jsonify({"error": "VLM 엔드포인트 설정이 필요합니다. VLM_BASE_URL(기본 http://localhost:8000/v1)을 확인하세요."}), 400
 
     if 'files' not in request.files:
         return jsonify({"error": "파일이 없습니다."}), 400
         
     output_format = request.form.get('format', 'json')
     model_name = request.form.get('model', 'Qwen/Qwen3-VL-8B-Instruct')
-    chunk_strategies = request.form.getlist('chunk')  # e.g. ["page", "toc", "tree"]
+    chunk_strategies = request.form.getlist('chunk')
     
     task_id = str(uuid.uuid4())
     tasks_progress[task_id] = {"progress": 0, "status": "업로드 중...", "is_done": False, "error": None, "processed": [], "docs": {}}
@@ -78,7 +77,6 @@ def process_files():
 
     def background_worker(t_id, files_info, out_fmt, mod_name, chunk_strats):
         total_files = len(files_info)
-        # 문서별 진행률 독립 추적 (thread-safe: GIL로 dict 읽기/쓰기는 안전)
         doc_progress = {f_name: 0 for _, f_name in files_info}
         doc_status = {f_name: "대기 중..." for _, f_name in files_info}
         lock = threading.Lock()
@@ -102,7 +100,7 @@ def process_files():
         def process_one(f_path, f_name):
             DocumentProcessor.process_and_save(
                 file_path=f_path, base_output_dir=app.config['OUTPUT_FOLDER'],
-                api_key=TOGETHER_API_KEY, output_format=out_fmt, model_name=mod_name,
+                api_key=API_KEY, output_format=out_fmt, model_name=mod_name,
                 progress_callback=make_progress_cb(f_name),
                 chunk_strategies=chunk_strats or None
             )
@@ -110,7 +108,7 @@ def process_files():
 
         try:
             processed_docs = []
-            max_workers = min(total_files, 3)  # 동시 최대 3문서 (API rate limit 고려)
+            max_workers = min(total_files, 3)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_one, f_path, f_name): f_name
                            for f_path, f_name in files_info}
@@ -159,7 +157,6 @@ def download_result(task_id):
     memory_file.seek(0)
     return send_file(memory_file, download_name="parsed_result.zip", as_attachment=True)
 
-# [NEW] 모달 뷰어용 결과 파일 텍스트 반환 API
 @app.route('/api/view/<task_id>')
 def view_result(task_id):
     task = tasks_progress.get(task_id)

@@ -2,9 +2,12 @@ flask>=3.0.0
 PyMuPDF>=1.24.0
 openpyxl>=3.1.0
 beautifulsoup4>=4.12.0
-together>=1.3.0
+olefile>=0.47
 Pillow>=10.0.0
 
-# Windows only (HWP support)
+# VLM backend: any OpenAI-compatible endpoint via VLM_BASE_URL (e.g. local vLLM)
+openai>=1.40.0
+
+# Windows only (HWP COM-based lossless conversion)
 pywin32>=306; sys_platform == "win32"
 pywinauto>=0.6.8; sys_platform == "win32"

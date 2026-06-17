@@ -1,12 +1,3 @@
-"""
-RAG 후처리 스크립트: Breadcrumb 경로 주입 + 페이지 경계 테이블 병합
-
-사용법:
-    python postprocess.py <doc_output_dir> [--format json|xml]
-
-출력:
-    <doc_output_dir>/chunks.json  — Vector DB에 바로 넣을 수 있는 청크 배열
-"""
 import argparse
 import json
 import os
@@ -15,12 +6,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-# ──────────────────────────────────────────────
-# 공통 유틸
-# ──────────────────────────────────────────────
 
 def get_sheet_for_page(page_num: int, sheet_map: list) -> str | None:
-    """페이지 번호로 해당 엑셀 시트명 반환."""
     for s in sheet_map:
         if s["page_start"] <= page_num <= s["page_end"]:
             return s["name"]
@@ -36,13 +23,11 @@ def breadcrumb_str(bc: dict, sheet_name: str | None = None) -> str:
 
 
 def has_markdown_header(md: str) -> bool:
-    """마크다운 테이블에 헤더 구분선(---|---) 이 있는지 확인"""
     lines = [l.strip() for l in md.strip().splitlines() if l.strip()]
     return len(lines) >= 2 and bool(re.match(r"\|[-| :]+\|", lines[1]))
 
 
 def get_table_header_lines(md: str) -> list[str]:
-    """헤더 행 + 구분선 반환 (없으면 빈 리스트)"""
     lines = [l.strip() for l in md.strip().splitlines() if l.strip()]
     if len(lines) >= 2 and re.match(r"\|[-| :]+\|", lines[1]):
         return lines[:2]
@@ -50,15 +35,10 @@ def get_table_header_lines(md: str) -> list[str]:
 
 
 def merge_table_markdown(prev_md: str, curr_md: str) -> str:
-    """
-    이전 페이지 테이블 헤더 + 현재 페이지 테이블 데이터 병합.
-    현재 테이블에 헤더가 없으면 이전 헤더를 붙여줌.
-    """
     header_lines = get_table_header_lines(prev_md)
     curr_lines = [l.strip() for l in curr_md.strip().splitlines() if l.strip()]
 
     if has_markdown_header(curr_md):
-        # VLM이 헤더를 다시 붙인 경우 → 데이터 행만 추출해 이전 헤더와 합침
         data_lines = curr_lines[2:]
     else:
         data_lines = curr_lines
@@ -68,9 +48,6 @@ def merge_table_markdown(prev_md: str, curr_md: str) -> str:
     return "\n".join(data_lines)
 
 
-# ──────────────────────────────────────────────
-# JSON 처리
-# ──────────────────────────────────────────────
 
 def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
     page_files = sorted(
@@ -82,12 +59,11 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
     bc = {"heading_1": None, "heading_2": None, "heading_3": None}
     chunks = []
     prev_page_last_table_idx = None
-    prev_sheet = None  # 시트 전환 감지용
+    prev_sheet = None
 
     for page_file in page_files:
         page_num = int(re.search(r"page_(\d+)_structured", page_file).group(1))
         sheet_name = get_sheet_for_page(page_num, sheet_map)
-        # 시트가 바뀌면 heading 컨텍스트 초기화
         if sheet_name != prev_sheet:
             bc = {"heading_1": None, "heading_2": None, "heading_3": None}
             prev_sheet = sheet_name
@@ -101,7 +77,7 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
             continue
 
         elements = page_data.get("elements", [])
-        this_page_last_table_idx = None  # 이 페이지의 마지막 테이블 청크 인덱스
+        this_page_last_table_idx = None
 
         for i, elem in enumerate(elements):
             etype = elem.get("type", "")
@@ -109,7 +85,6 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
             caption = elem.get("caption", "")
 
             if etype in ("heading_1", "heading_2", "heading_3"):
-                # 헤딩 레벨에 따라 하위 경로 초기화
                 if etype == "heading_1":
                     bc["heading_1"] = content
                     bc["heading_2"] = None
@@ -131,7 +106,6 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
 
             elif etype == "table":
                 is_first_elem = (i == 0)
-                # 페이지 첫 번째 테이블이고 이전 페이지가 테이블로 끝났으면 병합
                 if is_first_elem and prev_page_last_table_idx is not None:
                     prev_chunk = chunks[prev_page_last_table_idx]
                     merged = merge_table_markdown(prev_chunk["content"], content)
@@ -154,7 +128,6 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
                     this_page_last_table_idx = len(chunks) - 1
 
             else:
-                # text / image / footnote
                 prev_page_last_table_idx = None
                 this_page_last_table_idx = None
                 chunks.append({
@@ -165,15 +138,11 @@ def process_json(doc_output_dir: str, metadata: dict) -> list[dict]:
                     "breadcrumb": breadcrumb_str(bc, sheet_name),
                 })
 
-        # 이 페이지의 마지막 테이블 추적 (다음 페이지로 넘김)
         prev_page_last_table_idx = this_page_last_table_idx
 
     return chunks
 
 
-# ──────────────────────────────────────────────
-# XML 처리
-# ──────────────────────────────────────────────
 
 def process_xml(doc_output_dir: str, metadata: dict) -> list[dict]:
     page_files = sorted(
@@ -274,12 +243,8 @@ def process_xml(doc_output_dir: str, metadata: dict) -> list[dict]:
     return chunks
 
 
-# ──────────────────────────────────────────────
-# 진입점
-# ──────────────────────────────────────────────
 
 def run(doc_output_dir: str, fmt: str = "json"):
-    # 메타데이터 로드
     meta_path = os.path.join(doc_output_dir, "metadata.json")
     if os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:

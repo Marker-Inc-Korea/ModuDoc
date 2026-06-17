@@ -1,0 +1,12 @@
+# Normalize text to LF in the repo, regardless of contributor OS (prevents CRLF churn).
+* text=auto eol=lf
+
+# Treat these as binary (no eol conversion, no diff).
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.hwp  binary
+*.hwpx binary
+*.docx binary
+*.pptx binary
+*.xlsx binary

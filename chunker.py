@@ -1,9 +1,3 @@
-"""
-Document chunker — three strategies:
-  page : one chunk per page
-  toc  : one chunk per heading section (splits on heading_1/2/3)
-  tree : hierarchical tree, one node per heading + its direct body content
-"""
 import os
 import json
 import re
@@ -15,15 +9,8 @@ HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
 HEADING_LEVEL = {"heading_1": 1, "heading_2": 2, "heading_3": 3}
 
 
-# ──────────────────────────────────────────────
-# Internal helpers
-# ──────────────────────────────────────────────
 
 def _load_pages(doc_dir: str) -> list:
-    """
-    Read page_NNNN_structured.json files sorted by filename (lexicographic = numeric due to zfill).
-    Stamps each element with its page_number.
-    """
     entries = []
     for fname in sorted(f for f in os.listdir(doc_dir) if re.match(r"page_\d+_structured\.json$", f)):
         m = re.match(r"page_(\d+)_structured\.json$", fname)
@@ -45,7 +32,6 @@ def _load_pages(doc_dir: str) -> list:
 
 
 def _flat_elements(pages: list) -> list:
-    """Flatten pages → single ordered list of elements (toc_entry excluded)."""
     return [
         elem
         for page in pages
@@ -55,7 +41,6 @@ def _flat_elements(pages: list) -> list:
 
 
 def _load_toc(doc_dir: str) -> list:
-    """Load toc array from metadata.json if available."""
     meta_path = os.path.join(doc_dir, "metadata.json")
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -64,12 +49,8 @@ def _load_toc(doc_dir: str) -> list:
         return []
 
 
-# ──────────────────────────────────────────────
-# Strategy 1 — Page
-# ──────────────────────────────────────────────
 
 def chunk_by_page(doc_dir: str) -> list:
-    """One chunk per page — trivial split."""
     pages = _load_pages(doc_dir)
     return [
         {
@@ -83,23 +64,15 @@ def chunk_by_page(doc_dir: str) -> list:
     ]
 
 
-# ──────────────────────────────────────────────
-# Strategy 2 — TOC (heading-boundary split)
-# ──────────────────────────────────────────────
 
 def chunk_by_toc(doc_dir: str) -> list:
-    """
-    Walk elements sequentially.
-    Each heading_* starts a new chunk; content follows under that heading.
-    metadata.json toc is used to enrich heading_path when available.
-    """
     elements = _flat_elements(_load_pages(doc_dir))
     if not elements:
         return []
 
     chunks = []
     current = None
-    heading_stack: list[tuple[int, str]] = []  # (level, title)
+    heading_stack: list[tuple[int, str]] = []
     counter = 0
 
     def save(chunk):
@@ -147,16 +120,8 @@ def chunk_by_toc(doc_dir: str) -> list:
     return chunks
 
 
-# ──────────────────────────────────────────────
-# Strategy 3 — Tree
-# ──────────────────────────────────────────────
 
 def chunk_by_tree(doc_dir: str) -> list:
-    """
-    Each heading becomes a node owning subsequent non-heading elements
-    until a same-or-higher-level heading is encountered.
-    depth = heading level (1/2/3); 0 = preamble before first heading.
-    """
     elements = _flat_elements(_load_pages(doc_dir))
     if not elements:
         return []
@@ -217,9 +182,6 @@ def chunk_by_tree(doc_dir: str) -> list:
     return nodes
 
 
-# ──────────────────────────────────────────────
-# Public entry point
-# ──────────────────────────────────────────────
 
 _STRATEGY_MAP = {
     "page": chunk_by_page,
@@ -229,17 +191,6 @@ _STRATEGY_MAP = {
 
 
 def chunk_document(doc_dir: str, strategies: list = None) -> dict:
-    """
-    Run chunking strategies on a document output directory.
-
-    Args:
-        doc_dir:    Path containing page_NNNN_structured.json files.
-        strategies: List of strategy names. Defaults to ["page", "toc", "tree"].
-
-    Returns:
-        dict keyed by strategy name → list of chunks.
-        Side-effect: writes chunks_<strategy>.json into doc_dir.
-    """
     if strategies is None:
         strategies = ["page", "toc", "tree"]
 

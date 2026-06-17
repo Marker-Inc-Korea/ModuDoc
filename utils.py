@@ -30,11 +30,9 @@ logging.basicConfig(level=logging.INFO)
 
 
 class HWPTextExtractor:
-    """HWP/HWPX 문서에서 텍스트 및 구조를 추출하는 파서 클래스."""
 
     @staticmethod
     def text_preprocessing(text, threshold=0.5):
-        """텍스트를 정규화하고 노이즈(URL, 특수문자 과다 등)를 제거한다."""
         if not text: return ""
         special_chars = re.sub(r'[가-힣a-zA-Z0-9\s]', '', text)
         if len(text) > 0 and (len(special_chars) / len(text)) >= threshold: return ""
@@ -53,7 +51,6 @@ class HWPTextExtractor:
 
     @classmethod
     def hwp_process_children(cls, tag):
-        """HTML 태그의 자식 노드를 재귀적으로 순회하여 콘텐츠 문자열을 반환한다."""
         content = ""
         for child in tag.children:
             if isinstance(child, NavigableString):
@@ -72,7 +69,6 @@ class HWPTextExtractor:
 
     @classmethod
     def hwp_parse_table(cls, table_tag):
-        """BeautifulSoup table 태그를 HTML 문자열로 직렬화한다."""
         table_html = "<table>"
         for tr in table_tag.find_all('tr', recursive=False):
             table_html += "<tr>"
@@ -91,7 +87,6 @@ class HWPTextExtractor:
 
     @classmethod
     def parser_from_hwp_html(cls, file_path):
-        """hwp5html로 HWP를 XHTML 변환 후 페이지 단위 HTML 문자열 목록을 반환한다."""
         temp_dir = tempfile.mkdtemp()
         pages = []
         try:
@@ -134,7 +129,6 @@ class HWPTextExtractor:
 
     @classmethod
     def get_text_from_hwpx(cls, element):
-        """HWPX XML p 요소에서 텍스트와 인라인 오브젝트를 추출한다."""
         text = []
         sentence_tags = element.findall('./{*}run')
         for sentence_tag in sentence_tags:
@@ -156,7 +150,6 @@ class HWPTextExtractor:
 
     @classmethod
     def get_table_from_hwpx(cls, element):
-        """HWPX XML tbl 요소를 HTML 테이블 문자열로 변환한다."""
         table = "<table>"
         rows = element.findall('./{*}tr')
         for row in rows:
@@ -178,7 +171,6 @@ class HWPTextExtractor:
 
     @classmethod
     def parser_from_hwpx_xml(cls, file_path):
-        """HWPX ZIP 내 section XML을 파싱하여 페이지 단위 HTML 문자열 목록을 반환한다."""
         pages = []
         try:
             all_p_elements = []
@@ -214,7 +206,6 @@ class HWPTextExtractor:
 
     @classmethod
     def _process_hwp_child(cls, child, text, include_table=True):
-        """HWP XML 자식 요소에서 텍스트/테이블/도형 추출 헬퍼."""
         if child.tag == "Text":
             text.append(child.text)
         elif child.tag == "GShapeObjectControl":
@@ -240,7 +231,6 @@ class HWPTextExtractor:
 
     @classmethod
     def get_text_from_hwp(cls, element):
-        """HWP XML Paragraph 요소에서 텍스트와 인라인 오브젝트를 추출한다."""
         text = []
         for sentence_tag in element.findall('./LineSeg'):
             fieldclickheres = sentence_tag.findall('./FieldClickHere')
@@ -262,7 +252,6 @@ class HWPTextExtractor:
 
     @classmethod
     def _get_text_from_hwp_for_table(cls, element):
-        """테이블 셀 내 Paragraph 텍스트 추출 (TableControl 재귀 없이)."""
         text = []
         for sentence_tag in element.findall('./LineSeg'):
             fieldclickheres = sentence_tag.findall('./FieldClickHere')
@@ -284,7 +273,6 @@ class HWPTextExtractor:
 
     @classmethod
     def get_table_from_hwp(cls, element):
-        """HWP XML TableControl 요소를 HTML 테이블 문자열로 변환한다."""
         table_body = element.find('./TableBody')
         if table_body is None: return ""
         table = "<table>"
@@ -314,7 +302,6 @@ class HWPTextExtractor:
 
     @classmethod
     def parser_from_hwp_xml(cls, file_path):
-        """hwp5proc xml 출력을 파싱하여 페이지 단위 HTML 문자열 목록을 반환한다."""
         pre, _ = os.path.splitext(file_path)
         temp_xml = pre + f"_{uuid.uuid4().hex[:6]}_temp.xml"
         pages = []
@@ -342,13 +329,33 @@ class HWPTextExtractor:
             
         return [re.sub(r"(<br>){2,}", "<br>", p).strip() for p in pages]
 
+    @staticmethod
+    def _clean_native(text):
+        if not text: return ""
+        text = unicodedata.normalize("NFC", text)
+        text = re.sub(r'[-]', "", text)
+        text = re.sub(" ", " ", text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n{2,}', '\n', text)
+        return text.strip()
+
     @classmethod
     def extract_pages(cls, file_path):
-        """ 메인 진입점: HWPX/HWP를 판별하여 페이지 단위 텍스트 배열을 반환합니다. """
-        _, ext = os.path.splitext(file_path)
-        ext = ext.lower()
+        ext = os.path.splitext(file_path)[1].lower()
+
+        try:
+            from hwp_extract import extract as _native_extract
+            text, status = _native_extract(file_path)
+            if status == "ok":
+                cleaned = cls._clean_native(text)
+                if cleaned:
+                    return [cleaned]
+            else:
+                logger.info(f"네이티브 추출 비정상({status}), 폴백 시도: {os.path.basename(file_path)}")
+        except Exception as e:
+            logger.warning(f"네이티브 추출 예외, 폴백: {e}")
+
         pages = []
-        
         if ext == ".hwpx":
             pages = cls.parser_from_hwpx_xml(file_path)
         elif ext == ".hwp":
@@ -363,7 +370,6 @@ class HWPTextExtractor:
 
 
 def _sanitize_json_strings(text: str) -> str:
-    """JSON 문자열 값 내부의 control character 및 invalid escape를 교체."""
     _CTRL_ESCAPES = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
     _VALID_ESCAPES = set('"\\\/bfnrtu')
     result = []
@@ -400,11 +406,9 @@ def _sanitize_json_strings(text: str) -> str:
 
 
 class VLMProcessor:
-    """Together AI VLM을 통해 문서 페이지를 구조화된 JSON/XML로 변환하는 처리기."""
 
     @classmethod
     def encode_image(cls, image_path, max_width=1024):
-        """이미지를 base64로 인코딩. VLM 전송용으로 max_width 이하로 리사이즈."""
         try:
             from PIL import Image
             import io
@@ -422,14 +426,14 @@ class VLMProcessor:
 
     @classmethod
     def extract_structure(cls, txt_path, img_path=None, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-8B-Instruct"):
-        """VLM에 텍스트와 이미지를 전송하여 구조화된 JSON 또는 XML 문자열을 반환한다."""
         if not api_key or "여기에_" in api_key: return None
 
         try:
-            from together import Together
-            client = Together(api_key=api_key, timeout=300, max_retries=0)
+            from openai import OpenAI
+            base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
+            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=300, max_retries=0)
         except Exception as e:
-            logger.error(f"Together 오류: {e}")
+            logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return None
 
         with open(txt_path, "r", encoding="utf-8") as f:
@@ -594,16 +598,14 @@ Based on the raw text and the visual layout in the image (if provided), structur
 
     @classmethod
     def extract_metadata(cls, txt_paths, img_paths, api_key, model_name):
-        """문서 1~2페이지에서 글로벌 메타데이터 추출.
-        Returns dict: {doc_title, date, organization, author, keywords}
-        """
         if not api_key or "여기에_" in api_key:
             return {}
         try:
-            from together import Together
-            client = Together(api_key=api_key, timeout=60, max_retries=0)
+            from openai import OpenAI
+            base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
+            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=60, max_retries=0)
         except Exception as e:
-            logger.error(f"Together 오류: {e}")
+            logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return {}
 
         combined_text = ""
@@ -650,11 +652,9 @@ If a field cannot be found, use null."""
 
 
 class DocumentProcessor:
-    """PDF/Office/HWP 문서를 파싱하고 VLM으로 구조화하는 통합 파이프라인 처리기."""
 
     @staticmethod
     def get_libreoffice_cmd():
-        """플랫폼에 맞는 LibreOffice 실행 파일 경로를 반환한다."""
         if platform.system() == "Linux": return "libreoffice"
         candidates = [r"C:\Program Files\LibreOffice\program\soffice.exe", r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"]
         if shutil.which("soffice"): return "soffice"
@@ -664,7 +664,6 @@ class DocumentProcessor:
 
     @staticmethod
     def _optimize_excel_layout(input_path, output_path):
-        """엑셀 PDF 변환 전 레이아웃 최적화: A2 가로, 1페이지 너비 맞춤, 여백 제거, AutoFit."""
         try:
             wb = openpyxl.load_workbook(input_path)
             for ws in wb.worksheets:
@@ -702,10 +701,6 @@ class DocumentProcessor:
 
     @classmethod
     def _convert_excel_to_pdf_with_sheet_map(cls, input_path, output_dir):
-        """Excel 시트별 개별 PDF 변환 → 합친 PDF + 시트 페이지 매핑 반환.
-        Returns: (merged_pdf_path, sheet_map)
-          sheet_map = [{"name": "시트명", "page_start": 1, "page_end": 3}, ...]
-        """
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         cmd_exe = cls.get_libreoffice_cmd()
         if not cmd_exe: return None, []
@@ -787,7 +782,6 @@ class DocumentProcessor:
 
     @classmethod
     def convert_to_pdf(cls, input_path, output_dir):
-        """LibreOffice를 사용해 문서를 PDF로 변환하고 결과 경로를 반환한다."""
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         cmd_exe = cls.get_libreoffice_cmd()
         if not cmd_exe: return None
@@ -833,7 +827,6 @@ class DocumentProcessor:
 
     @classmethod
     def convert_hwp_to_pdf_via_odt(cls, input_path, output_dir):
-        """HWP → ODT (hwp5odt) → PDF (LibreOffice) 2단계 변환. LibreOffice 직접 변환이 안 될 때 사용."""
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         cmd_exe = cls.get_libreoffice_cmd()
         if not cmd_exe: return None
@@ -881,7 +874,6 @@ class DocumentProcessor:
 
     @staticmethod
     def _auto_click_hwp_popup():
-        """HWP COM 변환 중 나타나는 보안 팝업을 백그라운드에서 자동으로 닫는다."""
         try:
             from pywinauto import Desktop
             import threading
@@ -907,7 +899,6 @@ class DocumentProcessor:
 
     @classmethod
     def convert_hwp_to_pdf_win32(cls, input_path, output_dir):
-        """HWP/HWPX → PDF 변환. HWP COM은 스레드에서 동작 안 하므로 별도 subprocess로 실행."""
         if platform.system() != "Windows": return None
 
         filename = os.path.basename(input_path)
@@ -939,7 +930,6 @@ class DocumentProcessor:
 
     @staticmethod
     def json_to_markdown(structured_json_str: str) -> str:
-        """_structured.json 문자열 → Markdown 문자열 변환"""
         try:
             data = json.loads(structured_json_str)
         except json.JSONDecodeError:
@@ -1007,7 +997,6 @@ class DocumentProcessor:
 
     @classmethod
     def process_and_save(cls, file_path, base_output_dir, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-8B-Instruct", progress_callback=None, chunk_strategies=None):
-        """문서를 파싱·구조화하여 페이지별 파일을 출력 디렉터리에 저장한다."""
         filename = os.path.basename(file_path)
         name, ext = os.path.splitext(filename)
         ext = ext.lower()
@@ -1021,7 +1010,8 @@ class DocumentProcessor:
             if progress_callback: progress_callback({"msg": msg, "percent": percent})
 
         set_progress("문서 파싱 준비 중...", 2)
-        temp_pdf_dir = os.path.join(base_output_dir, "temp_pdf")
+
+        temp_pdf_dir = os.path.join(doc_output_dir, "temp_pdf")
         if not os.path.exists(temp_pdf_dir): os.makedirs(temp_pdf_dir)
         excel_sheet_map = []
 

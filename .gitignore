@@ -1,5 +1,15 @@
-"__pycache__/" 
-"*.pyc" 
-".env" 
-"processed/" 
-"uploads/" 
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+venv/
+
+# Runtime artifacts
+processed/
+uploads/
+
+# Local data / archives
+*.zip
+.DS_Store
+.ipynb_checkpoints/
