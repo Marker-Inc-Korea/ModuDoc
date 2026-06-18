@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 
 _VLM_SEMAPHORE = threading.Semaphore(5)
 _SOFFICE_LOCK = threading.Lock()
+RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
 
 import fitz
 import openpyxl
@@ -1031,7 +1032,7 @@ class DocumentProcessor:
                 try:
                     doc = fitz.open(pdf_path)
                     out_page = 0
-                    mat = fitz.Matrix(100 / 72, 100 / 72)
+                    mat = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
                     for i in range(len(doc)):
                         page = doc[i]
                         w, h = page.rect.width, page.rect.height
@@ -1079,7 +1080,7 @@ class DocumentProcessor:
                     total_pages = len(doc)
                     for i in range(total_pages):
                         pnum = str(i + 1).zfill(4)
-                        pix = doc[i].get_pixmap(dpi=100)
+                        pix = doc[i].get_pixmap(dpi=RENDER_DPI)
                         pix.save(os.path.join(doc_output_dir, f"page_{pnum}.png"))
 
                         raw_text = doc[i].get_text().strip()
