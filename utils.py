@@ -609,10 +609,10 @@ Based on the raw text and the visual layout in the image (if provided), structur
         except Exception as e:
             logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return ""
-        prompt = ("이 이미지가 단순 로고·기관 심볼·아이콘·장식선·도장 등 정보 가치가 낮은 요소이면 "
-                  "다른 말 없이 정확히 'LOGO' 한 단어만 출력하세요.\n"
-                  "차트·그래프·사진·도식·표·내용이 담긴 화면 캡처 등 의미 있는 시각자료이면 "
-                  "한국어로 2~3문장으로 핵심(수치·추세·내용)을 설명하세요. 설명문만 출력하세요.")
+        prompt = ("이 이미지가 '기관 로고·CI·심볼마크·단순 아이콘·장식용 선/문양·도장(직인)'처럼 "
+                  "정보 전달이 목적이 아닌 요소이면, 다른 말 없이 정확히 'LOGO' 한 단어만 출력하세요.\n"
+                  "그 외 정보를 담은 시각자료 — 차트·그래프·사진·도식·표·인포그래픽·내용이 있는 화면 캡처 등 — "
+                  "이면 한국어로 2~3문장으로 핵심(수치·추세·내용)을 설명하세요. 설명문만 출력하세요.")
         content = [{"type": "text", "text": prompt},
                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{cls.encode_image(img_path)}"}}]
         for attempt in range(2):
@@ -1249,7 +1249,7 @@ class DocumentProcessor:
                     set_progress(f"🖼️ 임베디드 시각자료 {len(figs)}건 복원·분석 중...", 99)
                     fig_dir = os.path.join(doc_output_dir, "figures")
                     os.makedirs(fig_dir, exist_ok=True)
-                    records = []
+                    records = []; page_inserts = []
                     for fobj in figs:
                         try:
                             im = Image.open(_io.BytesIO(fobj["data"])).convert("RGB")
@@ -1265,16 +1265,27 @@ class DocumentProcessor:
                             except OSError:
                                 pass
                             continue
+                        caption = fobj.get("context", "")[:80]
                         records.append({
                             "order": fobj["order"], "section": fobj["section"],
                             "para_index": fobj["para_index"], "ref": fobj["ref"],
                             "size_inch": [fobj["w_in"], fobj["h_in"]],
-                            "context": fobj.get("context", "")[:80],
+                            "context": caption, "anchor": fobj.get("anchor", "")[:80],
                             "image": f"figures/{fname}", "description": desc,
+                        })
+                        page_inserts.append({
+                            "anchor": fobj.get("anchor", ""),
+                            "element": {"type": "figure", "content": "", "caption": "",
+                                        "description": desc, "image": f"figures/{fname}",
+                                        "salvaged": True, "para_index": fobj["para_index"]},
                         })
                     with open(os.path.join(doc_output_dir, "figures.json"), "w", encoding="utf-8") as ff:
                         json.dump(records, ff, ensure_ascii=False, indent=2)
-                    logger.info(f"시각자료 salvage: {len(records)}건 → figures.json")
+                    placed = 0
+                    if output_format.lower() in ("json", "markdown") and page_inserts:
+                        from hwp_figures import insert_figures_into_pages
+                        placed = insert_figures_into_pages(doc_output_dir, page_inserts)
+                    logger.info(f"시각자료 salvage: {len(records)}건 → figures.json, 페이지 삽입 {placed}건")
             except Exception as e:
                 logger.warning(f"시각자료 salvage 실패: {e}")
 

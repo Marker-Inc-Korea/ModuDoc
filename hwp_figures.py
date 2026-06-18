@@ -25,6 +25,21 @@ def _ln(t):
     return t.split('}')[-1]
 
 
+def _strip_alt(s):
+    """이미지 단락의 alt 텍스트('그림입니다 / 원본 그림의 이름: ...')를 제거해 실제 본문만 남김."""
+    keep = []
+    for line in s.splitlines():
+        l = line.strip()
+        if not l or l.startswith("그림입니다") or l.startswith("원본 그림의 이름") or l == "원본":
+            continue
+        keep.append(l)
+    return " ".join(keep).strip()
+
+
+def _norm(s):
+    return re.sub(r"\s+", "", s or "")
+
+
 def _hwpx_item_map(z):
     m = {}
     try:
@@ -50,8 +65,10 @@ def _hwpx_figures(path):
         order = 0
         for si, s in enumerate(secs):
             root = ET.fromstring(z.read(s))
+            last_anchor = ""
             for pi, p in enumerate(pp for pp in root.iter() if _ln(pp.tag) == "p"):
                 ptext = "".join(p.itertext()).strip()
+                body = _strip_alt(ptext)
                 for pic in (e for e in p.iter() if _ln(e.tag) == "pic"):
                     ref = None
                     cw = ch = 0
@@ -80,9 +97,11 @@ def _hwpx_figures(path):
                         "ref": ref, "href": href, "media_type": mtype,
                         "w_in": round(cw / HWPUNIT_PER_INCH, 2),
                         "h_in": round(ch / HWPUNIT_PER_INCH, 2),
-                        "context": ptext[:120], "ext": ext,
+                        "context": ptext[:120], "anchor": last_anchor[:80], "ext": ext,
                         "data": z.read(href),
                     })
+                if len(_norm(body)) >= 8:
+                    last_anchor = body
     return out
 
 
@@ -182,15 +201,26 @@ def _hwp5_figures(path):
 
         secs = sorted([e for e in ole.listdir() if len(e) == 2 and e[0] == 'BodyText'],
                       key=lambda e: int(re.sub(r'\D', '', e[1]) or 0))
+        try:
+            from hwp_extract import _decode_para_text
+        except Exception:
+            _decode_para_text = None
         out = []; order = 0
         for si, e in enumerate(secs):
             recs = _parse_records(read('/'.join(e)))
             pic_recs = [rec for tag, lvl, rec in recs if tag == 85]
             off = _binid_offset(pic_recs, len(bins))
-            para = -1
+            para = -1; last_anchor = ""
             for tag, lvl, rec in recs:
                 if tag == 66:
                     para += 1
+                elif tag == 67 and _decode_para_text:
+                    try:
+                        t = _strip_alt(_decode_para_text(rec))
+                    except Exception:
+                        t = ""
+                    if len(_norm(t)) >= 8:
+                        last_anchor = t
                 if tag != 85:
                     continue
                 try:
@@ -220,11 +250,50 @@ def _hwp5_figures(path):
                     "ref": f"BIN{sid:04X}", "href": sname, "media_type": f"image/{ext}",
                     "w_in": round(w / HWPUNIT_PER_INCH, 2),
                     "h_in": round(h / HWPUNIT_PER_INCH, 2),
-                    "context": "", "ext": ext, "data": data,
+                    "context": "", "anchor": last_anchor[:80], "ext": ext, "data": data,
                 })
         return out
     finally:
         ole.close()
+
+
+def insert_figures_into_pages(doc_dir, fig_records):
+    """salvage된 figure 요소를 앵커 텍스트가 들어있는 페이지 structured.json의
+    해당 위치에 삽입한다(매칭 실패 시 그 페이지 끝/마지막 페이지). 청킹 전에 호출."""
+    import glob, json
+    pages = sorted(glob.glob(os.path.join(doc_dir, "page_*_structured.json")))
+    if not pages:
+        return 0
+    ptext = {}
+    for pj in pages:
+        stem = os.path.basename(pj)[:-len("_structured.json")]
+        tp = os.path.join(doc_dir, stem + ".txt")
+        ptext[pj] = _norm(open(tp, encoding="utf-8").read()) if os.path.exists(tp) else ""
+    placed = 0
+    for rec in fig_records:
+        anchor = _norm(rec.get("anchor", ""))[:40]
+        target = None
+        if len(anchor) >= 8:
+            for pj in pages:
+                if anchor in ptext[pj]:
+                    target = pj; break
+        if target is None:
+            target = pages[-1]
+        try:
+            data = json.load(open(target, encoding="utf-8"))
+        except Exception:
+            continue
+        els = data.setdefault("elements", [])
+        pos = len(els)
+        if len(anchor) >= 8:
+            key = anchor[:20]
+            for i, el in enumerate(els):
+                if key in _norm(el.get("content", "")):
+                    pos = i + 1; break
+        els.insert(pos, rec["element"])
+        json.dump(data, open(target, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
+        placed += 1
+    return placed
 
 
 def significant(figs, min_dim_in=0.25, max_aspect=18.0, dedup=True):
