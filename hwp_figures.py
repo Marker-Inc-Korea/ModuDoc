@@ -257,9 +257,20 @@ def _hwp5_figures(path):
         ole.close()
 
 
-def insert_figures_into_pages(doc_dir, fig_records):
-    """salvage된 figure 요소를 앵커 텍스트가 들어있는 페이지 structured.json의
-    해당 위치에 삽입한다(매칭 실패 시 그 페이지 끝/마지막 페이지). 청킹 전에 호출."""
+def _word_overlap(a, b):
+    """두 문자열의 단어(2자+) 토큰 겹침 계수(교집합/작은쪽). 의역 vs OCR 비교용."""
+    A = set(re.findall(r"[가-힣A-Za-z0-9]{2,}", a or ""))
+    B = set(re.findall(r"[가-힣A-Za-z0-9]{2,}", b or ""))
+    if not A or not B:
+        return 0.0
+    return len(A & B) / min(len(A), len(B))
+
+
+def insert_figures_into_pages(doc_dir, fig_records, dedup_vlm=True, dup_thresh=0.3):
+    """salvage figure 요소를 앵커 텍스트가 있는 페이지 structured.json 의 해당 위치에 삽입.
+    dedup_vlm=True 면, 같은 임베디드 이미지를 VLM 이 페이지에서 읽어 만든 figure 요소(중복)를
+    제거한다 — salvage 와 단어 겹침이 큰 VLM figure 만 제거(벡터 도식 등 안 겹치는 건 보존).
+    청킹 전에 호출."""
     import glob, json
     pages = sorted(glob.glob(os.path.join(doc_dir, "page_*_structured.json")))
     if not pages:
@@ -269,7 +280,8 @@ def insert_figures_into_pages(doc_dir, fig_records):
         stem = os.path.basename(pj)[:-len("_structured.json")]
         tp = os.path.join(doc_dir, stem + ".txt")
         ptext[pj] = _norm(open(tp, encoding="utf-8").read()) if os.path.exists(tp) else ""
-    placed = 0
+
+    by_page = {}
     for rec in fig_records:
         anchor = _norm(rec.get("anchor", ""))[:40]
         target = None
@@ -279,20 +291,35 @@ def insert_figures_into_pages(doc_dir, fig_records):
                     target = pj; break
         if target is None:
             target = pages[-1]
+        by_page.setdefault(target, []).append((anchor, rec))
+
+    placed = 0
+    for pj, items in by_page.items():
         try:
-            data = json.load(open(target, encoding="utf-8"))
+            data = json.load(open(pj, encoding="utf-8"))
         except Exception:
             continue
         els = data.setdefault("elements", [])
-        pos = len(els)
-        if len(anchor) >= 8:
-            key = anchor[:20]
-            for i, el in enumerate(els):
-                if key in _norm(el.get("content", "")):
-                    pos = i + 1; break
-        els.insert(pos, rec["element"])
-        json.dump(data, open(target, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
-        placed += 1
+        sal_descs = [r["element"].get("description", "") for _, r in items]
+        if dedup_vlm:
+            kept = []
+            for e in els:
+                if e.get("type") == "figure" and not e.get("salvaged"):
+                    vt = (e.get("content", "") or "") + " " + (e.get("description", "") or "")
+                    if any(_word_overlap(vt, sd) >= dup_thresh for sd in sal_descs):
+                        continue   # salvage 와 중복되는 VLM figure 제거
+                kept.append(e)
+            els = kept
+        for anchor, rec in items:
+            pos = len(els)
+            if len(anchor) >= 8:
+                key = anchor[:20]
+                for i, el in enumerate(els):
+                    if key in _norm(el.get("content", "")):
+                        pos = i + 1; break
+            els.insert(pos, rec["element"]); placed += 1
+        data["elements"] = els
+        json.dump(data, open(pj, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
     return placed
 
 
