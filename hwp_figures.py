@@ -10,7 +10,7 @@ extract_figures(path) -> [ {order, section, para_index, ref, href, media_type,
                             w_in, h_in, context, ext, data} ... ]  (reading-order)
 significant(figs, ...) -> 로고/아이콘/얇은 배너를 거른 유의미 figure 목록 (ref 중복 제거)
 """
-import os, re, zipfile, struct, zlib
+import os, re, zipfile, struct, zlib, hashlib
 import xml.etree.ElementTree as ET
 try:
     import olefile
@@ -227,19 +227,23 @@ def _hwp5_figures(path):
         ole.close()
 
 
-def significant(figs, min_dim_in=0.6, min_area_in2=0.7, dedup=True):
-    """로고/아이콘/얇은 배너 제거 + (선택) ref 중복 제거. reading-order 유지."""
+def significant(figs, min_dim_in=0.25, max_aspect=18.0, dedup=True):
+    """극소 장식(불릿/아이콘)·구분선만 최소한으로 거르고 동일 이미지 중복만 제거한다.
+    로고 vs 실제 시각자료 판별은 룰이 아니라 VLM(describe_image)에 맡긴다 —
+    작은 진짜 figure(작은 차트·도장·서명 등)를 크기 룰로 버리지 않기 위함."""
     seen = set()
     out = []
     for f in figs:
-        if min(f["w_in"], f["h_in"]) < min_dim_in:
+        w, h = f["w_in"], f["h_in"]
+        if min(w, h) < min_dim_in:                       # 불릿/아이콘 등 극소 장식
             continue
-        if f["w_in"] * f["h_in"] < min_area_in2:
-            continue
+        if min(w, h) > 0 and max(w, h) / min(w, h) > max_aspect:
+            continue                                      # 구분선/룰 같은 극단 비율
         if dedup:
-            if f["ref"] in seen:
+            hsh = hashlib.md5(f["data"]).hexdigest()
+            if hsh in seen:
                 continue
-            seen.add(f["ref"])
+            seen.add(hsh)
         out.append(f)
     return out
 

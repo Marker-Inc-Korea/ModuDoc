@@ -609,9 +609,10 @@ Based on the raw text and the visual layout in the image (if provided), structur
         except Exception as e:
             logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return ""
-        prompt = ("다음은 문서에 삽입된 시각자료(그림/차트/사진/화면 캡처)입니다. 한국어로 2~3문장으로 핵심만 설명하세요. "
-                  "그래프·차트면 종류와 주요 수치·추세를, 표/캡처면 핵심 내용과 보이는 문구를, "
-                  "사진·도식이면 무엇을 나타내는지 적으세요. 설명문만 출력하세요.")
+        prompt = ("이 이미지가 단순 로고·기관 심볼·아이콘·장식선·도장 등 정보 가치가 낮은 요소이면 "
+                  "다른 말 없이 정확히 'LOGO' 한 단어만 출력하세요.\n"
+                  "차트·그래프·사진·도식·표·내용이 담긴 화면 캡처 등 의미 있는 시각자료이면 "
+                  "한국어로 2~3문장으로 핵심(수치·추세·내용)을 설명하세요. 설명문만 출력하세요.")
         content = [{"type": "text", "text": prompt},
                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{cls.encode_image(img_path)}"}}]
         for attempt in range(2):
@@ -1255,8 +1256,15 @@ class DocumentProcessor:
                         except Exception:
                             continue
                         fname = f"figure_{fobj['order']:04d}.png"
-                        im.save(os.path.join(fig_dir, fname))
-                        desc = VLMProcessor.describe_image(os.path.join(fig_dir, fname), api_key, model_name)
+                        fpath = os.path.join(fig_dir, fname)
+                        im.save(fpath)
+                        desc = VLMProcessor.describe_image(fpath, api_key, model_name)
+                        if not desc or desc.strip().upper().startswith("LOGO"):
+                            try:
+                                os.remove(fpath)   # 로고/장식 — VLM이 걸러냄
+                            except OSError:
+                                pass
+                            continue
                         records.append({
                             "order": fobj["order"], "section": fobj["section"],
                             "para_index": fobj["para_index"], "ref": fobj["ref"],
