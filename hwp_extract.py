@@ -227,7 +227,23 @@ def extract_hwpx(path):
         return "", f"error:{e}"
 
 
+def _sniff(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(17)
+    except Exception:
+        return None
+    if head[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1': return "hwp5"
+    if head[:4] == b'PK\x03\x04': return "hwpx"
+    if head == b'HWP Document File': return "hwp3"
+    return None
+
+
 def extract(path):
+    kind = _sniff(path)
+    if kind == "hwp3": return "", "hwp3-unsupported"
+    if kind == "hwpx": return extract_hwpx(path)
+    if kind == "hwp5": return extract_hwp5(path)
     ext = os.path.splitext(path)[1].lower()
     if ext == ".hwpx": return extract_hwpx(path)
     if ext == ".hwp":  return extract_hwp5(path)
