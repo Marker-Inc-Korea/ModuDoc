@@ -599,6 +599,36 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     return None
 
     @classmethod
+    def describe_image(cls, img_path, api_key, model_name="Qwen/Qwen3-VL-8B-Instruct"):
+        if not api_key or "여기에_" in api_key or not os.path.exists(img_path):
+            return ""
+        try:
+            from openai import OpenAI
+            base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
+            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=120, max_retries=0)
+        except Exception as e:
+            logger.error(f"VLM 클라이언트 초기화 오류: {e}")
+            return ""
+        prompt = ("다음은 문서에 삽입된 시각자료(그림/차트/사진/화면 캡처)입니다. 한국어로 2~3문장으로 핵심만 설명하세요. "
+                  "그래프·차트면 종류와 주요 수치·추세를, 표/캡처면 핵심 내용과 보이는 문구를, "
+                  "사진·도식이면 무엇을 나타내는지 적으세요. 설명문만 출력하세요.")
+        content = [{"type": "text", "text": prompt},
+                   {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{cls.encode_image(img_path)}"}}]
+        for attempt in range(2):
+            try:
+                with _VLM_SEMAPHORE:
+                    r = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": content}],
+                        temperature=0.2, max_tokens=512, timeout=120)
+                return (r.choices[0].message.content or "").strip()
+            except Exception as e:
+                logger.warning(f"figure 설명 VLM 에러 (시도 {attempt+1}/2): {e}")
+                if attempt < 1:
+                    time.sleep(3)
+        return ""
+
+    @classmethod
     def extract_metadata(cls, txt_paths, img_paths, api_key, model_name):
         if not api_key or "여기에_" in api_key:
             return {}
@@ -1205,6 +1235,40 @@ class DocumentProcessor:
                 with open(meta_path, "w", encoding="utf-8") as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
                 logger.info(f"TOC {len(toc_entries)}개 항목 수집 완료")
+
+        # 시각자료 salvage: 렌더(H2Orestart)가 잘라먹을 수 있는 임베디드 이미지를
+        # BinData 원본에서 reading-order 위치/크기와 함께 복원 + VLM 설명 → figures.json
+        if ext in ('.hwp', '.hwpx') and api_key:
+            try:
+                from hwp_figures import extract_figures, significant
+                from PIL import Image
+                import io as _io
+                figs = significant(extract_figures(file_path))
+                if figs:
+                    set_progress(f"🖼️ 임베디드 시각자료 {len(figs)}건 복원·분석 중...", 99)
+                    fig_dir = os.path.join(doc_output_dir, "figures")
+                    os.makedirs(fig_dir, exist_ok=True)
+                    records = []
+                    for fobj in figs:
+                        try:
+                            im = Image.open(_io.BytesIO(fobj["data"])).convert("RGB")
+                        except Exception:
+                            continue
+                        fname = f"figure_{fobj['order']:04d}.png"
+                        im.save(os.path.join(fig_dir, fname))
+                        desc = VLMProcessor.describe_image(os.path.join(fig_dir, fname), api_key, model_name)
+                        records.append({
+                            "order": fobj["order"], "section": fobj["section"],
+                            "para_index": fobj["para_index"], "ref": fobj["ref"],
+                            "size_inch": [fobj["w_in"], fobj["h_in"]],
+                            "context": fobj.get("context", "")[:80],
+                            "image": f"figures/{fname}", "description": desc,
+                        })
+                    with open(os.path.join(doc_output_dir, "figures.json"), "w", encoding="utf-8") as ff:
+                        json.dump(records, ff, ensure_ascii=False, indent=2)
+                    logger.info(f"시각자료 salvage: {len(records)}건 → figures.json")
+            except Exception as e:
+                logger.warning(f"시각자료 salvage 실패: {e}")
 
         if chunk_strategies and output_format.lower() in ("json", "markdown"):
             try:
