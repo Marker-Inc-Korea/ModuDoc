@@ -106,6 +106,9 @@ def _emit(node, out):
 def extract_hwp5(path):
     if olefile is None:
         return "", "no-olefile"
+    with open(path, "rb") as f:
+        if f.read(17) == b"HWP Document File":
+            return "", "hwp3-unsupported"
     if not olefile.isOleFile(path):
         return "", "not-ole"
     ole = olefile.OleFileIO(path)
@@ -184,14 +187,37 @@ def _hwpx_table(tbl):
     return html + "</table>"
 
 
+def _hwpx_encrypted_paths(z):
+    enc = set()
+    try:
+        root = ET.fromstring(z.read("META-INF/manifest.xml"))
+    except Exception:
+        return enc
+    for fe in root.iter():
+        if _lname(fe.tag) != "file-entry":
+            continue
+        path = next((v for k, v in fe.attrib.items() if k.split('}')[-1] == "full-path"), None)
+        if path and any(_lname(c.tag) == "encryption-data" for c in fe):
+            enc.add(path)
+    return enc
+
+
 def extract_hwpx(path):
     try:
         out = []
         with zipfile.ZipFile(path) as z:
+            enc = _hwpx_encrypted_paths(z)
             secs = sorted([n for n in z.namelist() if re.match(r"Contents/section\d+\.xml", n)],
                           key=lambda x: int(re.search(r'\d+', x).group()))
+            if not secs:
+                return "", "no-section"
+            if any(s in enc for s in secs):
+                return "", "encrypted"
             for s in secs:
-                root = ET.fromstring(z.read(s))
+                try:
+                    root = ET.fromstring(z.read(s))
+                except ET.ParseError:
+                    return "", ("encrypted" if enc else "error:section-not-xml")
                 for p in root:
                     if _lname(p.tag) != "p": continue
                     t = _hwpx_para_text(p)
