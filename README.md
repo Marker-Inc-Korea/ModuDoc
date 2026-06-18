@@ -132,8 +132,8 @@ ModuDoc/
 ├── utils.py          # 핵심 파싱 로직 (하이브리드 텍스트 추출 + VLM 프롬프팅)
 ├── hwp_extract.py    # 네이티브 HWP/HWPX 텍스트·표 추출기 (외부 의존성 없음)
 ├── hwpx_paginate.py  # HWPX 페이지 경계 추정 유틸
-├── chunker.py        # 의미 기반 RAG 청킹 프로세서 (page / toc / tree)
-├── postprocess.py    # RAG 후처리 로직 (계층 경로 추적, 단일 마크다운 병합 등)
+├── hwp_figures.py    # HWP/HWPX 임베디드 이미지(시각자료) 위치-인식 salvage + VLM 설명
+├── chunker.py        # RAG 청킹·후처리 (page / toc / tree, 계층 경로 heading_path)
 ├── hwp_to_pdf.py     # Windows COM 기반 HWP/HWPX 무손실 변환기
 └── templates/        # 웹 UI 템플릿
 ```
