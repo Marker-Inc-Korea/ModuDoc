@@ -16,6 +16,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 
 _VLM_SEMAPHORE = threading.Semaphore(5)
+_SOFFICE_LOCK = threading.Lock()
 
 import fitz
 import openpyxl
@@ -742,8 +743,9 @@ class DocumentProcessor:
                 if platform.system() == "Windows":
                     startupinfo = subprocess.STARTUPINFO()
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               startupinfo=startupinfo, timeout=90)
+                with _SOFFICE_LOCK:
+                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   startupinfo=startupinfo, timeout=90)
                 if os.path.exists(generated):
                     os.rename(generated, sheet_pdf)
                     doc = fitz.open(sheet_pdf)
@@ -806,7 +808,8 @@ class DocumentProcessor:
             if platform.system() == "Windows":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo, timeout=90)
+            with _SOFFICE_LOCK:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo, timeout=90)
             if result.returncode != 0:
                 logger.error(f"LibreOffice 변환 실패 (code {result.returncode}): {result.stderr.decode('utf-8', errors='replace')}")
                 return None
@@ -1016,8 +1019,13 @@ class DocumentProcessor:
         excel_sheet_map = []
 
         if ext in ['.hwp', '.hwpx']:
-            set_progress(f"{ext.upper()} PDF 변환 중 (한글 COM)...", 5)
-            pdf_path = cls.convert_hwp_to_pdf_win32(file_path, temp_pdf_dir)
+            if platform.system() == "Windows":
+                set_progress(f"{ext.upper()} PDF 변환 중 (한글 COM)...", 5)
+                pdf_path = cls.convert_hwp_to_pdf_win32(file_path, temp_pdf_dir)
+            else:
+                set_progress(f"{ext.upper()} PDF 변환 중 (LibreOffice+H2Orestart)...", 5)
+                pdf_path = cls.convert_to_pdf(file_path, temp_pdf_dir)
+            two_up_split = platform.system() == "Windows"
 
             if pdf_path:
                 try:
@@ -1027,7 +1035,7 @@ class DocumentProcessor:
                     for i in range(len(doc)):
                         page = doc[i]
                         w, h = page.rect.width, page.rect.height
-                        is_two_up = w > h
+                        is_two_up = two_up_split and w > h
                         halves = (
                             [(0, 0, w / 2, h), (w / 2, 0, w, h)] if is_two_up
                             else [(0, 0, w, h)]
@@ -1054,7 +1062,7 @@ class DocumentProcessor:
                 except Exception as e:
                     raise Exception(f"{ext.upper()} PDF 변환 후 처리 실패: {e}")
             else:
-                raise Exception(f"{ext.upper()} → PDF 변환 실패. 한글(HWP) 프로그램이 설치되어 있는지 확인하세요.")
+                raise Exception(f"{ext.upper()} → PDF 변환 실패. (Windows: 한글 프로그램 / Linux: LibreOffice+H2Orestart 필요)")
 
         else:
             set_progress("일반 문서 시각 레이아웃 생성 중...", 10)
@@ -1197,7 +1205,7 @@ class DocumentProcessor:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
                 logger.info(f"TOC {len(toc_entries)}개 항목 수집 완료")
 
-        if chunk_strategies and output_format.lower() == "json":
+        if chunk_strategies and output_format.lower() in ("json", "markdown"):
             try:
                 from chunker import chunk_document
                 set_progress("📦 청킹 중...", 98)

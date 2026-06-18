@@ -60,6 +60,18 @@
                     </div>
                 </div>
 
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">동시 처리 문서 수 <span class="text-gray-400 font-normal">(서버 사양에 맞게 선택 — 높을수록 빠르나 GPU·메모리 사용량 ↑)</span></label>
+                    <select name="concurrency" class="w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500">
+                        <option value="1">1개 (가장 안전 / 저사양)</option>
+                        <option value="2">2개</option>
+                        <option value="3" selected>3개 (기본)</option>
+                        <option value="4">4개</option>
+                        <option value="6">6개</option>
+                        <option value="8">8개 (고사양 GPU)</option>
+                    </select>
+                </div>
+
                 <div class="flex items-center justify-center w-full">
                     <label for="dropzone-file" class="flex flex-col items-center justify-center w-full h-48 border-2 border-gray-300 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100 transition">
                         <div class="flex flex-col items-center justify-center pt-5 pb-6">

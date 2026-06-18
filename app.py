@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
 from utils import DocumentProcessor
+import utils
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = './documents'
@@ -63,6 +64,11 @@ def process_files():
     output_format = request.form.get('format', 'json')
     model_name = request.form.get('model', 'Qwen/Qwen3-VL-8B-Instruct')
     chunk_strategies = request.form.getlist('chunk')
+    try:
+        concurrency = max(1, min(16, int(request.form.get('concurrency', 3))))
+    except (TypeError, ValueError):
+        concurrency = 3
+    utils._VLM_SEMAPHORE = threading.Semaphore(concurrency)
     
     task_id = str(uuid.uuid4())
     tasks_progress[task_id] = {"progress": 0, "status": "업로드 중...", "is_done": False, "error": None, "processed": [], "docs": {}}
@@ -75,7 +81,7 @@ def process_files():
             file.save(file_path)
             saved_files.append((file_path, filename))
 
-    def background_worker(t_id, files_info, out_fmt, mod_name, chunk_strats):
+    def background_worker(t_id, files_info, out_fmt, mod_name, chunk_strats, conc):
         total_files = len(files_info)
         doc_progress = {f_name: 0 for _, f_name in files_info}
         doc_status = {f_name: "대기 중..." for _, f_name in files_info}
@@ -108,7 +114,7 @@ def process_files():
 
         try:
             processed_docs = []
-            max_workers = min(total_files, 3)
+            max_workers = min(total_files, conc)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_one, f_path, f_name): f_name
                            for f_path, f_name in files_info}
@@ -132,7 +138,7 @@ def process_files():
         finally:
             tasks_progress[t_id]["is_done"] = True
 
-    threading.Thread(target=background_worker, args=(task_id, saved_files, output_format, model_name, chunk_strategies)).start()
+    threading.Thread(target=background_worker, args=(task_id, saved_files, output_format, model_name, chunk_strategies, concurrency)).start()
     return jsonify({"message": "작업 시작됨", "task_id": task_id})
 
 @app.route('/api/download/<task_id>')
