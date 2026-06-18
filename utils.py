@@ -15,7 +15,7 @@ import zipfile
 import unicodedata
 import xml.etree.ElementTree as ET
 
-_VLM_SEMAPHORE = threading.Semaphore(5)
+_VLM_SEMAPHORE = threading.Semaphore(int(os.environ.get("VLM_CONCURRENCY", "5")))
 _SOFFICE_LOCK = threading.Lock()
 RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
 
@@ -678,7 +678,8 @@ If a field cannot be found, use null."""
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```"): raw = raw.split("\n", 1)[-1]
             if raw.endswith("```"): raw = raw.rsplit("```", 1)[0]
-            return json.loads(raw.strip())
+            parsed = json.loads(raw.strip())
+            return parsed if isinstance(parsed, dict) else {}
         except Exception as e:
             logger.error(f"메타데이터 추출 실패: {e}")
             return {}
@@ -1133,6 +1134,8 @@ class DocumentProcessor:
         meta_txts = [os.path.join(doc_output_dir, f"page_{str(i).zfill(4)}.txt") for i in range(1, 3)]
         meta_imgs = [os.path.join(doc_output_dir, f"page_{str(i).zfill(4)}.png") for i in range(1, 3)]
         metadata = VLMProcessor.extract_metadata(meta_txts, meta_imgs, api_key, model_name)
+        if not isinstance(metadata, dict):
+            metadata = {}
         metadata["source_file"] = filename
         if excel_sheet_map:
             metadata["sheets"] = excel_sheet_map
@@ -1285,6 +1288,18 @@ class DocumentProcessor:
                     if output_format.lower() in ("json", "markdown") and page_inserts:
                         from hwp_figures import insert_figures_into_pages
                         placed = insert_figures_into_pages(doc_output_dir, page_inserts)
+                        # markdown 모드: 페이지 .md 는 salvage 이전에 생성됐으므로 갱신된 json 으로 재생성
+                        if placed and output_format.lower() == "markdown":
+                            import glob as _glob
+                            for _pj in _glob.glob(os.path.join(doc_output_dir, "page_*_structured.json")):
+                                _stem = os.path.basename(_pj)[:-len("_structured.json")]
+                                try:
+                                    with open(_pj, encoding="utf-8") as _f:
+                                        _md = DocumentProcessor.json_to_markdown(_f.read())
+                                    with open(os.path.join(doc_output_dir, f"{_stem}_structured.md"), "w", encoding="utf-8") as _f:
+                                        _f.write(_md)
+                                except Exception as _e:
+                                    logger.warning(f"salvage 후 {_stem} 마크다운 재생성 실패: {_e}")
                     logger.info(f"시각자료 salvage: {len(records)}건 → figures.json, 페이지 삽입 {placed}건")
             except Exception as e:
                 logger.warning(f"시각자료 salvage 실패: {e}")

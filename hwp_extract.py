@@ -113,7 +113,10 @@ def extract_hwp5(path):
         return "", "not-ole"
     ole = olefile.OleFileIO(path)
     try:
-        hdr = ole.openstream('FileHeader').read()
+        try:
+            hdr = ole.openstream('FileHeader').read()
+        except (IOError, OSError):
+            return "", "not-hwp5"   # OLE2 이지만 HWP FileHeader 없음 (.doc/.xls/.ppt 등)
         flags = hdr[36] if len(hdr) > 36 else 0
         comp = bool(flags & 1); enc = bool(flags & 2); dist = bool(flags & 4)
         if enc:
@@ -217,7 +220,7 @@ def extract_hwpx(path):
                 try:
                     root = ET.fromstring(z.read(s))
                 except ET.ParseError:
-                    return "", ("encrypted" if enc else "error:section-not-xml")
+                    return "", "error:section-not-xml"
                 for p in root:
                     if _lname(p.tag) != "p": continue
                     t = _hwpx_para_text(p)

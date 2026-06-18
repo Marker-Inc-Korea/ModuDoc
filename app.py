@@ -9,7 +9,6 @@ import re
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
 from utils import DocumentProcessor
-import utils
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = './documents'
@@ -68,8 +67,6 @@ def process_files():
         concurrency = max(1, min(16, int(request.form.get('concurrency', 3))))
     except (TypeError, ValueError):
         concurrency = 3
-    utils._VLM_SEMAPHORE = threading.Semaphore(concurrency)
-    
     task_id = str(uuid.uuid4())
     tasks_progress[task_id] = {"progress": 0, "status": "업로드 중...", "is_done": False, "error": None, "processed": [], "docs": {}}
 
@@ -80,6 +77,10 @@ def process_files():
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
             saved_files.append((file_path, filename))
+
+    if not saved_files:
+        tasks_progress.pop(task_id, None)
+        return jsonify({"error": "유효한 파일이 없습니다."}), 400
 
     def background_worker(t_id, files_info, out_fmt, mod_name, chunk_strats, conc):
         total_files = len(files_info)
@@ -114,7 +115,7 @@ def process_files():
 
         try:
             processed_docs = []
-            max_workers = min(total_files, conc)
+            max_workers = max(1, min(total_files, conc))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_one, f_path, f_name): f_name
                            for f_path, f_name in files_info}
