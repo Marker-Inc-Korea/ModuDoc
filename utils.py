@@ -18,6 +18,81 @@ import xml.etree.ElementTree as ET
 _VLM_SEMAPHORE = threading.Semaphore(int(os.environ.get("VLM_CONCURRENCY", "5")))
 _SOFFICE_LOCK = threading.Lock()
 RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
+# HWP/HWPX 렌더러로 rhwp 사용(기본 ON). rhwp 미설치/렌더 실패 시 LibreOffice 로 자동 폴백.
+USE_RHWP = os.environ.get("USE_RHWP", "1") == "1"
+_RHWP_MOD = None
+_RHWP_INIT_LOCK = threading.Lock()
+_RHWP_FT_CANDIDATES = ["/lib/x86_64-linux-gnu/libfreetype.so.6", "/usr/lib/x86_64-linux-gnu/libfreetype.so.6"]
+
+def _ensure_min_fontconfig():
+    # rhwp(Skia)는 글자마다 시스템 폰트 전체를 폴백 스캔하므로 폰트가 수천 개면 페이지당 수십 초가 걸린다.
+    # 한글 + 기본 Latin 폰트만 담은 최소 fontconfig 를 만들어 FONTCONFIG_FILE 로 지정(렌더 속도 ~100배).
+    # RHWP_FONTCONFIG 로 직접 지정하거나 FONTCONFIG_FILE 가 이미 있으면 그대로 둔다.
+    if os.environ.get("FONTCONFIG_FILE"):
+        return
+    cfg = os.environ.get("RHWP_FONTCONFIG")
+    if cfg and os.path.exists(cfg):
+        os.environ["FONTCONFIG_FILE"] = cfg
+        return
+    import glob, tempfile
+    pats = ["HCR*", "NotoSansCJK*", "NotoSerifCJK*", "NanumGothic*", "NanumMyeongjo*",
+            "malgun*", "*Batang*", "*Gulim*", "DejaVuSans*", "DejaVuSerif*",
+            "LiberationSans*", "LiberationSerif*"]
+    dirs = [os.path.expanduser("~/.local/share/fonts"),
+            "/usr/share/fonts/truetype/nanum", "/usr/share/fonts/opentype/noto",
+            "/usr/share/fonts/truetype/noto", "/usr/share/fonts/truetype/dejavu",
+            "/usr/share/fonts/truetype/liberation", "/usr/share/fonts", "/usr/local/share/fonts"]
+    found = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for p in pats:
+            found += glob.glob(os.path.join(d, "**", p), recursive=True)
+    found = sorted({f for f in found if os.path.isfile(f)})[:80]
+    if not found:
+        return
+    base = os.path.join(tempfile.gettempdir(), "rhwp_fonts")
+    os.makedirs(base, exist_ok=True)
+    for f in found:
+        ln = os.path.join(base, os.path.basename(f))
+        try:
+            if not os.path.lexists(ln):
+                os.symlink(f, ln)
+        except OSError:
+            pass
+    cachedir = os.path.join(tempfile.gettempdir(), "rhwp_fc_cache")
+    os.makedirs(cachedir, exist_ok=True)
+    conf = os.path.join(tempfile.gettempdir(), "rhwp_min_fonts.conf")
+    with open(conf, "w", encoding="utf-8") as fp:
+        fp.write('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n'
+                 '<fontconfig>\n  <dir>%s</dir>\n  <cachedir>%s</cachedir>\n</fontconfig>\n' % (base, cachedir))
+    os.environ["FONTCONFIG_FILE"] = conf
+
+def _load_rhwp():
+    global _RHWP_MOD
+    if _RHWP_MOD is None:
+        with _RHWP_INIT_LOCK:
+            if _RHWP_MOD is None:
+                _ensure_min_fontconfig()
+                import ctypes
+                for _p in _RHWP_FT_CANDIDATES:
+                    try:
+                        ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+                        break
+                    except OSError:
+                        continue
+                # rhwp 코어가 stdout 으로 레이아웃 진단(LAYOUT_OVERFLOW 등)을 다량 출력한다.
+                # 앱은 로깅(stderr)/콜백/파일로 통신하므로 기본적으로 stdout 을 억제(RHWP_QUIET=0 로 해제).
+                if os.environ.get("RHWP_QUIET", "1") != "0":
+                    try:
+                        _null = os.open(os.devnull, os.O_WRONLY)
+                        os.dup2(_null, 1)
+                        os.close(_null)
+                    except OSError:
+                        pass
+                import rhwp as _r
+                _RHWP_MOD = _r
+    return _RHWP_MOD
 
 import fitz
 import openpyxl
@@ -816,6 +891,37 @@ class DocumentProcessor:
         return merged_pdf_path, sheet_map
 
     @classmethod
+    def _render_hwp_with_rhwp(cls, input_path, doc_output_dir):
+        import re as _re, html as _html
+        rhwp = _load_rhwp()
+        doc = rhwp.parse(input_path)
+        n = doc.page_count
+        if not n:
+            return 0
+        scale = RENDER_DPI / 96.0
+        out_page = 0
+        for i in range(n):
+            try:
+                png = doc.render_png(i, scale=scale)
+            except Exception as e:
+                logger.warning(f"rhwp page {i} render 실패: {e}")
+                continue
+            out_page += 1
+            pnum = str(out_page).zfill(4)
+            with open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb") as f:
+                f.write(png)
+            try:
+                svg = doc.render_svg(i)
+                runs = _re.findall(r"<text[^>]*>(.*?)</text>", svg, flags=_re.S)
+                txt = " ".join(_html.unescape(_re.sub(r"<[^>]+>", "", t)).strip() for t in runs if t.strip())
+                txt = _re.sub(r"\s+", " ", txt).strip()
+            except Exception:
+                txt = ""
+            with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as f:
+                f.write(HWPTextExtractor.text_preprocessing(txt) if txt else "")
+        return out_page
+
+    @classmethod
     def convert_to_pdf(cls, input_path, output_dir):
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         cmd_exe = cls.get_libreoffice_cmd()
@@ -1052,7 +1158,20 @@ class DocumentProcessor:
         excel_sheet_map = []
 
         if ext in ['.hwp', '.hwpx']:
-            if platform.system() == "Windows":
+            pdf_path = None
+            rhwp_done = False
+            if USE_RHWP and platform.system() != "Windows":
+                try:
+                    set_progress(f"{ext.upper()} rhwp 렌더 중...", 5)
+                    op = cls._render_hwp_with_rhwp(file_path, doc_output_dir)
+                    if op:
+                        rhwp_done = True
+                        set_progress(f"{ext.upper()} rhwp 렌더 완료 ({op}쪽)", 20)
+                except Exception as e:
+                    logger.warning(f"rhwp 렌더 실패, 폴백 사용: {e}")
+            if rhwp_done:
+                pass
+            elif platform.system() == "Windows":
                 set_progress(f"{ext.upper()} PDF 변환 중 (한글 COM)...", 5)
                 pdf_path = cls.convert_hwp_to_pdf_win32(file_path, temp_pdf_dir)
             else:
@@ -1060,7 +1179,9 @@ class DocumentProcessor:
                 pdf_path = cls.convert_to_pdf(file_path, temp_pdf_dir)
             two_up_split = platform.system() == "Windows"
 
-            if pdf_path:
+            if rhwp_done:
+                pass
+            elif pdf_path:
                 try:
                     doc = fitz.open(pdf_path)
                     out_page = 0
@@ -1240,9 +1361,10 @@ class DocumentProcessor:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
                 logger.info(f"TOC {len(toc_entries)}개 항목 수집 완료")
 
-        # 시각자료 salvage: 렌더(H2Orestart)가 잘라먹을 수 있는 임베디드 이미지를
-        # BinData 원본에서 reading-order 위치/크기와 함께 복원 + VLM 설명 → figures.json
-        if ext in ('.hwp', '.hwpx') and api_key:
+        # 시각자료 salvage: 렌더가 잘라먹을 수 있는 임베디드 이미지를 BinData 원본에서
+        # reading-order 위치/크기와 함께 복원 + VLM 설명 → figures.json.
+        # rhwp 렌더(rhwp_done)는 이미지를 페이지에 온전히 그려 VLM 이 직접 잡으므로 salvage 불필요(중복+VLM 낭비) → 폴백(LibreOffice)일 때만 수행.
+        if ext in ('.hwp', '.hwpx') and api_key and not rhwp_done:
             try:
                 from hwp_figures import extract_figures, significant
                 from PIL import Image

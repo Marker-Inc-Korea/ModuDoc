@@ -70,7 +70,12 @@ git clone https://github.com/Marker-Inc-Korea/ModuDoc.git
 cd ModuDoc
 pip install -r requirements.txt
 ```
-*(Windows 환경에서 HWP 파일 처리를 위해서는 한글과컴퓨터 한글(HWP) 프로그램이 설치되어 있어야 합니다.)*
+
+**HWP/HWPX 렌더링**: 리눅스에서는 `rhwp`(Skia 기반 네이티브 렌더러)를 기본으로 사용하여 별도 도구 없이 HWP/HWPX를 페이지 이미지로 렌더합니다. 표 겹침·임베디드 이미지 잘림이 없고 한글 원본에 가까운 페이지네이션을 제공합니다. 정확한 글자 조판을 위해 **한글 폰트(함초롬 HCR / Noto CJK KR / 나눔)** 설치를 권장합니다.
+- `rhwp` 미설치 또는 렌더 실패(암호화·손상 파일 등) 시 **LibreOffice + H2Orestart 로 자동 폴백**합니다(설치되어 있으면).
+- `USE_RHWP=0` 으로 rhwp 경로를 끄고 항상 LibreOffice 를 쓰게 할 수 있습니다.
+
+*(Windows 환경에서 무손실 변환을 위해서는 한글과컴퓨터 한글(HWP) 프로그램이 설치되어 있어야 합니다.)*
 
 ### 2. 환경 변수 설정 (Configuration)
 기본적으로 **로컬 VLM**(vLLM 등 OpenAI 호환 엔드포인트)을 사용합니다. 모델을 로컬에 서빙한 뒤, 그 주소를 `VLM_BASE_URL`로 지정하면 됩니다. (별도 API 키 불필요)
@@ -83,6 +88,17 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 # (인증이 필요한 엔드포인트라면) export VLM_API_KEY="your_key"
 ```
 > 💡 `/api/process`의 `model` 파라미터(기본 `Qwen/Qwen3-VL-8B-Instruct`)는 **서빙 중인 모델 이름과 일치**해야 합니다.
+
+<details><summary>HWP 렌더(rhwp) 관련 선택 환경변수</summary>
+
+| 변수 | 기본 | 설명 |
+|---|---|---|
+| `USE_RHWP` | `1` | HWP/HWPX 를 rhwp 로 렌더. `0` 이면 LibreOffice 만 사용 |
+| `RHWP_FONTCONFIG` | (자동) | 한글 폰트만 담은 최소 `fonts.conf` 경로. 미지정 시 자동 생성(시스템 폰트가 수천 개면 렌더가 느려지는 것을 방지) |
+| `RHWP_QUIET` | `1` | rhwp 코어의 stdout 진단 로그 억제. `0` 이면 출력 |
+| `RENDER_DPI` | `200` | 렌더 해상도 |
+
+</details>
 
 ### 3. 서버 실행 (Run)
 ```bash

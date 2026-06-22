@@ -5,6 +5,10 @@ beautifulsoup4>=4.12.0
 olefile>=0.47
 Pillow>=10.0.0
 
+# HWP/HWPX 네이티브 렌더러(Skia 기반, LibreOffice 불필요). 미설치/렌더 실패 시 LibreOffice 로 자동 폴백.
+# USE_RHWP=0 으로 끌 수 있음. 한글 폰트(함초롬/Noto CJK 등) 설치 권장.
+rhwp-python>=0.7.0
+
 # VLM backend: any OpenAI-compatible endpoint via VLM_BASE_URL (e.g. local vLLM)
 openai>=1.40.0
 
