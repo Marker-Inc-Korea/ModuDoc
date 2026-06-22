@@ -95,8 +95,9 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 |---|---|---|
 | `USE_RHWP` | `1` | HWP/HWPX 를 rhwp 로 렌더. `0` 이면 LibreOffice 만 사용 |
 | `RHWP_FONTCONFIG` | (자동) | 한글 폰트만 담은 최소 `fonts.conf` 경로. 미지정 시 자동 생성(시스템 폰트가 수천 개면 렌더가 느려지는 것을 방지) |
-| `RHWP_QUIET` | `1` | rhwp 코어의 stdout 진단 로그 억제. `0` 이면 출력 |
 | `RENDER_DPI` | `200` | 렌더 해상도 |
+
+> rhwp 코어는 레이아웃 진단(`LAYOUT_OVERFLOW` 등)을 **stderr** 로 출력합니다(기능엔 무해). 로그가 거슬리면 프로세스 stderr 를 리다이렉트하세요.
 
 </details>
 

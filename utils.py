@@ -81,15 +81,9 @@ def _load_rhwp():
                         break
                     except OSError:
                         continue
-                # rhwp 코어가 stdout 으로 레이아웃 진단(LAYOUT_OVERFLOW 등)을 다량 출력한다.
-                # 앱은 로깅(stderr)/콜백/파일로 통신하므로 기본적으로 stdout 을 억제(RHWP_QUIET=0 로 해제).
-                if os.environ.get("RHWP_QUIET", "1") != "0":
-                    try:
-                        _null = os.open(os.devnull, os.O_WRONLY)
-                        os.dup2(_null, 1)
-                        os.close(_null)
-                    except OSError:
-                        pass
+                # 참고: rhwp 코어는 레이아웃 진단(LAYOUT_OVERFLOW 등)을 stderr 로 출력한다.
+                # stderr 는 앱 로거와 공유라 인프로세스에서 안전하게 끌 수 없으므로(스레드 공유+로그 손실),
+                # 노이즈가 거슬리면 프로세스 stderr 를 배포 레벨에서 리다이렉트할 것.
                 import rhwp as _r
                 _RHWP_MOD = _r
     return _RHWP_MOD
