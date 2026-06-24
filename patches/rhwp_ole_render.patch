@@ -1,0 +1,244 @@
+--- /tmp/orig_src/rhwp_python-0.8.0/external/rhwp/src/parser/ole_container.rs	2006-07-24 10:21:28.000000000 +0900
++++ rhwp_python-0.8.0/external/rhwp/src/parser/ole_container.rs	2026-06-24 10:25:24.223345658 +0900
+@@ -31,6 +31,9 @@
+ pub struct OleContainer {
+     /// `\x02OlePres000` 스트림에서 추출한 EMF 바이트 (OLE Presentation Stream 헤더 스킵됨)
+     pub preview_emf: Option<Vec<u8>>,
++    /// `\x02OlePres000` 이 WMF(CF_METAFILEPICT) 프리뷰일 때 추출한 WMF 바이트
++    /// (ChemDraw 등 OLE 객체는 EMF 대신 표준 WMF 프리뷰를 저장하는 경우가 많다)
++    pub preview_wmf: Option<Vec<u8>>,
+     /// `OOXMLChartContents` 원본 바이트 (OOXML 차트 XML)
+     pub ooxml_chart: Option<Vec<u8>>,
+     /// `Contents` 원본 바이트 (내부 OLE 데이터)
+@@ -78,6 +81,10 @@
+                 let mut buf = Vec::new();
+                 if s.read_to_end(&mut buf).is_ok() {
+                     container.preview_emf = strip_ole_presentation_header(&buf);
++                    // EMF 프리뷰가 아니면 WMF(CF_METAFILEPICT) 프리뷰를 시도
++                    if container.preview_emf.is_none() {
++                        container.preview_wmf = strip_ole_presentation_header_wmf(&buf);
++                    }
+                 }
+             }
+         } else if name == "OOXMLChartContents" {
+@@ -87,11 +94,18 @@
+                     container.ooxml_chart = Some(buf);
+                 }
+             }
+-        } else if name == "Contents" {
++        } else if name.eq_ignore_ascii_case("Contents") {
++            // 스트림명은 한컴 OLE 에서 "Contents"/"CONTENTS" 둘 다 쓰인다(대소문자 무시).
+             if let Ok(mut s) = comp.open_stream(&path) {
+                 let mut buf = Vec::new();
+                 if s.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+-                    container.raw_contents = Some(buf);
++                    // StaticDib(Picture) OLE 는 Contents 가 그대로 BMP/PNG/JPEG 인 경우가 많다.
++                    // 네이티브 이미지면 raw_contents(차트 경로) 가 아니라 native_image 로 둔다.
++                    if let Some(img) = detect_native_image(&buf) {
++                        container.native_image = Some(img);
++                    } else {
++                        container.raw_contents = Some(buf);
++                    }
+                 }
+             }
+         } else if name == "\u{0001}Ole10Native" || name.ends_with("Ole10Native") {
+@@ -109,7 +123,10 @@
+     }
+ 
+     // preview_emf가 없으면 OlePres000에서 DIB 추출 시도 → BMP로 포장
+-    if container.preview_emf.is_none() && container.native_image.is_none() {
++    if container.preview_emf.is_none()
++        && container.preview_wmf.is_none()
++        && container.native_image.is_none()
++    {
+         // OlePres000을 다시 읽어 DIB 헤더를 찾아본다
+         // (이미 preview_emf가 None인 경우만)
+         if let Ok(entries) = std::panic::catch_unwind(|| {
+@@ -144,6 +161,7 @@
+     }
+ 
+     if container.preview_emf.is_some()
++        || container.preview_wmf.is_some()
+         || container.ooxml_chart.is_some()
+         || container.raw_contents.is_some()
+         || container.native_image.is_some()
+@@ -253,6 +271,28 @@
+             return Some(data[i..].to_vec());
+         }
+     }
++    None
++}
++
++/// OLE Presentation Stream(`\x02OlePres000`) 안의 표준 WMF(CF_METAFILEPICT) 본체를 찾는다.
++/// WMF METAHEADER: u16 mtType(1=memory|2=disk), u16 mtHeaderSize(=0x0009 words),
++/// u16 mtVersion(0x0300=WMF3.0 | 0x0100). placeable(0x9AC6CDD7) 헤더는 OlePres 에 보통 없음.
++fn strip_ole_presentation_header_wmf(data: &[u8]) -> Option<Vec<u8>> {
++    if data.len() < 64 {
++        return None;
++    }
++    let scan_limit = data.len().min(4096);
++    for i in 0..scan_limit.saturating_sub(18) {
++        let mt_type = u16::from_le_bytes([data[i], data[i + 1]]);
++        let hdr_size = u16::from_le_bytes([data[i + 2], data[i + 3]]);
++        let version = u16::from_le_bytes([data[i + 4], data[i + 5]]);
++        if (mt_type == 1 || mt_type == 2)
++            && hdr_size == 0x0009
++            && (version == 0x0300 || version == 0x0100)
++        {
++            return Some(data[i..].to_vec());
++        }
++    }
+     None
+ }
+ 
+--- /tmp/orig_src/rhwp_python-0.8.0/external/rhwp/src/parser/hwpx/reader.rs	2006-07-24 10:21:28.000000000 +0900
++++ rhwp_python-0.8.0/external/rhwp/src/parser/hwpx/reader.rs	2026-06-24 15:14:14.582168560 +0900
+@@ -18,9 +18,10 @@
+ 
+ /// XML 엔트리(section, header, content.hpf 등) 엔트리당 압축 해제 상한.
+ ///
+-/// 실제 정부 보도자료·법령 HWPX에서도 section.xml이 이 한도를 넘는 경우는
+-/// 없다. 초과 시 압축 해제 폭탄으로 판단해 차단한다.
+-pub const MAX_XML_SIZE: usize = 32 * 1024 * 1024; // 32 MB
++/// 대형 법령/규격 HWPX(식품첨가물 기준규격 전문 ~33MB, 대한민국약전 의약품각조
++/// ~44MB 등)는 section.xml이 32MB를 넘는다(압축비 ~8–12x = 정상, bomb 아님).
++/// 이런 정상 대형 문서를 수용하기 위해 상한을 올린다. GB급 압축폭탄은 여전히 차단.
++pub const MAX_XML_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+ 
+ /// BinData(이미지·폰트 등) 엔트리당 압축 해제 상한.
+ pub const MAX_BINDATA_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+--- /tmp/orig_src/rhwp_python-0.8.0/external/rhwp/src/renderer/layout/shape_layout.rs	2006-07-24 10:21:28.000000000 +0900
++++ rhwp_python-0.8.0/external/rhwp/src/renderer/layout/shape_layout.rs	2026-06-24 11:32:51.604650927 +0900
+@@ -1529,20 +1529,26 @@
+                                             rendered = true;
+                                         }
+                                         Err(error) => {
+-                                            push_placeholder_render_node(
+-                                                tree,
+-                                                parent,
+-                                                BoundingBox::new(
+-                                                    render_x, render_y, render_w, render_h,
+-                                                ),
+-                                                0xFFFFF4E5,
+-                                                0xFFB45F06,
+-                                                ole_chart_fallback_label(
+-                                                    error.stable_message(),
+-                                                    ole.bin_data_id,
+-                                                ),
+-                                            );
+-                                            rendered = true;
++                                            // Contents 가 HWP 차트가 아닌 경우(예: ChemDraw OLE):
++                                            // EMF/WMF 프리뷰가 있으면 그쪽으로 폴백되도록 placeholder 를 건너뛴다.
++                                            if container.preview_emf.is_none()
++                                                && container.preview_wmf.is_none()
++                                            {
++                                                push_placeholder_render_node(
++                                                    tree,
++                                                    parent,
++                                                    BoundingBox::new(
++                                                        render_x, render_y, render_w, render_h,
++                                                    ),
++                                                    0xFFFFF4E5,
++                                                    0xFFB45F06,
++                                                    ole_chart_fallback_label(
++                                                        error.stable_message(),
++                                                        ole.bin_data_id,
++                                                    ),
++                                                );
++                                                rendered = true;
++                                            }
+                                         }
+                                     }
+                                 }
+@@ -1578,6 +1584,63 @@
+                                 }
+                             }
+ 
++                            // OLE 프리뷰가 WMF(CF_METAFILEPICT)일 때: 기존 WMF 컨버터로 SVG 변환 후 <image> 배치
++                            if !rendered {
++                                if let Some(wmf_bytes) = container.preview_wmf.as_ref() {
++                                    if let Some(svg_bytes) =
++                                        crate::renderer::svg::convert_wmf_to_svg(wmf_bytes)
++                                    {
++                                        // WMF→SVG(<svg viewBox="0 0 W H">본문</svg>)를 render rect 로
++                                        // translate+scale 한 <g> 로 인라인한다. (네이티브 raster 는 <image> 의
++                                        // image/svg+xml data-URI 를 디코드하지 못하므로 프리미티브로 펼친다)
++                                        let wmf_svg = String::from_utf8_lossy(&svg_bytes);
++                                        let (vb_w, vb_h) = wmf_svg
++                                            .find("viewBox=\"")
++                                            .and_then(|i| wmf_svg[i + 9..].split('"').next())
++                                            .map(|vb| {
++                                                let n: Vec<f64> = vb
++                                                    .split_whitespace()
++                                                    .filter_map(|s| s.parse().ok())
++                                                    .collect();
++                                                if n.len() == 4 {
++                                                    (n[2], n[3])
++                                                } else {
++                                                    (render_w, render_h)
++                                                }
++                                            })
++                                            .unwrap_or((render_w, render_h));
++                                        let body = wmf_svg
++                                            .find('>')
++                                            .map(|i| &wmf_svg[i + 1..])
++                                            .unwrap_or(wmf_svg.as_ref())
++                                            .trim_end()
++                                            .trim_end_matches("</svg>");
++                                        // 네이티브 raster 는 조각을 viewBox="0 0 w h"(로컬 원점)로 감싸므로
++                                        // WMF 콘텐츠를 bbox 크기에 맞춰 scale 만 한다 (translate 금지).
++                                        let sx = if vb_w > 0.0 { render_w / vb_w } else { 1.0 };
++                                        let sy = if vb_h > 0.0 { render_h / vb_h } else { 1.0 };
++                                        let svg_fragment = format!(
++                                            "<g transform=\"scale({:.5},{:.5})\">{}</g>",
++                                            sx, sy, body
++                                        );
++                                        let node_id = tree.next_id();
++                                        let node = RenderNode::new(
++                                            node_id,
++                                            RenderNodeType::RawSvg(
++                                                crate::renderer::render_tree::RawSvgNode {
++                                                    svg: svg_fragment,
++                                                },
++                                            ),
++                                            BoundingBox::new(
++                                                render_x, render_y, render_w, render_h,
++                                            ),
++                                        );
++                                        parent.children.push(node);
++                                        rendered = true;
++                                    }
++                                }
++                            }
++
+                             // 네이티브 임베딩 이미지(BMP/PNG/JPEG/GIF) 폴백
+                             if !rendered {
+                                 if let Some((kind, bytes)) = container.native_image.as_ref() {
+@@ -1602,9 +1665,11 @@
+                                     let b64 = base64::engine::general_purpose::STANDARD
+                                         .encode(&*render_bytes);
+                                     let href = format!("data:{};base64,{}", render_mime, b64);
++                                    // 네이티브 raster 는 조각을 viewBox="0 0 w h"(로컬 원점)로 감싸므로
++                                    // <image> 좌표는 페이지절대(render_x,y)가 아니라 (0,0)이어야 한다.
+                                     let svg_fragment = format!(
+-                                    "<image x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" preserveAspectRatio=\"xMidYMid meet\" xlink:href=\"{}\" href=\"{}\"/>",
+-                                    render_x, render_y, render_w, render_h, href, href
++                                    "<image x=\"0\" y=\"0\" width=\"{:.2}\" height=\"{:.2}\" preserveAspectRatio=\"xMidYMid meet\" xlink:href=\"{}\" href=\"{}\"/>",
++                                    render_w, render_h, href, href
+                                 );
+                                     let node_id = tree.next_id();
+                                     let node = RenderNode::new(
+--- /tmp/orig_src/rhwp_python-0.8.0/external/rhwp/src/renderer/skia/image_conv.rs	2006-07-24 10:21:28.000000000 +0900
++++ rhwp_python-0.8.0/external/rhwp/src/renderer/skia/image_conv.rs	2026-06-24 14:36:34.823931369 +0900
+@@ -338,8 +338,10 @@
+         return None;
+     }
+ 
++    // xmlns:xlink 선언 필수: native_image 조각이 xlink:href 를 쓰는데 이게 없으면
++    // 미선언 네임스페이스로 XML 파싱이 실패해 usvg::Tree::from_str 가 None 을 반환한다.
+     let svg = format!(
+-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.2}\" height=\"{height:.2}\" viewBox=\"0 0 {width:.2} {height:.2}\">{svg_fragment}</svg>"
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{width:.2}\" height=\"{height:.2}\" viewBox=\"0 0 {width:.2} {height:.2}\">{svg_fragment}</svg>"
+     );
+     let options = svg_parse_options();
+     let tree = usvg::Tree::from_str(&svg, &options).ok()?;

@@ -7,7 +7,10 @@ Pillow>=10.0.0
 
 # HWP/HWPX 네이티브 렌더러(Skia 기반, LibreOffice 불필요). 미설치/렌더 실패 시 LibreOffice 로 자동 폴백.
 # USE_RHWP=0 으로 끌 수 있음. 한글 폰트(함초롬/Noto CJK 등) 설치 권장.
-rhwp-python>=0.7.0
+# Linux x86_64: OLE 완전 렌더(ChemDraw 화학구조식/StaticDib 비트맵/초대형 규정문서) 패치 빌드 사용(patches/ 참조).
+# 그 외 플랫폼(Windows 는 한글 COM 사용): 공식 패키지.
+vendor/rhwp_python-0.8.0-cp310-abi3-manylinux_2_38_x86_64.whl ; platform_system == "Linux" and platform_machine == "x86_64"
+rhwp-python>=0.7.0 ; platform_system != "Linux" or platform_machine != "x86_64"
 
 # VLM backend: any OpenAI-compatible endpoint via VLM_BASE_URL (e.g. local vLLM)
 openai>=1.40.0
