@@ -18,6 +18,43 @@ import xml.etree.ElementTree as ET
 _VLM_SEMAPHORE = threading.Semaphore(int(os.environ.get("VLM_CONCURRENCY", "5")))
 _SOFFICE_LOCK = threading.Lock()
 RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
+
+# VLM 호출 상한 노브(기본값은 기존 동작과 동일 — 정상 페이지엔 영향 없음)
+VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "300"))                   # 구조추출 VLM 호출 타임아웃(초)
+VLM_MAX_ATTEMPTS = max(1, int(os.environ.get("VLM_MAX_ATTEMPTS", "3")))   # 한 페이지 추출의 최대 시도 수
+DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
+
+
+def _vlm_finish_reason(response):
+    """choices[0].finish_reason 안전 추출(백엔드마다 없을 수 있음)."""
+    try:
+        return getattr(response.choices[0], "finish_reason", None)
+    except Exception:
+        return None
+
+
+def _is_runaway_repeat(text, min_repeats=16, max_unit=512, tail=8192):
+    """출력 꼬리가 같은 조각의 연속 반복(주기 ≤max_unit)으로 끝나면 True(반복 생성 지문).
+    단일 반복뿐 아니라 A,B,A,B 같은 순환도 'AB' 단위로 잡는다(주기성→위상 무관).
+    정상 문서·표는 동일 조각을 십수 번 연속 반복하며 끝나지 않으므로 고정밀."""
+    if not text:
+        return False
+    t = text[-tail:].rstrip()
+    n = len(t)
+    if n < 32:
+        return False
+    upper = min(max_unit, n // min_repeats)
+    for unit in range(2, upper + 1):
+        seg = t[n - unit:]
+        if not seg.strip():
+            continue
+        reps, pos = 1, n - 2 * unit
+        while pos >= 0 and t[pos:pos + unit] == seg:
+            reps += 1
+            pos -= unit
+        if reps >= min_repeats:
+            return True
+    return False
 # HWP/HWPX 렌더러로 rhwp 사용(기본 ON). rhwp 미설치/렌더 실패 시 LibreOffice 로 자동 폴백.
 USE_RHWP = os.environ.get("USE_RHWP", "1") == "1"
 _RHWP_MOD = None
@@ -497,15 +534,23 @@ class VLMProcessor:
 
     @classmethod
     def extract_structure(cls, txt_path, img_path=None, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-8B-Instruct"):
-        if not api_key or "여기에_" in api_key: return None
+        # 반환: (구조 문자열 또는 None, retryable). retryable=False 면 동일 입력 재시도가 무의미
+        # (반복 루프·타임아웃·유효성 실패) → 호출자의 최종재시도 패스에서 제외.
+        if not api_key or "여기에_" in api_key:
+            return None, False
 
         try:
             from openai import OpenAI
+            try:
+                from openai import APITimeoutError as _APITimeout
+            except Exception:
+                class _APITimeout(Exception):
+                    pass
             base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
-            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=300, max_retries=0)
+            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=VLM_TIMEOUT, max_retries=0)
         except Exception as e:
             logger.error(f"VLM 클라이언트 초기화 오류: {e}")
-            return None
+            return None, False
 
         with open(txt_path, "r", encoding="utf-8") as f:
             extracted_text = f.read()
@@ -624,17 +669,34 @@ Based on the raw text and the visual layout in the image (if provided), structur
             if t.endswith("```"): t = t[:-3]
             return t.strip()
 
-        for attempt in range(3):
+        N = VLM_MAX_ATTEMPTS
+        best_result, best_cov = None, -1.0   # 최고 coverage 후보 — 재시도가 결과를 악화시키지 못하게
+        escalated = False                     # 루프/타임아웃 의심 시 1회 한정 고온 탈출
+        for attempt in range(N):
+            last = attempt >= N - 1
             try:
                 with _VLM_SEMAPHORE:
                     response = client.chat.completions.create(
                         model=model_name,
                         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
-                        temperature=0.1,
+                        temperature=0.5 if escalated else 0.1,   # 의심(반복/타임아웃) 시에만 고온으로 전환
                         max_tokens=16384,
-                        timeout=300
+                        timeout=VLM_TIMEOUT
                     )
-                result = _strip_fences(response.choices[0].message.content)
+                finish = _vlm_finish_reason(response)
+                result = _strip_fences(response.choices[0].message.content or "")
+
+                # 반복 생성(같은 조각 무한 반복) 차단: 동일 입력 재시도는 무의미하므로 1회 고온 탈출만
+                # 시도하고, 그래도 반복이면 폐기(최고후보 없으면 호출자가 텍스트 폴백).
+                if result and _is_runaway_repeat(result):
+                    logger.warning(f"반복 생성 감지 (시도 {attempt+1}/{N}, finish={finish}) — 토큰 런어웨이 차단")
+                    if not escalated and not last:
+                        escalated = True
+                        time.sleep(2)
+                        continue
+                    return best_result, False
+
+                truncated = (finish == "length")   # max_tokens 도달 = 미완(반복이거나 초대형 페이지)
 
                 if output_format.lower() == "json":
                     try:
@@ -645,39 +707,53 @@ Based on the raw text and the visual layout in the image (if provided), structur
                             parsed = json.loads(sanitized)
                             result = sanitized
                         except json.JSONDecodeError:
-                            logger.warning(f"JSON 파싱 오류 (시도 {attempt+1}/3): {je} — 재시도")
-                            if attempt < 2:
+                            logger.warning(f"JSON 파싱 오류 (시도 {attempt+1}/{N}): {je} — 재시도")
+                            if not last:
                                 time.sleep(5 * (attempt + 1))
                                 continue
-                            logger.error("JSON 유효성 검증 3회 실패, 건너뜀")
-                            return None
-                    # 내용 기반 truncation 검사: 캡처된 content 가 입력 본문을 충분히 덮는지를
-                    # '텍스트 vs 텍스트'(공백 제거)로 비교 — JSON 오버헤드·글자공백에 휘둘리는
-                    # 원시 길이 비교(포맷에 따라 무력화되던)를 대체. 임계값 0.7(머리글·꼬리말 등
-                    # 정상 누락 허용). 마지막 시도면 부분 구조라도 수용(폴백보다 나음).
+                            logger.error("JSON 유효성 검증 실패, 건너뜀")
+                            return best_result, False
+                    # 내용 기반 coverage 검사: 캡처된 content 가 입력 본문을 충분히 덮는지를
+                    # '텍스트 vs 텍스트'(공백 제거)로 비교(임계값 0.7). finish=='length'(미완)도
+                    # 재시도 트리거 — 잘린 출력을 묵시 수용하지 않음. 마지막 시도면 부분 구조라도 수용.
                     elements = parsed if isinstance(parsed, list) else parsed.get("elements", [])
                     in_clean = re.sub(r"\s", "", extracted_text)
                     cap_clean = re.sub(r"\s", "", "".join((e.get("content") or "") for e in elements))
-                    if len(in_clean) > 0 and len(cap_clean) < len(in_clean) * 0.7 and attempt < 2:
-                        logger.warning(f"내용 부족 (시도 {attempt+1}/3): 입력본문={len(in_clean)}, 캡처={len(cap_clean)} — truncation 의심, 재시도")
+                    cov = (len(cap_clean) / len(in_clean)) if in_clean else 1.0
+                    if cov > best_cov:
+                        best_cov, best_result = cov, result
+                    if (truncated or (in_clean and cov < 0.7)) and not last:
+                        why = "출력 미완(length)" if truncated else f"내용 부족(cov={cov:.2f})"
+                        logger.warning(f"{why} (시도 {attempt+1}/{N}) — 재시도")
                         time.sleep(5 * (attempt + 1))
                         continue
+                    return (best_result or result), True
                 else:
                     # 비-JSON(xml 등)은 파싱 스키마가 달라 원시 길이 기반 검사 유지
+                    if best_result is None:
+                        best_result = result
                     input_len = len(extracted_text)
-                    if input_len > 0 and len(result) < input_len * 0.9 and attempt < 2:
-                        logger.warning(f"출력 길이 부족 (시도 {attempt+1}/3): 입력={input_len}, 출력={len(result)} — 재시도")
+                    if (truncated or (input_len and len(result) < input_len * 0.9)) and not last:
+                        logger.warning(f"출력 미완/부족 (시도 {attempt+1}/{N}, finish={finish}) — 재시도")
                         time.sleep(5 * (attempt + 1))
                         continue
-
-                return result
+                    return (best_result or result), True
+            except _APITimeout as e:
+                # 타임아웃: 일시적 오류와 분리해 1회만 고온 재시도 후 중단
+                logger.warning(f"VLM 타임아웃 (시도 {attempt+1}/{N}): {e} — 반복 생성 의심")
+                if not escalated and not last:
+                    escalated = True
+                    continue
+                return best_result, False
             except Exception as e:
-                logger.warning(f"VLM API 에러 (시도 {attempt+1}/3): {e}")
-                if attempt < 2:
+                # 연결/5xx/429 등 일시적 오류 → 백오프 후 재시도(최종재시도 패스 자격 유지)
+                logger.warning(f"VLM API 에러 (시도 {attempt+1}/{N}): {e}")
+                if not last:
                     time.sleep(5 * (attempt + 1))
                 else:
-                    logger.error("VLM API 3회 실패, 건너뜀")
-                    return None
+                    logger.error("VLM API 재시도 소진, 건너뜀")
+                    return best_result, True
+        return best_result, (best_result is not None)
 
     @classmethod
     def describe_image(cls, img_path, api_key, model_name="Qwen/Qwen3-VL-8B-Instruct"):
@@ -754,9 +830,10 @@ If a field cannot be found, use null."""
                     model=model_name,
                     messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
                     temperature=0.0,
-                    max_tokens=512
+                    max_tokens=512,
+                    timeout=60
                 )
-            raw = response.choices[0].message.content.strip()
+            raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"): raw = raw.split("\n", 1)[-1]
             if raw.endswith("```"): raw = raw.rsplit("```", 1)[0]
             parsed = json.loads(raw.strip())
@@ -1502,37 +1579,53 @@ class DocumentProcessor:
                     f.write(structured_data)
 
         def _extract_page(stem):
-            """한 페이지 추출(extract_structure 내부 3회 재시도) + 성공 시 기록. 성공 여부 반환."""
+            """한 페이지 추출 + 성공 시 기록. (성공여부, 재시도가치) 반환.
+            재시도가치=False 면 일시적 오류가 아니라(반복 생성·타임아웃·유효성 실패) 최종재시도 무의미."""
             img_path = os.path.join(doc_output_dir, f"{stem}.png")
-            sd = VLMProcessor.extract_structure(
+            sd, retryable = VLMProcessor.extract_structure(
                 txt_path=os.path.join(doc_output_dir, f"{stem}.txt"),
                 img_path=img_path if os.path.exists(img_path) else None,
                 api_key=api_key, output_format=vlm_fmt, model_name=model_name)
             if sd:
                 _persist_page(stem, sd)
-            return bool(sd)
+                return True, True
+            return False, retryable
 
+        retry_eligible = set()        # 일시적 실패라 최종재시도 가치가 있는 페이지 번호
+        budget_exceeded = False       # 문서 VLM 시간예산 초과(이후 페이지는 텍스트 폴백)
+        _vlm_start = time.monotonic()
         for idx, txt_file in enumerate(page_files):
             set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)",
                          25 + int((idx / total_vlm_pages) * 75))
             stem = txt_file[:-4]
             if os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.json")):
                 continue   # 이미 처리됨(XLSX 하이브리드 등) — 재VLM 안 함
-            done_pct = 25 + int(((idx + 1) / total_vlm_pages) * 75)
-            if _extract_page(stem):
-                set_progress(f"✅ {idx + 1}쪽 분석 완료!", done_pct)
-            else:
+            if DOC_VLM_BUDGET_SEC > 0 and (time.monotonic() - _vlm_start) > DOC_VLM_BUDGET_SEC:
+                if not budget_exceeded:
+                    logger.error(f"문서 VLM 시간예산({DOC_VLM_BUDGET_SEC}s) 초과 — 남은 페이지는 텍스트 폴백")
+                budget_exceeded = True
                 try: failed_pages.append(int(stem.split("_")[-1]))
                 except ValueError: failed_pages.append(stem)
-                logger.warning(f"{stem} AI 분석 실패 (최종 재시도 대상)")
+                continue
+            done_pct = 25 + int(((idx + 1) / total_vlm_pages) * 75)
+            ok, retryable = _extract_page(stem)
+            if ok:
+                set_progress(f"✅ {idx + 1}쪽 분석 완료!", done_pct)
+            else:
+                try:
+                    pn = int(stem.split("_")[-1]); failed_pages.append(pn)
+                    if retryable: retry_eligible.add(pn)
+                except ValueError:
+                    failed_pages.append(stem)
+                logger.warning(f"{stem} AI 분석 실패 ({'최종 재시도 대상' if retryable else '재시도 무의미'})")
                 set_progress(f"⚠️ {stem} 분석 실패", done_pct)
 
-        # 최종 재시도: 나머지 페이지 처리가 끝나 부하가 빠진 뒤, 실패 페이지만 1회 더 시도해
-        # 일시적 과부하로 잃은 구조를 복구한다(각 호출은 내부적으로 다시 3회 재시도).
-        retry = [pn for pn in failed_pages if isinstance(pn, int)]
-        if retry:
+        # 최종 재시도: 부하가 빠진 뒤 '일시적' 실패 페이지만 1회 더 시도해 복구한다.
+        # 반복 생성·타임아웃·유효성 실패(retry_eligible 아님)는 동일 입력 재시도가 무의미하므로 제외(런어웨이 방지).
+        retry = [pn for pn in failed_pages if isinstance(pn, int) and pn in retry_eligible]
+        if retry and not budget_exceeded:
             set_progress(f"🔁 실패 {len(retry)}쪽 최종 재시도 중...", 96)
-            recovered = [pn for pn in retry if _extract_page(f"page_{pn:04d}")]
+            recovered = [pn for pn in retry if _extract_page(f"page_{pn:04d}")[0]]
             if recovered:
                 logger.info(f"최종 재시도로 {len(recovered)}쪽 구조 복구: {sorted(recovered)}")
             failed_pages = [pn for pn in failed_pages if pn not in recovered]
