@@ -766,6 +766,104 @@ If a field cannot be found, use null."""
             return {}
 
 
+def _xlsx_sheet_tables(path, batch_chars=3000):
+    """각 시트를 HTML <table> 배치들로 추출(병합셀 colspan/rowspan, 빈영역 트림,
+    행배치 분할+헤더반복, 차트/이미지 감지)."""
+    import html as _html
+    esc = lambda v: _html.escape("" if v is None else str(v))
+    wb = openpyxl.load_workbook(path, data_only=True)            # 캐시(계산)값
+    try:
+        wb_raw = openpyxl.load_workbook(path, data_only=False)   # 수식/원본 — 캐시 없는 수식셀 복구용
+    except Exception:
+        wb_raw = None
+    out = []
+    for ws in wb.worksheets:
+        ws_raw = wb_raw[ws.title] if (wb_raw and ws.title in wb_raw.sheetnames) else None
+        def cval(r, c, _ws=ws, _wsr=ws_raw):
+            v = _ws.cell(row=r, column=c).value
+            if v in (None, "") and _wsr is not None:
+                v = _wsr.cell(row=r, column=c).value            # 캐시 없으면 수식 문자열이라도 보존
+            return v
+        # 경계 박스: 수식셀도 포함되도록 raw 우선 스캔
+        min_r = min_c = 10 ** 9; max_r = max_c = 0; nonempty = 0
+        for row in (ws_raw or ws).iter_rows():
+            for c in row:
+                if c.value not in (None, ""):
+                    nonempty += 1
+                    min_r = min(min_r, c.row); max_r = max(max_r, c.row)
+                    min_c = min(min_c, c.column); max_c = max(max_c, c.column)
+        imgs = []
+        for _im in getattr(ws, "_images", []):
+            try:
+                imgs.append(_im._data())   # 임베디드 이미지 원본 바이트
+            except Exception as e:
+                logger.warning(f"임베디드 이미지 추출 실패 ({ws.title}): {e}")
+        rec = {"name": ws.title, "tables": [], "cells": nonempty,
+               "has_chart": bool(getattr(ws, "_charts", [])), "images": imgs}
+        if nonempty == 0:
+            out.append(rec); continue
+        # 병합셀: 경계 박스로 클램프(박스 밖으로 삐져나간 span 방지) + 세로병합이 가로지르는 행경계 표시
+        span = {}; covered = set(); vspan_break = set()
+        for rng in ws.merged_cells.ranges:
+            r0 = max(rng.min_row, min_r); c0 = max(rng.min_col, min_c)
+            r1 = min(rng.max_row, max_r); c1 = min(rng.max_col, max_c)
+            if r0 > r1 or c0 > c1:
+                continue
+            span[(r0, c0)] = (r1 - r0 + 1, c1 - c0 + 1)
+            for r in range(r0, r1 + 1):
+                for c in range(c0, c1 + 1):
+                    if (r, c) != (r0, c0):
+                        covered.add((r, c))
+            for r in range(r0, r1):       # r→r+1 경계가 이 세로병합 내부 → 배치 분할 금지
+                vspan_break.add(r)
+        def row_html(r):
+            tds = []
+            for c in range(min_c, max_c + 1):
+                if (r, c) in covered:
+                    continue
+                attr = ""
+                if (r, c) in span:
+                    rs, cs = span[(r, c)]
+                    if rs > 1: attr += f' rowspan="{rs}"'
+                    if cs > 1: attr += f' colspan="{cs}"'
+                tds.append(f"<td{attr}>{esc(cval(r, c))}</td>")
+            return "<tr>" + "".join(tds) + "</tr>"
+        rows = {r: row_html(r) for r in range(min_r, max_r + 1)}
+        full = "<table>" + "".join(rows[r] for r in range(min_r, max_r + 1)) + "</table>"
+        if len(full) <= batch_chars:
+            rec["tables"] = [full]
+        else:
+            # 헤더 반복은 첫 행이 고정창(freeze_panes)으로 '헤더'임이 분명할 때만 — 데이터행을 가짜
+            # 헤더로 복제하지 않도록.
+            has_header = False
+            try:
+                fp = ws.freeze_panes
+                if fp:
+                    from openpyxl.utils.cell import coordinate_to_tuple
+                    if coordinate_to_tuple(fp)[0] == min_r + 1:
+                        has_header = True
+            except Exception:
+                pass
+            hdr = rows[min_r] if has_header else ""
+            body0 = min_r + 1 if has_header else min_r
+            batches = []; cur = []; clen = len(hdr) + 16
+            for r in range(body0, max_r + 1):
+                rh = rows[r]
+                can_break = (r - 1) not in vspan_break   # 세로병합 내부에서는 분할 금지(rowspan 깨짐 방지)
+                if cur and clen + len(rh) > batch_chars and can_break:
+                    batches.append("<table>" + hdr + "".join(cur) + "</table>"); cur = []; clen = len(hdr) + 16
+                cur.append(rh); clen += len(rh)
+            if cur:
+                batches.append("<table>" + hdr + "".join(cur) + "</table>")
+            rec["tables"] = batches
+        out.append(rec)
+    wb.close()
+    if wb_raw is not None:
+        try: wb_raw.close()
+        except Exception: pass
+    return out
+
+
 class DocumentProcessor:
 
     @staticmethod
@@ -796,11 +894,10 @@ class DocumentProcessor:
                             except Exception:
                                 pass
                         ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
-                    ws.page_setup.paperSize = 66
+                    # A4 페이지네이션
+                    ws.page_setup.paperSize = 9
                     ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-                    ws.page_setup.fitToPage = True
-                    ws.page_setup.fitToWidth = 1
-                    ws.page_setup.fitToHeight = False
+                    ws.page_setup.fitToPage = False
                     ws.page_margins = PageMargins(left=0, right=0, top=0, bottom=0, header=0, footer=0)
                 except Exception:
                     continue
@@ -895,6 +992,96 @@ class DocumentProcessor:
                 if os.path.exists(sp): os.remove(sp)
 
         return merged_pdf_path, sheet_map
+
+    @classmethod
+    def _xlsx_hybrid_write(cls, doc_output_dir, src, sheet_map, api_key, model_name, output_format="json"):
+        """시트 데이터를 추출하고, 차트/이미지가 있는 시트만 VLM 설명을 붙여
+        시트별 structured.json(+ markdown/xml)을 기록한다. 시트 첫 페이지에
+        [시트명 heading + 표 배치들 (+차트/이미지 figure)], 나머지 연속 페이지는 빈 structured.
+        내용이 없는 시트는 기록하지 않는다(일반 VLM 경로가 처리)."""
+        tables = _xlsx_sheet_tables(src)   # 실패 시 예외 → 호출자가 일반 VLM 으로 폴백
+        by_name = {t["name"]: t for t in tables}
+        fmt = output_format.lower()
+
+        def write_page(pg, elements):
+            stem = os.path.join(doc_output_dir, f"page_{pg:04d}_structured")
+            payload = {"page_number": pg, "elements": elements}
+            with open(stem + ".json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            if fmt == "markdown":     # 다른 포맷과 동일하게 .md 도 생성(출력 계약 유지)
+                try:
+                    with open(stem + ".md", "w", encoding="utf-8") as f:
+                        f.write(cls.json_to_markdown(json.dumps(payload, ensure_ascii=False)))
+                except Exception as e:
+                    logger.warning(f"XLSX markdown 생성 실패 (page {pg}): {e}")
+            elif fmt == "xml":
+                try:
+                    import html as _h
+                    parts = ["<document>", f"<page_number>{pg}</page_number>", "<elements>"]
+                    for e in elements:
+                        cap = _h.escape(e.get("caption", "") or "")
+                        parts.append(f'<element type="{e.get("type","text")}"'
+                                     + (f' caption="{cap}"' if cap else "")
+                                     + f'>{_h.escape(e.get("content","") or "")}</element>')
+                    parts += ["</elements>", "</document>"]
+                    with open(stem + ".xml", "w", encoding="utf-8") as f:
+                        f.write("\n".join(parts))
+                except Exception as e:
+                    logger.warning(f"XLSX xml 생성 실패 (page {pg}): {e}")
+
+        for sm in sheet_map:
+            ps, pe = sm["page_start"], sm["page_end"]
+            if ps > pe:
+                logger.warning(f"XLSX 시트 '{sm.get('name')}' 페이지범위 역전(ps={ps}>pe={pe}) — 보정")
+                pe = ps
+            rec = by_name.get(sm["name"])
+            if rec is None:
+                logger.warning(f"XLSX 시트명 불일치: sheet_map '{sm.get('name')}' 가 추출 결과에 없음")
+            elements = []
+            try:
+                if rec is not None:
+                    has_visual = rec.get("has_chart") or rec.get("images")
+                    if rec["cells"] > 0 or has_visual:
+                        # 각 시트 = 독립 최상위 섹션
+                        elements.append({"type": "heading_1", "content": sm["name"], "_section_root": True})
+                    for tb in rec.get("tables", []):
+                        elements.append({"type": "table", "content": tb, "caption": sm["name"]})
+                    # 차트 설명(상단 페이지)
+                    if rec.get("has_chart"):
+                        for pg in range(ps, min(pe, ps + 2) + 1):
+                            img = os.path.join(doc_output_dir, f"page_{pg:04d}.png")
+                            if not os.path.exists(img):
+                                continue
+                            try:
+                                desc = VLMProcessor.describe_image(img, api_key, model_name)
+                            except Exception as e:
+                                logger.warning(f"XLSX 차트 설명 실패 (page {pg}): {e}"); desc = ""
+                            if desc and desc.strip().upper() != "LOGO":
+                                elements.append({"type": "figure", "content": desc, "page_number": pg})
+                    # 임베디드 이미지 설명(로고 제외)
+                    for k, data in enumerate(rec.get("images", [])[:5]):
+                        tmp = os.path.join(doc_output_dir, f"_xlimg_{ps}_{k}.png")
+                        try:
+                            with open(tmp, "wb") as f:
+                                f.write(data)
+                            desc = VLMProcessor.describe_image(tmp, api_key, model_name)
+                            if desc and desc.strip().upper() != "LOGO":
+                                elements.append({"type": "figure", "content": desc, "caption": f"{sm['name']} 임베디드 이미지"})
+                        except Exception as e:
+                            logger.warning(f"XLSX 임베디드 이미지 설명 실패 ({sm.get('name')}): {e}")
+                        finally:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+            except Exception as e:
+                # 한 시트 실패가 다른 시트·이미 추출된 표 데이터를 버리지 않게 격리
+                logger.warning(f"XLSX 시트 '{sm.get('name')}' 처리 실패(건너뜀): {e}")
+                elements = [e for e in elements if e.get("type") in ("heading_1", "table")]
+            # 내용이 전혀 없는 시트는 기록 안 함 → 일반 VLM 경로가 그 페이지들을 처리(누락 방지)
+            if not elements:
+                continue
+            for pg in range(ps, pe + 1):
+                write_page(pg, elements if pg == ps else [])
+        return []
 
     @classmethod
     def _render_hwp_with_rhwp(cls, input_path, doc_output_dir):
@@ -1271,6 +1458,15 @@ class DocumentProcessor:
 
         set_progress(f"🤖 AI 분석 대기 중 (총 {total_vlm_pages}페이지)...", 25)
 
+        # XLSX: 시트 데이터를 직접 추출해 structured.json 기록(아래 VLM 루프가 건너뜀).
+        if ext == '.xlsx' and excel_sheet_map:   # .xls 는 일반 VLM 경로
+            try:
+                set_progress("📊 엑셀 시트 직접 추출 중...", 30)
+                cls._xlsx_hybrid_write(doc_output_dir, file_path, excel_sheet_map, api_key, model_name,
+                                       output_format=output_format)
+            except Exception as e:
+                logger.warning(f"XLSX 하이브리드 실패 → 일반 VLM 폴백: {e}")
+
         failed_pages = []   # VLM 구조추출이 (재시도 후에도) 실패한 페이지 — 부분 실패 가시화용
         vlm_fmt = "json" if output_format.lower() == "markdown" else output_format
 
@@ -1320,6 +1516,8 @@ class DocumentProcessor:
             set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)",
                          25 + int((idx / total_vlm_pages) * 75))
             stem = txt_file[:-4]
+            if os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.json")):
+                continue   # 이미 처리됨(XLSX 하이브리드 등) — 재VLM 안 함
             done_pct = 25 + int(((idx + 1) / total_vlm_pages) * 75)
             if _extract_page(stem):
                 set_progress(f"✅ {idx + 1}쪽 분석 완료!", done_pct)

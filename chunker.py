@@ -34,8 +34,7 @@ _NUM_PATTERNS = [
 _PATTERN_RANK = {name: i for i, (name, _) in enumerate(_NUM_PATTERNS)}
 _STRONG = {"pyeon", "jang", "jeol", "gwan", "jo"}
 MAX_CHUNK_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "4000"))
-# 크기 분할로 생긴 하위청크 사이 오버랩(자). 경계 잘림 방지(RAG 재현율↑). 0=비활성.
-# 주의: heading 의미 섹션 경계엔 적용 안 함(섹션은 완결단위 → 오버랩은 오염). 크기 분할에만.
+# 크기 분할로 생긴 하위청크 사이 오버랩(자). 0=비활성. (크기 분할에만 적용)
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "0"))
 
 
@@ -59,10 +58,8 @@ _RANK = {
     "pnum": 50, "pga": 52, "nump": 60, "gap": 62,
     "sq": 70, "circ": 74, "dash": 78,
 }
-# 마커없는 heading 은 모든 번호마커(조~기호, 8~80)보다 약하게(90+) 둔다 — VLM 이 페이지
-# 경계에서 잘린 단어/문장 조각을 heading 으로 오라벨해도 번호 하위트리를 뒤엎지 못하게(조각은
-# 잎으로 떨어지고 다음 진짜 번호 heading 이 즉시 pop). h1<h2<h3 순서는 유지(비번호 문서 보존).
-# 진짜 최상위 섹션은 별표/별지/부칙 키워드·'(제N조 관련)' 참조·문서 첫 heading 으로 rank 1 부여.
+# 마커없는 heading 은 번호마커보다 약하게(90+) 둔다. h1<h2<h3 순서 유지.
+# 별표/별지/부칙·'(제N조 관련)' 참조·문서 첫 heading 은 rank 1(최상위 섹션).
 _VLM_RANK = {"heading_1": 90, "heading_2": 92, "heading_3": 94}
 _JO_TITLE_RX = re.compile(r'^(제\s*\d+\s*조(?:의\s*\d+)?\s*(?:\([^)]*\))?)')
 _BU_TITLE_RX = re.compile(r'^(제\s*\d+\s*[편장절관부](?:\s*\([^)]*\))?)')
@@ -93,8 +90,7 @@ def _is_def_entry(content: str) -> bool:
     return bool(_DEF_ENTRY_RX.match(content or ""))
 
 
-# 절/리스트 마커. 항(①)은 항상, 그 외(호/목/괄호/기호)는 '긴 문장'일 때만 본문 강등 —
-# 절은 짧은 제목이 아니라 본문이라, VLM 이 heading 으로 오라벨해도 heading_path 를 오염시킨다.
+# 절/리스트 마커. 항(①)은 항상, 그 외는 '긴 문장'일 때만 본문으로 강등.
 _CLAUSE_MARKERS = {"hang", "ho", "mok", "pnum", "pga", "nump", "gap", "sq", "circ", "dash"}
 CLAUSE_HEADING_MAX = int(os.environ.get("CHUNK_CLAUSE_HEADING_MAX", "40"))
 
@@ -190,9 +186,8 @@ def _normalize_heading_levels(elements: list) -> list:
                 e["type"] = "heading_2"
                 e["_promoted_heading"] = True
         content = e.get("content", "") or ""
-        # 페이지 경계에서 잘린 조각을 VLM 이 heading 으로 오라벨 → 본문으로 강등.
-        # rank>=90 인 '진짜 마커없는' heading 만 대상(십진 4.1.3 등은 rank<90 이라 제외) +
-        # 직전(본문이든 heading 이든)이 잘려 보일 때만; 보수적.
+        # 잘린 조각이 heading 으로 오라벨된 경우 → 본문 강등.
+        # 마커없는 heading(rank>=90) + 직전이 미완결일 때만(보수적).
         if (e.get("type") in HEADING_TYPES and not first
                 and _heading_rank(content, e.get("type")) >= 90
                 and _prev_incomplete(prev)):
@@ -208,6 +203,9 @@ def _normalize_heading_levels(elements: list) -> list:
         r = _heading_rank(content, e.get("type"))
         # 문서 첫 heading 이 마커없는 제목(예: 문서 제목)이면 최상위 루트로 본다.
         if first and _detect_pattern(content) is None and r >= 10:
+            r = 1
+        # 명시적 최상위 섹션(예: XLSX 시트명) — 항상 루트로
+        if e.get("_section_root"):
             r = 1
         first = False
         while stack and stack[-1] >= r:
@@ -344,8 +342,7 @@ def _split_oversized(chunks: list, max_chars: int = None) -> list:
             cur.append(e)
             cur_len += el
         flush()
-        # 2) 사후 오버랩: 직전 하위청크의 '텍스트' 꼬리만 prepend(표 HTML 토막 오염 방지),
-        #    여유분 내로만 → max_chars 초과 없음.
+        # 2) 사후 오버랩: 직전 하위청크의 텍스트 꼬리만 prepend(여유분 내).
         if overlap > 0:
             for i in range(1, len(subs)):
                 prev_text = " ".join(
@@ -466,16 +463,19 @@ def _load_toc(doc_dir: str) -> list:
 
 def chunk_by_page(doc_dir: str) -> list:
     pages = _load_pages(doc_dir)
-    return [
-        {
+    chunks = []
+    for p in pages:
+        els = [e for e in p["elements"] if e.get("type") != "toc_entry"]
+        if not els:
+            continue   # 빈 페이지(예: XLSX 시트 연속 페이지)는 청크 생성 안 함
+        chunks.append({
             "chunk_id": f"page_{p['page_number']:04d}",
             "chunk_type": "page",
             "page_range": [p["page_number"], p["page_number"]],
             "heading_path": [],
-            "elements": [e for e in p["elements"] if e.get("type") != "toc_entry"],
-        }
-        for p in pages
-    ]
+            "elements": els,
+        })
+    return _split_oversized(chunks)   # XLSX 등 한 페이지에 표 배치가 많은 경우 MAX 초과 분할
 
 
 
