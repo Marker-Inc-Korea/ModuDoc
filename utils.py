@@ -1245,7 +1245,7 @@ class DocumentProcessor:
         total_vlm_pages = len(page_files)
 
         if not page_files: return set_progress("분석할 텍스트가 없어 종료합니다.", 100)
-        if not api_key or len(api_key) < 10 or "여기에" in api_key: raise Exception("API 키가 누락되었거나 유효하지 않습니다.")
+        if not api_key or "여기에" in api_key: raise Exception("API 키가 누락되었거나 유효하지 않습니다.")
 
         set_progress("문서 메타데이터 추출 중...", 22)
         meta_txts = [os.path.join(doc_output_dir, f"page_{str(i).zfill(4)}.txt") for i in range(1, 3)]
@@ -1262,42 +1262,21 @@ class DocumentProcessor:
         set_progress(f"🤖 AI 분석 대기 중 (총 {total_vlm_pages}페이지)...", 25)
 
         failed_pages = []   # VLM 구조추출이 (재시도 후에도) 실패한 페이지 — 부분 실패 가시화용
-        for idx, txt_file in enumerate(page_files):
-            start_percent = 25 + int(((idx) / total_vlm_pages) * 75)
-            set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)", start_percent)
-            
-            stem = txt_file[:-4]
-            txt_path = os.path.join(doc_output_dir, txt_file)
-            img_path = os.path.join(doc_output_dir, f"{stem}.png")
-            if not os.path.exists(img_path): img_path = None
+        vlm_fmt = "json" if output_format.lower() == "markdown" else output_format
 
-            vlm_fmt = "json" if output_format.lower() == "markdown" else output_format
-            structured_data = VLMProcessor.extract_structure(
-                txt_path=txt_path, img_path=img_path, api_key=api_key,
-                output_format=vlm_fmt, model_name=model_name
-            )
-
-            if not structured_data:
-                try: failed_pages.append(int(stem.split("_")[-1]))
-                except ValueError: failed_pages.append(stem)
-                logger.warning(f"{stem} AI 분석 실패, 건너뜀 (raw 텍스트로 폴백)")
-                set_progress(f"⚠️ {stem} 분석 실패 (건너뜀)", 25 + int(((idx + 1) / total_vlm_pages) * 75))
-                continue
-
+        def _persist_page(stem, structured_data):
+            """추출 구조를 후처리(page_number·중복제거) 후 파일로 기록(메인/최종재시도 공용)."""
             if vlm_fmt == "json":
                 try:
                     parsed = json.loads(structured_data)
                     try:
-                        file_page_num = int(stem.split("_")[1])
-                        parsed["page_number"] = file_page_num
+                        parsed["page_number"] = int(stem.split("_")[1])
                     except (IndexError, ValueError):
                         pass
-                    seen_contents = set()
-                    deduped = []
+                    seen_contents, deduped = set(), []
                     for elem in parsed.get("elements", []):
                         content_only = elem.get("content", "").strip()
                         if content_only and content_only in seen_contents:
-                            logger.debug(f"중복 element 제거: {content_only[:40]}...")
                             continue
                         if content_only:
                             seen_contents.add(content_only)
@@ -1306,7 +1285,6 @@ class DocumentProcessor:
                     structured_data = json.dumps(parsed, ensure_ascii=False, indent=4)
                 except Exception as e:
                     logger.warning(f"JSON 후처리 실패 ({stem}): {e}")
-
             if output_format.lower() == "markdown":
                 with open(os.path.join(doc_output_dir, f"{stem}_structured.json"), "w", encoding="utf-8") as f:
                     f.write(structured_data)
@@ -1314,11 +1292,42 @@ class DocumentProcessor:
                 with open(os.path.join(doc_output_dir, f"{stem}_structured.md"), "w", encoding="utf-8") as f:
                     f.write(md_data)
             else:
-                ext_str = output_format.lower()
-                with open(os.path.join(doc_output_dir, f"{stem}_structured.{ext_str}"), "w", encoding="utf-8") as f:
+                with open(os.path.join(doc_output_dir, f"{stem}_structured.{output_format.lower()}"), "w", encoding="utf-8") as f:
                     f.write(structured_data)
-                
-            set_progress(f"✅ {idx + 1}쪽 분석 완료!", 25 + int(((idx + 1) / total_vlm_pages) * 75))
+
+        def _extract_page(stem):
+            """한 페이지 추출(extract_structure 내부 3회 재시도) + 성공 시 기록. 성공 여부 반환."""
+            img_path = os.path.join(doc_output_dir, f"{stem}.png")
+            sd = VLMProcessor.extract_structure(
+                txt_path=os.path.join(doc_output_dir, f"{stem}.txt"),
+                img_path=img_path if os.path.exists(img_path) else None,
+                api_key=api_key, output_format=vlm_fmt, model_name=model_name)
+            if sd:
+                _persist_page(stem, sd)
+            return bool(sd)
+
+        for idx, txt_file in enumerate(page_files):
+            set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)",
+                         25 + int((idx / total_vlm_pages) * 75))
+            stem = txt_file[:-4]
+            done_pct = 25 + int(((idx + 1) / total_vlm_pages) * 75)
+            if _extract_page(stem):
+                set_progress(f"✅ {idx + 1}쪽 분석 완료!", done_pct)
+            else:
+                try: failed_pages.append(int(stem.split("_")[-1]))
+                except ValueError: failed_pages.append(stem)
+                logger.warning(f"{stem} AI 분석 실패 (최종 재시도 대상)")
+                set_progress(f"⚠️ {stem} 분석 실패", done_pct)
+
+        # 최종 재시도: 나머지 페이지 처리가 끝나 부하가 빠진 뒤, 실패 페이지만 1회 더 시도해
+        # 일시적 과부하로 잃은 구조를 복구한다(각 호출은 내부적으로 다시 3회 재시도).
+        retry = [pn for pn in failed_pages if isinstance(pn, int)]
+        if retry:
+            set_progress(f"🔁 실패 {len(retry)}쪽 최종 재시도 중...", 96)
+            recovered = [pn for pn in retry if _extract_page(f"page_{pn:04d}")]
+            if recovered:
+                logger.info(f"최종 재시도로 {len(recovered)}쪽 구조 복구: {sorted(recovered)}")
+            failed_pages = [pn for pn in failed_pages if pn not in recovered]
 
         if output_format.lower() in ("json", "markdown"):
             toc_entries = []
