@@ -608,13 +608,18 @@ def chunk_document(doc_dir: str, strategies: list = None) -> dict:
     if strategies is None:
         strategies = ["page", "toc", "tree"]
 
-    has_json = any(
-        re.match(r"page_\d+_structured\.json$", f)
-        for f in os.listdir(doc_dir)
-    )
+    files = os.listdir(doc_dir)
+    has_json = any(re.match(r"page_\d+_structured\.json$", f) for f in files)
     if not has_json:
-        logger.info(f"청킹 건너뜀 (JSON 결과 없음): {doc_dir}")
-        return {}
+        # VLM 구조(heading) 없음 → toc/tree 는 만들 수 없다. 렌더 텍스트(page_*.txt)가 있으면
+        # page 청킹만 폴백 제공(VLM 미연결·전체 실패 시에도 최소한의 결과).
+        if not any(re.match(r"page_\d+\.txt$", f) for f in files):
+            logger.info(f"청킹 건너뜀 (구조·텍스트 결과 없음): {doc_dir}")
+            return {}
+        skipped = [s for s in strategies if s != "page"]
+        if skipped:
+            logger.warning(f"VLM 구조 없음 → {skipped} 불가(heading 없음), page 청킹만 수행: {doc_dir}")
+        strategies = ["page"]
 
     results = {}
     for strat in strategies:
