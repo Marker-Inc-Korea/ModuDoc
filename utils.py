@@ -1261,6 +1261,7 @@ class DocumentProcessor:
 
         set_progress(f"🤖 AI 분석 대기 중 (총 {total_vlm_pages}페이지)...", 25)
 
+        failed_pages = []   # VLM 구조추출이 (재시도 후에도) 실패한 페이지 — 부분 실패 가시화용
         for idx, txt_file in enumerate(page_files):
             start_percent = 25 + int(((idx) / total_vlm_pages) * 75)
             set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)", start_percent)
@@ -1277,7 +1278,9 @@ class DocumentProcessor:
             )
 
             if not structured_data:
-                logger.warning(f"{stem} AI 분석 실패, 건너뜀")
+                try: failed_pages.append(int(stem.split("_")[-1]))
+                except ValueError: failed_pages.append(stem)
+                logger.warning(f"{stem} AI 분석 실패, 건너뜀 (raw 텍스트로 폴백)")
                 set_progress(f"⚠️ {stem} 분석 실패 (건너뜀)", 25 + int(((idx + 1) / total_vlm_pages) * 75))
                 continue
 
@@ -1430,7 +1433,27 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"청킹 오류: {e}")
 
+        # 부분 실패 가시화: VLM 구조추출 실패 페이지를 metadata 에 기록(프로그램 접근용).
+        # 실패 페이지는 raw 텍스트로 폴백되어 내용은 보존되나 구조(heading/표)는 빠진다.
+        try:
+            meta_path = os.path.join(doc_output_dir, "metadata.json")
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except Exception:
+                metadata = {}
+            metadata["vlm_pages_total"] = total_vlm_pages
+            metadata["vlm_failed_pages"] = sorted(failed_pages)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"실패 페이지 메타 기록 실패: {e}")
+
         if os.path.exists(temp_pdf_dir):
             shutil.rmtree(temp_pdf_dir, ignore_errors=True)
 
-        set_progress("🎉 모든 구조화 완료!", 100)
+        if failed_pages:
+            set_progress(f"⚠️ 완료 — 구조추출 실패 {len(failed_pages)}/{total_vlm_pages}쪽"
+                         f"(폴백: {sorted(failed_pages)}). 해당 페이지는 텍스트만 포함.", 100)
+        else:
+            set_progress("🎉 모든 구조화 완료!", 100)
