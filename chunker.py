@@ -222,7 +222,9 @@ def _normalize_heading_levels(elements: list) -> list:
     return elements
 
 
-_CONT_MARK = re.compile(r'(?:계\s*속|이어서|이어짐|continued|cont[\'’]?\s*d\b|\(\s*cont)', re.IGNORECASE)
+# 반복 머리글의 '(계속)/(continued)' 연속표시 — 괄호 안에 있을 때만(영어 본문의 'continued'
+# 같은 일반 단어를 연속표시로 오인해 heading 을 삭제하던 거짓양성 방지).
+_CONT_MARK = re.compile(r'\(\s*(?:계\s*속|이어서|이어짐|cont(?:inued|[\'’]?d)?)\s*\)', re.IGNORECASE)
 
 
 def _norm_title(s: str) -> str:
