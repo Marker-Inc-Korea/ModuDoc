@@ -112,6 +112,7 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `CHUNK_OVERLAP` | `0` | 크기 분할로 생긴 하위청크 사이 오버랩(자). `0`=비활성 |
 | `CHUNK_NORMALIZE` | `1` | 한국 번호체계(`제N조 > ① > 1. > 가.`, 십진 `4.1.1`)로 heading 계층을 문서 전역에서 일관 보정 + 본문에 묻힌 조문·정의 항목 승급. `0`=VLM 원본 레벨 사용 |
 | `CHUNK_MERGE_CONTINUED` | `1` | 페이지 넘김으로 반복된 머리글/연속 heading 을 병합해 섹션 쪼개짐 방지. `0`=비활성 |
+| `CHUNK_CLAUSE_HEADING_MAX` | `40` | 항/호/목 절 마커가 이 길이(자)를 넘으면 '제목'이 아니라 본문 절로 보고 강등(긴 절 문장이 heading_path 를 오염시키는 것 방지) |
 
 </details>
 
