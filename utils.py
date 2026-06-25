@@ -636,29 +636,39 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     )
                 result = _strip_fences(response.choices[0].message.content)
 
-                input_len = len(extracted_text)
-                if input_len > 0 and len(result) < input_len * 0.9:
-                    logger.warning(f"출력 길이 부족 (시도 {attempt+1}/3): 입력={input_len}, 출력={len(result)} — truncation 의심, 재시도")
-                    if attempt < 2:
-                        time.sleep(5 * (attempt + 1))
-                        continue
-
                 if output_format.lower() == "json":
                     try:
-                        json.loads(result)
+                        parsed = json.loads(result)
                     except json.JSONDecodeError as je:
                         sanitized = _sanitize_json_strings(result)
                         try:
-                            json.loads(sanitized)
+                            parsed = json.loads(sanitized)
                             result = sanitized
                         except json.JSONDecodeError:
                             logger.warning(f"JSON 파싱 오류 (시도 {attempt+1}/3): {je} — 재시도")
                             if attempt < 2:
                                 time.sleep(5 * (attempt + 1))
-                            else:
-                                logger.error("JSON 유효성 검증 3회 실패, 건너뜀")
-                                return None
-                            continue
+                                continue
+                            logger.error("JSON 유효성 검증 3회 실패, 건너뜀")
+                            return None
+                    # 내용 기반 truncation 검사: 캡처된 content 가 입력 본문을 충분히 덮는지를
+                    # '텍스트 vs 텍스트'(공백 제거)로 비교 — JSON 오버헤드·글자공백에 휘둘리는
+                    # 원시 길이 비교(포맷에 따라 무력화되던)를 대체. 임계값 0.7(머리글·꼬리말 등
+                    # 정상 누락 허용). 마지막 시도면 부분 구조라도 수용(폴백보다 나음).
+                    elements = parsed if isinstance(parsed, list) else parsed.get("elements", [])
+                    in_clean = re.sub(r"\s", "", extracted_text)
+                    cap_clean = re.sub(r"\s", "", "".join((e.get("content") or "") for e in elements))
+                    if len(in_clean) > 0 and len(cap_clean) < len(in_clean) * 0.7 and attempt < 2:
+                        logger.warning(f"내용 부족 (시도 {attempt+1}/3): 입력본문={len(in_clean)}, 캡처={len(cap_clean)} — truncation 의심, 재시도")
+                        time.sleep(5 * (attempt + 1))
+                        continue
+                else:
+                    # 비-JSON(xml 등)은 파싱 스키마가 달라 원시 길이 기반 검사 유지
+                    input_len = len(extracted_text)
+                    if input_len > 0 and len(result) < input_len * 0.9 and attempt < 2:
+                        logger.warning(f"출력 길이 부족 (시도 {attempt+1}/3): 입력={input_len}, 출력={len(result)} — 재시도")
+                        time.sleep(5 * (attempt + 1))
+                        continue
 
                 return result
             except Exception as e:
