@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 import re
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, abort
 from utils import DocumentProcessor
 
 app = Flask(__name__)
@@ -184,6 +184,87 @@ def view_result(task_id):
                             results[f"{doc_dir_name} / {file}"] = f.read()
                             
     return jsonify(results)
+
+# ---- 원본 ↔ 파싱결과 비교 뷰어 ----
+def _doc_dir(name):
+    """OUTPUT_FOLDER 하위의 안전한 문서 폴더 경로(경로탈출 차단)."""
+    safe = os.path.basename(name or "")
+    d = os.path.join(app.config['OUTPUT_FOLDER'], safe)
+    if not safe or not os.path.isdir(d):
+        abort(404)
+    return d
+
+def _page_no(fname):
+    m = re.search(r'(\d+)', fname)
+    return int(m.group(1)) if m else 0
+
+@app.route('/compare')
+def compare_page():
+    return render_template('compare.html')
+
+@app.route('/api/docs')
+def api_docs():
+    """파싱 결과(_structured.json)가 있는 문서 목록."""
+    root = app.config['OUTPUT_FOLDER']
+    docs = []
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            n_pages = len([f for f in os.listdir(d) if f.endswith('_structured.json')])
+            if not n_pages:
+                continue
+            title = name
+            mp = os.path.join(d, 'metadata.json')
+            if os.path.exists(mp):
+                try:
+                    with open(mp, encoding='utf-8') as f:
+                        title = (json.load(f) or {}).get('doc_title') or name
+                except Exception:
+                    pass
+            docs.append({"name": name, "title": title, "pages": n_pages})
+    return jsonify(docs)
+
+@app.route('/api/doc/<name>')
+def api_doc(name):
+    """한 문서의 페이지별 [원본 이미지 URL + 파싱 요소]."""
+    d = _doc_dir(name)
+    meta = {}
+    mp = os.path.join(d, 'metadata.json')
+    if os.path.exists(mp):
+        try:
+            with open(mp, encoding='utf-8') as f:
+                meta = json.load(f) or {}
+        except Exception:
+            meta = {}
+    pages = []
+    structured = sorted((x for x in os.listdir(d) if x.endswith('_structured.json')), key=_page_no)
+    for fname in structured:
+        stem = fname[:-len('_structured.json')]
+        try:
+            with open(os.path.join(d, fname), encoding='utf-8') as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
+        elements = data.get('elements', []) if isinstance(data, dict) else (data or [])
+        img = None
+        for ext in ('.png', '.jpg', '.jpeg'):
+            if os.path.exists(os.path.join(d, stem + ext)):
+                img = f"/api/file/{name}/{stem}{ext}"
+                break
+        pages.append({"page": _page_no(fname), "image": img, "elements": elements})
+    chunks = [s for s in ("toc", "tree", "page") if os.path.exists(os.path.join(d, f"split_{s}.json"))]
+    return jsonify({"name": name, "metadata": meta, "pages": pages, "chunks": chunks})
+
+@app.route('/api/file/<name>/<path:filename>')
+def api_file(name, filename):
+    """문서 폴더 안의 파일(원본 페이지 이미지 등) 제공."""
+    d = _doc_dir(name)
+    safe = os.path.basename(filename)
+    if not safe or not os.path.exists(os.path.join(d, safe)):
+        abort(404)
+    return send_from_directory(d, safe)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

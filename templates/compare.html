@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ModuDoc · 원본 비교</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <style>
+        /* 파싱된 표 가독성(추출 HTML 표엔 클래스가 없어 전역 스타일로 처리) */
+        #parsed table { border-collapse: collapse; width: 100%; margin: .5rem 0; font-size: .8rem; }
+        #parsed td, #parsed th { border: 1px solid #d1d5db; padding: 4px 7px; vertical-align: top; }
+        #parsed th { background: #f3f4f6; font-weight: 600; }
+        #parsed { line-height: 1.6; }
+        .el { scroll-margin-top: .5rem; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 flex h-screen overflow-hidden">
+
+    <aside class="w-64 bg-gray-900 text-white flex flex-col flex-shrink-0">
+        <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">🤖 ModuDoc</div>
+        <nav class="flex-1 p-4 space-y-2">
+            <a href="/" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">새 변환 작업</a>
+            <a href="/history" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">변환 이력</a>
+            <a href="/compare" class="block py-2.5 px-4 rounded transition bg-gray-800">원본 비교 뷰어</a>
+        </nav>
+        <div class="p-4 text-xs text-gray-500 border-t border-gray-700">원본 페이지와 파싱 결과를 나란히 비교합니다.</div>
+    </aside>
+
+    <main class="flex-1 flex flex-col overflow-hidden">
+        <!-- 상단 컨트롤 -->
+        <header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-4 flex-wrap flex-shrink-0">
+            <div class="flex items-center gap-2">
+                <label class="text-sm font-medium text-gray-600">문서</label>
+                <select id="docSelect" class="border border-gray-300 rounded-lg p-2 text-sm min-w-[18rem] focus:ring-blue-500"></select>
+            </div>
+            <div class="flex items-center gap-2 ml-auto">
+                <button id="prevBtn" class="px-3 py-1.5 rounded-lg border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">◀ 이전</button>
+                <span id="pageInfo" class="text-sm text-gray-600 tabular-nums min-w-[5rem] text-center">– / –</span>
+                <button id="nextBtn" class="px-3 py-1.5 rounded-lg border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">다음 ▶</button>
+            </div>
+            <label class="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer">
+                <input type="checkbox" id="jsonToggle" class="w-4 h-4 rounded text-blue-600"> 원본 JSON 보기
+            </label>
+        </header>
+
+        <!-- 메타/청크 배지 -->
+        <div id="metaBar" class="bg-gray-50 border-b border-gray-200 px-6 py-2 text-xs text-gray-500 hidden"></div>
+
+        <!-- 2단 비교 -->
+        <section class="flex-1 grid grid-cols-2 overflow-hidden">
+            <!-- 좌: 원본 -->
+            <div class="overflow-auto bg-gray-100 border-r border-gray-200 p-4 flex flex-col items-center">
+                <div class="text-xs font-semibold text-gray-500 mb-2 self-start sticky top-0">📄 원본 페이지</div>
+                <img id="pageImg" class="max-w-full shadow border border-gray-300 bg-white" alt="원본 페이지">
+                <div id="noImg" class="text-sm text-gray-400 mt-10 hidden">이 페이지의 원본 이미지가 없습니다.</div>
+            </div>
+            <!-- 우: 파싱 결과 -->
+            <div class="overflow-auto bg-white p-6">
+                <div class="text-xs font-semibold text-gray-500 mb-3">🧩 파싱 결과</div>
+                <div id="parsed" class="text-sm"></div>
+                <pre id="rawJson" class="hidden text-xs rounded-lg overflow-x-auto"><code class="language-json"></code></pre>
+            </div>
+        </section>
+        <div id="empty" class="flex-1 flex items-center justify-center text-gray-400 text-sm hidden">
+            처리된 문서가 없습니다. 먼저 <a href="/" class="text-blue-600 underline mx-1">새 변환 작업</a>에서 문서를 변환하세요.
+        </div>
+    </main>
+
+<script>
+const $ = s => document.querySelector(s);
+let DOC = null, idx = 0;
+
+function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function mdBold(s){ return escapeHtml(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>'); }
+
+function renderElements(els){
+    if(!els || !els.length) return '<div class="text-gray-400">추출된 요소가 없습니다.</div>';
+    const out = [];
+    for(const e of els){
+        const t = e.type || 'text';
+        const c = e.content || '';
+        if(t === 'heading_1') out.push(`<h2 class="el text-lg font-bold text-gray-900 mt-5 mb-1 border-b pb-1">${escapeHtml(c)}</h2>`);
+        else if(t === 'heading_2') out.push(`<h3 class="el text-base font-semibold text-gray-800 mt-4 mb-1 ml-2">${escapeHtml(c)}</h3>`);
+        else if(t === 'heading_3') out.push(`<h4 class="el text-sm font-semibold text-gray-700 mt-3 mb-1 ml-4">${escapeHtml(c)}</h4>`);
+        else if(t === 'toc_entry') out.push(`<div class="el text-xs text-gray-500 ml-2">· ${escapeHtml(c)}</div>`);
+        else if(t === 'table') out.push(`<div class="el my-2 overflow-x-auto">${e.caption?`<div class="text-xs font-medium text-gray-500 mb-1">▤ ${escapeHtml(e.caption)}</div>`:''}${c}</div>`);
+        else if(t === 'figure') out.push(`<div class="el my-3 p-3 rounded-lg bg-amber-50 border border-amber-200">
+                <div class="text-xs font-semibold text-amber-700">🖼️ figure${e.caption?` · ${escapeHtml(e.caption)}`:''}</div>
+                ${e.description?`<div class="text-sm text-gray-700 mt-1">${escapeHtml(e.description)}</div>`:''}
+                ${c?`<div class="text-xs text-gray-500 mt-1 whitespace-pre-wrap">${escapeHtml(c)}</div>`:''}</div>`);
+        else if(t === 'footnote') out.push(`<div class="el text-xs text-gray-400 mt-2">※ ${escapeHtml(c)}</div>`);
+        else out.push(`<p class="el my-2 text-gray-700 whitespace-pre-wrap">${mdBold(c)}</p>`);
+    }
+    return out.join('');
+}
+
+function render(){
+    if(!DOC || !DOC.pages.length) return;
+    idx = Math.max(0, Math.min(idx, DOC.pages.length-1));
+    const p = DOC.pages[idx];
+    // 좌: 원본
+    const img = $('#pageImg'), noImg = $('#noImg');
+    if(p.image){ img.src = p.image; img.classList.remove('hidden'); noImg.classList.add('hidden'); }
+    else { img.classList.add('hidden'); noImg.classList.remove('hidden'); }
+    // 우: 파싱
+    $('#parsed').innerHTML = renderElements(p.elements);
+    const raw = JSON.stringify(p.elements, null, 2);
+    const code = $('#rawJson code'); code.textContent = raw; code.removeAttribute('data-highlighted'); hljs.highlightElement(code);
+    // 페이지 정보
+    $('#pageInfo').textContent = `${idx+1} / ${DOC.pages.length} (p.${p.page})`;
+    $('#prevBtn').disabled = idx===0; $('#nextBtn').disabled = idx===DOC.pages.length-1;
+}
+
+async function loadDoc(name){
+    const r = await fetch(`/api/doc/${encodeURIComponent(name)}`);
+    DOC = await r.json(); idx = 0;
+    const m = DOC.metadata || {};
+    const bits = [];
+    if(m.doc_title) bits.push(`📌 ${escapeHtml(m.doc_title)}`);
+    if(m.organization) bits.push(escapeHtml(m.organization));
+    if(m.date) bits.push(escapeHtml(m.date));
+    if(DOC.chunks && DOC.chunks.length) bits.push(`청크: ${DOC.chunks.join(', ')}`);
+    const mb = $('#metaBar');
+    if(bits.length){ mb.innerHTML = bits.join(' &nbsp;·&nbsp; '); mb.classList.remove('hidden'); } else mb.classList.add('hidden');
+    render();
+}
+
+function applyJsonToggle(){
+    const on = $('#jsonToggle').checked;
+    $('#parsed').classList.toggle('hidden', on);
+    $('#rawJson').classList.toggle('hidden', !on);
+}
+
+async function init(){
+    const docs = await (await fetch('/api/docs')).json();
+    const sel = $('#docSelect');
+    if(!docs.length){
+        $('section').classList.add('hidden'); $('header').classList.add('hidden'); $('#empty').classList.remove('hidden');
+        return;
+    }
+    sel.innerHTML = docs.map(d => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.title)} (${d.pages}쪽)</option>`).join('');
+    sel.onchange = () => loadDoc(sel.value);
+    $('#prevBtn').onclick = () => { idx--; render(); };
+    $('#nextBtn').onclick = () => { idx++; render(); };
+    $('#jsonToggle').onchange = applyJsonToggle;
+    document.addEventListener('keydown', e => {
+        if(e.key === 'ArrowLeft' && idx>0){ idx--; render(); }
+        if(e.key === 'ArrowRight' && DOC && idx<DOC.pages.length-1){ idx++; render(); }
+    });
+    await loadDoc(docs[0].name);
+}
+init();
+</script>
+</body>
+</html>
