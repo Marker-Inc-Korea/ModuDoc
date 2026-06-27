@@ -462,19 +462,61 @@ def _load_toc(doc_dir: str) -> list:
 
 
 def chunk_by_page(doc_dir: str) -> list:
-    pages = _load_pages(doc_dir)
+    # 1페이지=1청크. heading carry-forward 로 섹션 맥락을 주되, '엉뚱한 헤딩 오부착'을 막기 위해 조건부로만 상속:
+    #  - 자체 헤딩이 있는 페이지 → 그 헤딩 사용(확정).
+    #  - 헤딩 없는 페이지 → 직전 페이지에서 '같은 내용 흐름이 이어질 때'(표→표·본문→본문 등 페이지 분할
+    #    연속)만 직전 섹션을 상속하고 _heading_inherited=True 로 표시. 흐름이 끊긴 헤딩 없는 표(고아·VLM
+    #    헤딩 누락 등)는 직전 섹션을 붙이면 틀릴 수 있으므로 heading_path 를 비운다(추정 헤딩 오부착 방지).
+    elements = _flat_normalized(doc_dir)
+    heading_stack: list[tuple[int, str]] = []
+
+    def path_from_stack():
+        return [title for _, title in heading_stack]
+
+    page_order: list[int] = []
+    by_page: dict[int, dict] = {}
+    for elem in elements:
+        pnum = elem.get("page_number", 0)
+        if pnum not in by_page:
+            by_page[pnum] = {"elements": [], "own_path": None}
+            page_order.append(pnum)
+        if elem.get("type") in HEADING_TYPES:                      # 새 헤딩 → 활성 섹션 갱신
+            level = HEADING_LEVEL[elem["type"]]
+            title = (elem.get("heading_title") or elem.get("content", "")).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            by_page[pnum]["own_path"] = path_from_stack()          # 자체 헤딩 있는 페이지의 섹션
+        by_page[pnum]["elements"].append(elem)
+
     chunks = []
-    for p in pages:
-        els = [e for e in p["elements"] if e.get("type") != "toc_entry"]
+    prev_last_type = None        # 직전(생성된) 페이지의 마지막 내용 요소 타입
+    prev_path: list = []         # 직전(생성된) 페이지의 '확정된' heading_path
+    for pnum in page_order:
+        els = [e for e in by_page[pnum]["elements"] if e.get("type") != "toc_entry"]
         if not els:
             continue   # 빈 페이지(예: XLSX 시트 연속 페이지)는 청크 생성 안 함
-        chunks.append({
-            "chunk_id": f"page_{p['page_number']:04d}",
+        own = by_page[pnum]["own_path"]
+        inherited = False
+        if own is not None:                                        # 자체 헤딩 보유 → 확정
+            heading_path = own
+        elif prev_path and prev_last_type is not None and els[0].get("type") == prev_last_type:
+            heading_path = prev_path                               # 같은 흐름의 페이지 분할 연속 → 직전 페이지 섹션 상속
+            inherited = True
+        else:
+            heading_path = []                                      # 흐름 끊김(고아·헤딩 누락) → 오부착 대신 빈 path
+        chunk = {
+            "chunk_id": f"page_{pnum:04d}",
             "chunk_type": "page",
-            "page_range": [p["page_number"], p["page_number"]],
-            "heading_path": [],
+            "page_range": [pnum, pnum],
+            "heading_path": heading_path,
             "elements": els,
-        })
+        }
+        if inherited:
+            chunk["_heading_inherited"] = True                     # 상속(추정) 표시 — RAG에서 가중조절용
+        chunks.append(chunk)
+        prev_last_type = els[-1].get("type")
+        prev_path = heading_path
     return _split_oversized(chunks)   # XLSX 등 한 페이지에 표 배치가 많은 경우 MAX 초과 분할
 
 
