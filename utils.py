@@ -23,6 +23,152 @@ RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "300"))                   # 구조추출 VLM 호출 타임아웃(초)
 VLM_MAX_ATTEMPTS = max(1, int(os.environ.get("VLM_MAX_ATTEMPTS", "3")))   # 한 페이지 추출의 최대 시도 수
 DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
+VLM_PAGE_CONCURRENCY = max(1, int(os.environ.get("VLM_PAGE_CONCURRENCY", "16")))  # 페이지 동시 추출 수(vLLM 배칭으로 가속)
+# VLM 입력 이미지 폭 상한(px). 기본 1568(28의 배수).
+VLM_IMG_MAXW = max(512, int(os.environ.get("VLM_IMG_MAXW", "1568")))
+# 재시도 시 낮출 폴백 해상도.
+VLM_IMG_MAXW_FALLBACK = max(512, int(os.environ.get("VLM_IMG_MAXW_FALLBACK", "1024")))
+# repetition_penalty(기본/강).
+VLM_REP_PENALTY = float(os.environ.get("VLM_REP_PENALTY", "1.05"))
+VLM_REP_PENALTY_HI = float(os.environ.get("VLM_REP_PENALTY_HI", "1.18"))
+# PII 마스킹(사용자 지정). 콤마목록으로 켤 타입 지정. 기본 빈값=마스킹 안 함(충실 추출).
+# 지원 타입: rrn(주민번호) bizno(사업자등록번호) email(이메일) phone(전화) account(계좌) card(카드)
+PII_MASK_TYPES = {t.strip().lower() for t in os.environ.get("PII_MASK", "").split(",") if t.strip()}
+
+# 타입별 PII 패턴(한국 양식 우선). 캡처는 형식 보존 마스킹.
+_PII_PATTERNS = {
+    "rrn":     re.compile(r'(?<!\d)(\d{6})[-\s]?([1-4]\d{6})(?!\d)'),            # 주민등록번호
+    "bizno":   re.compile(r'(?<!\d)(\d{3})[-\s]?(\d{2})[-\s]?(\d{5})(?!\d)'),    # 사업자등록번호
+    "card":    re.compile(r'(?<!\d)(\d{4})[-\s]?(\d{4})[-\s]?(\d{4})[-\s]?(\d{4})(?!\d)'),
+    "account": re.compile(r'(?<!\d)\d{2,6}[-\s]\d{2,6}[-\s]\d{2,7}(?:[-\s]\d{1,6})?(?!\d)'),
+    "phone":   re.compile(r'(?<!\d)(01[016789])[-\s]?(\d{3,4})[-\s]?(\d{4})(?!\d)'),
+    "email":   re.compile(r'\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b'),
+}
+
+
+def _mask_one(kind, m):
+    """매칭된 PII 를 형식 보존하며 마스킹."""
+    if kind == "email":
+        loc = m.group(1)
+        return (loc[0] + "***" if loc else "***") + "@" + m.group(2)
+    if kind == "rrn":
+        return f"{m.group(1)}-*******"
+    if kind == "bizno":
+        return f"{m.group(1)}-**-*****"
+    if kind == "phone":
+        return f"{m.group(1)}-****-{m.group(3)}"
+    if kind == "card":
+        return f"{m.group(1)}-****-****-{m.group(4)}"
+    return re.sub(r"\d", "*", m.group(0))   # account 등: 숫자만 가림
+
+
+def mask_pii(text, types=None):
+    """설정된 타입의 PII 만 마스킹(끄면 원문 그대로). structured/청크 공용."""
+    types = PII_MASK_TYPES if types is None else types
+    if not text or not types:
+        return text
+    out = text
+    for kind in ("card", "account", "rrn", "bizno", "phone", "email"):   # 긴 패턴 우선
+        if kind in types and kind in _PII_PATTERNS:
+            out = _PII_PATTERNS[kind].sub(lambda m, k=kind: _mask_one(k, m), out)
+    return out
+
+
+# 다단 페이지 열분리 추출: 기본 OFF.
+VLM_MULTICOL = os.environ.get("VLM_MULTICOL", "0") == "1"
+
+def _detect_column_split(png_path):
+    """2단 페이지면 가운데 거터 x비율(0~1) 반환, 아니면 None."""
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            g = im.convert("L")
+            W, H = g.size
+            sw = 500
+            if W > sw:
+                g = g.resize((sw, max(1, int(H * sw / W)))); W, H = g.size
+            px = g.load()
+            colfill = [sum(1 for y in range(H) if px[x, y] < 190) / H for x in range(W)]  # 열별 잉크 비율
+            # 표 오탐 가드: 중앙대역 세로룰(>0.5) 있으면 표로 보고 미발동.
+            if max(colfill[int(W * 0.35):int(W * 0.65)] or [0]) > 0.5:
+                return None
+            lo, hi = int(W * 0.40), int(W * 0.60)
+            band = [x for x in range(lo, hi) if colfill[x] < 0.04]                          # 중앙의 거의 빈 열
+            if len(band) < W * 0.02:
+                return None
+            left_content = sum(1 for x in range(0, int(W * 0.35)) if colfill[x] > 0.10)
+            right_content = sum(1 for x in range(int(W * 0.65), W) if colfill[x] > 0.10)
+            if left_content > W * 0.05 and right_content > W * 0.05:                        # 좌·우 양쪽에 본문 존재
+                return (sum(band) / len(band)) / W
+    except Exception:
+        pass
+    return None
+
+
+def _image_has_ink(png_path, white=245, min_frac=0.004):
+    """페이지에 비백색 픽셀(잉크)이 있는가."""
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            g = im.convert("L")
+            g.thumbnail((400, 400))
+            px = list(g.getdata())
+            if not px:
+                return False
+            dark = sum(1 for p in px if p < white)
+            return (dark / len(px)) >= min_frac
+    except Exception:
+        return False
+
+
+def _korean_ratio(text):
+    """한글:라틴 글자 비율(0~1). 숫자·기호·공백 무시. 문서/설명 언어 판정용."""
+    if not text:
+        return 0.0
+    kr = sum(1 for ch in text if "가" <= ch <= "힣")
+    en = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+    tot = kr + en
+    return (kr / tot) if tot else 0.0
+
+
+def _reposition_figures_by_anchor(elements, anchors):
+    """figure 를 IR 앵커의 직후 텍스트 앞으로 이동(그림만 이동, 텍스트·표 불변).
+    anchors: [{'prev':앞문단, 'next':뒷문단}] 문서순. 매칭 실패 그림은 제자리."""
+    def _nm(s):
+        return re.sub(r"[^0-9A-Za-z가-힣]", "", (s or "")).lower()
+    figs = [(i, e) for i, e in enumerate(elements) if e.get("type") == "figure"]
+    if not figs or not anchors:
+        return elements
+    used = [False] * len(anchors)
+    base = [e for e in elements if e.get("type") != "figure"]
+    bnorm = [_nm((e.get("content") or "") + (e.get("caption") or "")) for e in base]
+    inserts = []
+    for orig_i, f in figs:
+        fk = ""
+        for k in ("caption", "content", "description"):
+            v = _nm(f.get(k) or "")
+            if len(v) >= 4:
+                fk = v; break
+        target = None
+        for ai, a in enumerate(anchors):
+            if used[ai]:
+                continue
+            ap = _nm(a.get("prev"))
+            if fk and ap and (fk in ap or ap in fk):
+                used[ai] = True
+                an = _nm(a.get("next"))[:16]
+                if an:
+                    for bi, bn in enumerate(bnorm):
+                        if an in bn:
+                            target = bi; break
+                break
+        if target is None:          # 매칭 실패 → 원래 위치(앞 비-그림 요소 수) 유지
+            target = sum(1 for e in elements[:orig_i] if e.get("type") != "figure")
+        inserts.append((target, f))
+    out = list(base)
+    for target, f in sorted(inserts, key=lambda x: -x[0]):
+        out.insert(max(0, min(target, len(out))), f)
+    return out
 
 
 def _vlm_finish_reason(response):
@@ -516,7 +662,8 @@ def _sanitize_json_strings(text: str) -> str:
 class VLMProcessor:
 
     @classmethod
-    def encode_image(cls, image_path, max_width=1024):
+    def encode_image(cls, image_path, max_width=None):
+        max_width = max_width or VLM_IMG_MAXW
         try:
             from PIL import Image
             import io
@@ -533,7 +680,7 @@ class VLMProcessor:
                 return base64.b64encode(f.read()).decode('utf-8')
 
     @classmethod
-    def extract_structure(cls, txt_path, img_path=None, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-8B-Instruct"):
+    def extract_structure(cls, txt_path, img_path=None, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-30B-A3B-Instruct"):
         # 반환: (구조 문자열 또는 None, retryable). retryable=False 면 동일 입력 재시도가 무의미
         # (반복 루프·타임아웃·유효성 실패) → 호출자의 최종재시도 패스에서 제외.
         if not api_key or "여기에_" in api_key:
@@ -552,8 +699,11 @@ class VLMProcessor:
             logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return None, False
 
-        with open(txt_path, "r", encoding="utf-8") as f:
-            extracted_text = f.read()
+        if txt_path and os.path.exists(txt_path):
+            with open(txt_path, "r", encoding="utf-8") as f:
+                extracted_text = f.read()
+        else:
+            extracted_text = ""        # 텍스트레이어 없음(예: 다단 열크롭) → 이미지만으로 추출, coverage 게이트 비활성
 
         if output_format.lower() == "xml":
             schema_instruction = """[FORMAT INSTRUCTION: XML ONLY]
@@ -570,7 +720,7 @@ Use the following exact XML template:
         <element type="toc_entry">TOC item — content format: "title::page_number"</element>
         <element type="text">General paragraph text</element>
         <element type="table" caption="Table title or caption if available">Markdown table content</element>
-        <element type="figure" caption="Figure title or caption if available" description="Detailed visual description: for charts/graphs describe what it shows, trends, key observations; for photographs describe what is depicted">For charts/graphs: extracted visible text data here (axis labels, tick values, etc.). Empty for photographs.</element>
+        <element type="figure" caption="Figure title or caption if available" description="Detailed visual description in the document body language (Korean for a Korean doc) even if the figure labels are foreign: for charts/graphs describe what it shows, trends, key observations; for photographs/UI captures describe what is depicted. Never empty for a figure.">For charts/graphs: extracted visible text data here (axis labels, tick values, etc.). Empty for photographs.</element>
         <element type="footnote">Footnote or reference text at the bottom</element>
     </elements>
 </document>
@@ -593,7 +743,7 @@ Rules for XML:
    - heading_1/2/3: For actual section titles and prominent standalone headings. Use for: section titles in body text (e.g. "Introduction", "1.1 Methods"); on slide/presentation pages, EACH visually prominent section label and numbered step title MUST be a SEPARATE heading element — do NOT merge section labels with their body text (e.g. "Our Purpose" → heading_2, "Making AI Beneficial" → text; "01 - Find Resources" → heading_2, description → text); section labels that introduce a data block on a report/survey page (e.g. "Education Level", "Profession"). Do NOT use for: TOC entries; run-in paragraph starters — if a "heading" would contain a period in the MIDDLE followed by more text (e.g. "Business characteristics. Business size was determined by...", "Ablation on the SFT base models. We compare...", "Filtered task names. We present task names..."), it is a paragraph, NOT a heading — output as text with the opening label in **bold**; bold short labels ending with a period followed by body text (e.g. "Base model.", "Depthwise scaling." — use text element); lettered sub-items (a., b., c., d.) that introduce paragraphs.
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading content exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items on a Table of Contents page. Format content as "title::page_number".
-   - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image from top-left to bottom-right and output EVERY visible number, label, and text exactly as it appears into the element body — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and any annotations. List each item on its own line in visual reading order (top-to-bottom, left-to-right). For photographs or decorative images with no data, leave the element body empty.
+   - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image from top-left to bottom-right and output EVERY visible number, label, and text exactly as it appears into the element body — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and any annotations. List each item on its own line in visual reading order (top-to-bottom, left-to-right). For photographs or decorative images with no data, leave the element body empty. The description MUST be written in the document body language (Korean for a Korean document) EVEN IF the figure's labels are in another language; for screenshots/UI captures put on-screen text in the body but still write the description — NEVER leave description empty for a figure. Match detail to type: charts → chart type + concrete trend shape (계단식/선형/급증·급락) + peak position + series comparison; diagrams → main nodes and their flow/relationships; photos/maps/renderings → key subject in 1–2 sentences; screenshots → one sentence on purpose (do not repeat the body data). ANTI-HALLUCINATION: if no numbers are printed on the axes/legend, do NOT invent them — state "축에 수치 미표기" and describe only the qualitative shape.
    - footnote: ONLY for superscript-style reference notes at the very bottom margin (e.g. *, ①, ※ markers). Do NOT use for regular body paragraphs.
    - table caption: Put the table title in the caption attribute, NOT as a separate heading element.
 6. CRITICAL — NO DUPLICATION: Each piece of content must appear exactly ONCE. Never output the same text in multiple elements."""
@@ -610,7 +760,7 @@ Use the following JSON schema:
             "type": "heading_1 | heading_2 | heading_3 | toc_entry | text | table | figure | footnote",
             "content": "Text content or HTML table. For toc_entry: 'title::page_number'. For figure (chart/graph): extracted visible text data (axis labels, tick values, legend, percentages). Empty for photographs.",
             "caption": "Optional: table title or figure caption if present",
-            "description": "For figure only: detailed visual description — for charts/graphs describe what it shows, trends, and key observations; for photographs describe what is depicted. Leave empty for non-figure elements."
+            "description": "For figure only: detailed visual description in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) even if the figure's labels are in another language — for charts/graphs describe what it shows, trends, and key observations; for photographs/UI captures describe what is depicted. Never empty for a figure. Leave empty for non-figure elements."
         }
     ]
 }
@@ -626,7 +776,12 @@ Rules for JSON:
    - toc_entry: ONLY for items listed on a Table of Contents page. Set content to "title::page_number".
    - text: General body paragraphs, including lists, bullet points, and any text content that is NOT a heading. Use **bold** for bold text within paragraphs.
    - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be <td></td>. NEVER output table data as flat text. Put table title in "caption".
-   - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart from top-left to bottom-right and output EVERY visible number, label, and text into "content" — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and annotations. List each item on its own line in visual reading order. For photographs or decorative images with no data, leave "content" empty. Always fill "description" with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations (e.g. "Bar chart showing monthly sales from Jan to Dec 2023. Sales peak in December at 120M, with a steady upward trend in Q4."); for photographs describe what is depicted in the image.
+   - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart from top-left to bottom-right and output EVERY visible number, label, and text into "content" — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and annotations. List each item on its own line in visual reading order. For photographs or decorative images with no data, leave "content" empty. ALWAYS fill "description" with a detailed visual description, written in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) EVEN IF the figure's own labels/axes/legend are in another language — transcribe the foreign labels verbatim into "content", but NARRATE "description" in the document language. Write "description" with detail matched to the figure TYPE:
+     • Chart/graph: name the chart type (막대/선/원), then the CONCRETE shape of the trend (계단식/선형/급증·급락/평탄), WHERE the peak/trough sits, and compare the series/legend entries by name. Include printed numbers (peaks, totals, legend values) ONLY if they are actually printed on the figure.
+     • Diagram/flowchart/structure: enumerate the main nodes/components and the relationships, flow direction, or contract/transaction names connecting them.
+     • Photograph/aerial/map/rendering: 1–2 sentences on the key subject and composition, then STOP. Describe only what is in the frame; if you read a place-name, sign, or caption in the photo, do NOT append background facts, history, or guesses about it.
+     • Screenshot/UI capture: ONE sentence on the screen's purpose — the on-screen data already goes in "content", so do NOT repeat it in the description.
+     ANTI-HALLUCINATION: if the axes/legend/data-labels carry NO printed numbers, do NOT invent any — state "축에 수치 미표기" and describe only the qualitative shape. NEVER leave "description" empty for a figure. (한국어 차트 예: "분기별 매출 막대그래프. 9~12월 계단식 상승, 12월 1.2억으로 정점, A계열이 B계열을 상회.")
    - footnote: ONLY for superscript-style reference notes (e.g., *, ①, ※ markers at the very bottom margin of the page). Do NOT use for regular body text that happens to appear at the bottom.
 3. CRITICAL — NO DUPLICATION: Each piece of text content must appear exactly ONCE in the elements array. Never output the same content in multiple elements.
 4. If the page is empty, return an empty "elements" array."""
@@ -640,6 +795,22 @@ Your task is to convert the provided document text (and layout image if availabl
 - Do not truncate or abbreviate content. Every element must be complete.
 - Never use unescaped special characters inside JSON strings (e.g. use \\n for newlines, escape double quotes).
 - For tables: every Markdown table row must have the same number of columns as the header row.
+- LANGUAGE: Write every natural-language string you generate — figure "description", any summary, and captions you compose — in the SAME language as the document body. For a Korean document the description MUST be Korean; do NOT answer in English. (Transcribed content keeps the original language as printed.)
+- FIGURE description LENGTH (hard limit): keep every figure "description" to AT MOST ~300 characters (about 2–4 sentences). Describe ONLY what is visibly in the frame. NEVER repeat a phrase, and do NOT drift into background knowledge, history, geography, or speculation triggered by a place-name, sign, or label you read in the image — if you catch yourself restating or elaborating beyond what is visible, STOP immediately.
+- READING ORDER on multi-column pages: finish the ENTIRE left column top-to-bottom BEFORE starting the right column. NEVER interleave left/right rows. Use the image to count columns.
+- Transcribe ONLY what is visibly printed on THIS page. Do NOT repeat, re-emit, or duplicate any block of text — each piece appears exactly once.
+- TABLES — STRUCTURE FIDELITY (critical):
+  (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right) or are separated by any gap, ruled gutter, blank column, or different column structure, output EACH as its OWN separate <table> element. NEVER merge two side-by-side grids into one <table>, and never put the right grid's columns into the same <tr> as the left grid's.
+  (2) Count the column count ONCE from the vertical border lines; EVERY <tr> must sum (counting colspan) to exactly that count — pad missing cells with <td></td>, never invent or drop columns.
+  (3) NO column-bleed: assign each printed value to EXACTLY ONE cell (the column whose borders bracket it). Two horizontally-adjacent <td> in a row MUST NOT contain identical text unless it is genuinely printed twice. An empty cell is <td></td> — never fill it by copying the neighbour.
+  (4) MERGED cells: a cell that visually spans N columns → colspan="N"; spanning N rows → rowspan="N". Reproduce multi-row headers exactly with colspan/rowspan; do not flatten or duplicate the spanned text into each cell.
+  (5) NESTED table (a table inside a cell): keep it as a nested <table> INSIDE that <td>; do not splice its rows into the outer table.
+  (6) HEADER WIDTH = BODY WIDTH: the header row's cells (counting colspan) MUST sum to the SAME column count as the body rows. When the body's left side is split into sub-columns by a rowspan category — e.g. body rows are [category | sub-item | content] (3 columns) where "category" spans several rows — the header label above must carry colspan to cover ALL the columns it sits over. Example: body is 3 columns [위험요인 | 세부요인 | 심사내용] → header MUST be <tr><td colspan="2">위험요인</td><td>심사내용</td></tr>, NEVER a 2-cell header over a 3-column body. A header narrower than the body is WRONG.
+  (7) KEY-VALUE form tables: if one row is a single label-value pair while another row places TWO label-value pairs side by side, the table width is the WIDER row; on the 1-pair row give the value a colspan to fill the remaining columns (e.g. <td>항목</td><td colspan="3">값</td>) — never leave a row shorter than the table width.
+  (8) RECTANGULAR-GRID SELF-CHECK — do this for EVERY <table> before you emit it. Expand all colspan/rowspan into a 2-D grid and confirm it is a PERFECT RECTANGLE: every row, after expansion, MUST resolve to the IDENTICAL number of columns C. Procedure: (a) fix C from the body data row that has the MOST cells; (b) make the header expand to exactly C — a group label sitting over k sub-columns gets colspan="k"; a full-height left label (category) gets rowspan and the rows beneath it MUST NOT be left one cell short; (c) NEVER insert an all-blank spacer column to pad width — if a column would be empty in EVERY row, it must NOT exist (do not emit a phantom <td></td> column); (d) finally sum colspans for the header and for each body row — if any total ≠ C, FIX it before output. A table whose header column-sum ≠ body column-sum, or that contains a column blank in every row, is WRONG.
+     Worked example — every row resolves to exactly 7 columns:
+     <table><tr><th rowspan="2">항목</th><th colspan="2">2024년</th><th colspan="2">2025년</th><th rowspan="2">증감</th><th rowspan="2">비고</th></tr><tr><th>상반기</th><th>하반기</th><th>상반기</th><th>하반기</th></tr><tr><td>매출</td><td>10</td><td>12</td><td>13</td><td>15</td><td>+2</td><td>-</td></tr></table>
+     (header row-1 = 1+2+2+1+1 = 7; row-2 fills only the 4 sub-columns under the two colspan groups while 항목·증감·비고 carry down by rowspan; body = 7. All rows = 7. No blank padding column.)
 
 
 {schema_instruction}"""
@@ -652,14 +823,12 @@ Here is the raw text extracted from the document:
 
 Based on the raw text and the visual layout in the image (if provided), structure the information strictly in {output_format.upper()} format.
 """
-        content_payload = [{"type": "text", "text": user_prompt}]
-
-        if img_path and os.path.exists(img_path):
-            base64_image = cls.encode_image(img_path)
-            content_payload.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{base64_image}"}
-            })
+        def _payload(img_w):
+            cp = [{"type": "text", "text": user_prompt}]
+            if img_path and os.path.exists(img_path):
+                b64 = cls.encode_image(img_path, max_width=img_w)
+                cp.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+            return cp
 
         def _strip_fences(text):
             t = text.strip()
@@ -676,18 +845,22 @@ Based on the raw text and the visual layout in the image (if provided), structur
             last = attempt >= N - 1
             try:
                 with _VLM_SEMAPHORE:
+                    # 재시도(escalated) 시 rep_penalty↑·no_repeat_ngram·저해상도로 전환.
+                    rep = VLM_REP_PENALTY_HI if escalated else VLM_REP_PENALTY
+                    img_w = VLM_IMG_MAXW_FALLBACK if escalated else VLM_IMG_MAXW
                     response = client.chat.completions.create(
                         model=model_name,
-                        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
+                        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": _payload(img_w)}],
                         temperature=0.5 if escalated else 0.1,   # 의심(반복/타임아웃) 시에만 고온으로 전환
                         max_tokens=16384,
-                        timeout=VLM_TIMEOUT
+                        timeout=VLM_TIMEOUT,
+                        extra_body={"repetition_penalty": rep,
+                                    "no_repeat_ngram_size": (24 if escalated else 0)}
                     )
                 finish = _vlm_finish_reason(response)
                 result = _strip_fences(response.choices[0].message.content or "")
 
-                # 반복 생성(같은 조각 무한 반복) 차단: 동일 입력 재시도는 무의미하므로 1회 고온 탈출만
-                # 시도하고, 그래도 반복이면 폐기(최고후보 없으면 호출자가 텍스트 폴백).
+                # 반복 생성 차단: 1회 escalated 탈출 후에도 반복이면 폐기.
                 if result and _is_runaway_repeat(result):
                     logger.warning(f"반복 생성 감지 (시도 {attempt+1}/{N}, finish={finish}) — 토큰 런어웨이 차단")
                     if not escalated and not last:
@@ -708,14 +881,17 @@ Based on the raw text and the visual layout in the image (if provided), structur
                             result = sanitized
                         except json.JSONDecodeError:
                             logger.warning(f"JSON 파싱 오류 (시도 {attempt+1}/{N}): {je} — 재시도")
+                            # 잘린 JSON → 1회 escalated 탈출.
+                            if not escalated and not last:
+                                escalated = True
+                                time.sleep(2)
+                                continue
                             if not last:
                                 time.sleep(5 * (attempt + 1))
                                 continue
                             logger.error("JSON 유효성 검증 실패, 건너뜀")
                             return best_result, False
-                    # 내용 기반 coverage 검사: 캡처된 content 가 입력 본문을 충분히 덮는지를
-                    # '텍스트 vs 텍스트'(공백 제거)로 비교(임계값 0.7). finish=='length'(미완)도
-                    # 재시도 트리거 — 잘린 출력을 묵시 수용하지 않음. 마지막 시도면 부분 구조라도 수용.
+                    # coverage 검사(공백 제거 후 캡처/입력 비율, 임계 0.7). 미완(length)도 재시도.
                     elements = parsed if isinstance(parsed, list) else parsed.get("elements", [])
                     in_clean = re.sub(r"\s", "", extracted_text)
                     cap_clean = re.sub(r"\s", "", "".join((e.get("content") or "") for e in elements))
@@ -725,6 +901,9 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     if (truncated or (in_clean and cov < 0.7)) and not last:
                         why = "출력 미완(length)" if truncated else f"내용 부족(cov={cov:.2f})"
                         logger.warning(f"{why} (시도 {attempt+1}/{N}) — 재시도")
+                        # 미완(length) → 1회 escalated 전환.
+                        if truncated and not escalated:
+                            escalated = True
                         time.sleep(5 * (attempt + 1))
                         continue
                     return (best_result or result), True
@@ -756,7 +935,7 @@ Based on the raw text and the visual layout in the image (if provided), structur
         return best_result, (best_result is not None)
 
     @classmethod
-    def describe_image(cls, img_path, api_key, model_name="Qwen/Qwen3-VL-8B-Instruct"):
+    def describe_image(cls, img_path, api_key, model_name="Qwen/Qwen3-VL-30B-A3B-Instruct"):
         if not api_key or "여기에_" in api_key or not os.path.exists(img_path):
             return ""
         try:
@@ -814,7 +993,14 @@ Output ONLY valid JSON with this exact schema — no markdown, no extra text:
     "author": "Author name(s) or null if not found",
     "keywords": ["keyword1", "keyword2"]
 }
-If a field cannot be found, use null."""
+If a field cannot be found, use null.
+
+[ANTI-HALLUCINATION — STRICT]
+- Output a value ONLY if it is EXPLICITLY printed on the provided page(s). Never infer, guess, or invent.
+- If author/date/organization is not literally written on the page, the value MUST be null.
+- NEVER output placeholder/example values such as "John Doe", "Jane Doe", "2023-10-15", "Unknown", "N/A", or a sample organization. A placeholder is worse than null — use null.
+- "organization" must be a real issuing body/department name printed in the document, NOT the document's title or a label phrase.
+- Write field values in the document's own language."""
 
         content_payload = [{"type": "text", "text": f"<raw_text>\n{combined_text}\n</raw_text>\n\nExtract metadata as JSON."}]
         for ip in img_paths[:2]:
@@ -1160,6 +1346,66 @@ class DocumentProcessor:
                 write_page(pg, elements if pg == ps else [])
         return []
 
+    @staticmethod
+    def _extract_hwp_memos(input_path, doc=None):
+        """HWP/HWPX 메모 텍스트 수집(파일 파싱 + rhwp IR memo 병합, 중복 제거)."""
+        memos = []
+        try:
+            import hwp_memo
+            memos.extend(hwp_memo.extract_hwp_memos(input_path))
+        except Exception as e:
+            logger.warning(f"HWP 메모 직접파싱 실패: {e}")
+        # 보강: rhwp IR 의 FieldBlock(field_kind='memo')
+        try:
+            ir = doc.to_ir() if (doc is not None and hasattr(doc, "to_ir")) else None
+            if ir is not None:
+                for b in ir.iter_blocks(scope="all", recurse=True):
+                    if getattr(b, "kind", "") == "field" and getattr(b, "field_kind", "") == "memo":
+                        v = (getattr(b, "cached_value", None) or getattr(b, "raw_instruction", None) or "").strip()
+                        if v:
+                            memos.append(v)
+        except Exception:
+            pass
+        # 중복 제거(순서 보존)
+        seen, out = set(), []
+        for m in memos:
+            k = re.sub(r"\s+", "", m)
+            if k and k not in seen:
+                seen.add(k); out.append(m)
+        return out
+
+    @classmethod
+    def _emit_hwp_memo_page(cls, input_path, doc, doc_output_dir, page_no):
+        """메모가 있으면 본문 뒤에 '메모' 페이지 1장(png+txt)을 편입. 메모 없으면 0 반환(무동작)."""
+        memos = cls._extract_hwp_memos(input_path, doc)
+        if not memos:
+            return 0
+        lines = ["[문서 메모 — 본문 렌더에는 표시되지 않는 주석]"] + [f"· {m}" for m in memos]
+        body = "\n".join(lines)
+        pnum = str(page_no).zfill(4)
+        try:
+            from PIL import Image as _I, ImageDraw as _D, ImageFont as _F
+            W, H = int(8.27 * RENDER_DPI), int(11.69 * RENDER_DPI)
+            im = _I.new("RGB", (W, H), "white")
+            dr = _D.Draw(im)
+            try:
+                ft = _F.truetype("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 30)
+                fb = _F.truetype("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf", 34)
+            except Exception:
+                ft = fb = _F.load_default()
+            y = 90
+            dr.text((90, 40), "📝 메모", font=fb, fill=(150, 30, 30))
+            for ln in lines:
+                for seg in [ln[i:i + 46] for i in range(0, len(ln), 46)] or [""]:
+                    dr.text((90, y), seg, font=ft, fill=(30, 30, 30)); y += 44
+            im.save(os.path.join(doc_output_dir, f"page_{pnum}.png"), "PNG")
+        except Exception:
+            open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb").close()
+        with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as f:
+            f.write(HWPTextExtractor.text_preprocessing(body))
+        logger.info(f"HWP 메모 {len(memos)}건 추출 → 메모 페이지 편입(p.{page_no})")
+        return 1
+
     @classmethod
     def _render_hwp_with_rhwp(cls, input_path, doc_output_dir):
         import re as _re, html as _html
@@ -1189,6 +1435,40 @@ class DocumentProcessor:
                 txt = ""
             with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as f:
                 f.write(HWPTextExtractor.text_preprocessing(txt) if txt else "")
+        # 메모(주석)는 렌더에 안 나오므로 파일에서 직접 추출해 본문 뒤 페이지로 편입(있을 때만).
+        try:
+            out_page += cls._emit_hwp_memo_page(input_path, doc, doc_output_dir, out_page + 1)
+        except Exception as e:
+            logger.warning(f"HWP 메모 페이지 편입 실패: {e}")
+        # 네이티브 표 HTML 을 사이드카로 저장 → _persist_page 가 내용매칭으로 치환.
+        try:
+            blocks = list(doc.to_ir().iter_blocks())
+            native = [{"html": b.html, "rows": b.rows or 0, "cols": b.cols or 0}
+                      for b in blocks
+                      if type(b).__name__ == "TableBlock" and (getattr(b, "html", "") or "").strip()]
+            if native:
+                with open(os.path.join(doc_output_dir, "_native_tables.json"), "w", encoding="utf-8") as f:
+                    json.dump(native, f, ensure_ascii=False)
+            # figure 앵커: 각 그림의 직전·직후 문단 텍스트(_persist_page 의 순서 교정용).
+            anchors = []
+            for i, b in enumerate(blocks):
+                if type(b).__name__ != "PictureBlock":
+                    continue
+                prev = nxt = ""
+                for j in range(i - 1, -1, -1):
+                    t = (getattr(blocks[j], "text", "") or "").strip()
+                    if t:
+                        prev = t; break
+                for j in range(i + 1, len(blocks)):
+                    t = (getattr(blocks[j], "text", "") or "").strip()
+                    if t:
+                        nxt = t; break
+                anchors.append({"prev": prev, "next": nxt})
+            if anchors:
+                with open(os.path.join(doc_output_dir, "_figure_anchors.json"), "w", encoding="utf-8") as f:
+                    json.dump(anchors, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"HWP 네이티브 표/figure 앵커 추출 실패: {e}")
         return out_page
 
     @classmethod
@@ -1236,6 +1516,255 @@ class DocumentProcessor:
         finally:
             if os.path.exists(safe_input_path): os.remove(safe_input_path)
             if os.path.exists(generated_temp_pdf): os.remove(generated_temp_pdf)
+
+    @classmethod
+    def _render_eml(cls, file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress=None):
+        """EML → page_NNNN.png/.txt 연속 시퀀스.
+
+        1) 헤더(보낸/받는/제목/일시) + 디코딩된 본문을 한 페이지로 렌더.
+        2) 첨부를 종류별로 재귀 렌더해 같은 페이지 시퀀스에 이어붙임
+           (HWP/HWPX→rhwp, PDF/DOCX/XLSX 등→PDF 변환, 이미지→PNG 1페이지).
+        반환: 생성된 총 페이지 수.
+        """
+        import email, email.policy, html as _html, io as _io
+        def _say(m, p):
+            if set_progress: set_progress(m, p)
+
+        with open(file_path, "rb") as f:
+            msg = email.message_from_binary_file(f, policy=email.policy.default)
+
+        os.makedirs(temp_pdf_dir, exist_ok=True)
+        state = {"n": 0}
+        mat = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
+
+        def _emit_pdf(pdf_path):
+            try:
+                d = fitz.open(pdf_path)
+            except Exception as e:
+                logger.warning(f"EML PDF 열기 실패: {e}")
+                return
+            try:
+                for i in range(len(d)):
+                    state["n"] += 1
+                    pnum = str(state["n"]).zfill(4)
+                    d[i].get_pixmap(matrix=mat).save(os.path.join(doc_output_dir, f"page_{pnum}.png"))
+                    raw = d[i].get_text().strip()
+                    with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
+                        fh.write(HWPTextExtractor.text_preprocessing(raw))
+            finally:
+                d.close()
+
+        def _emit_image(im, hint=""):
+            state["n"] += 1
+            pnum = str(state["n"]).zfill(4)
+            im.save(os.path.join(doc_output_dir, f"page_{pnum}.png"), "PNG")
+            with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
+                fh.write(hint)
+
+        def _emit_notice(lines):
+            """첨부를 렌더할 수 없을 때(DRM·실패) 가시적 마커 페이지를 한 장 생성.
+            본문 텍스트레이어에도 동일 안내를 남겨 청크/검색에 누락이 아닌 '보호됨'으로 드러나게 한다."""
+            try:
+                from PIL import Image as _PILImage, ImageDraw as _ImageDraw, ImageFont as _ImageFont
+                W, H = int(8.27 * RENDER_DPI), int(11.69 * RENDER_DPI)
+                im = _PILImage.new("RGB", (W, H), "white")
+                dr = _ImageDraw.Draw(im)
+                try:
+                    fb = _ImageFont.truetype("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf", 40)
+                    fr = _ImageFont.truetype("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 30)
+                except Exception:
+                    fb = fr = _ImageFont.load_default()
+                dr.rectangle([60, 60, W - 60, 60 + 70 * len(lines) + 80], outline=(180, 60, 60), width=4)
+                y = 110
+                for i, ln in enumerate(lines):
+                    dr.text((110, y), ln, font=(fb if i == 0 else fr), fill=(150, 30, 30) if i == 0 else (40, 40, 40))
+                    y += 70
+                _emit_image(im, hint="\n".join(lines))
+            except Exception:
+                # PIL 실패시 텍스트 페이지라도 남김
+                state["n"] += 1
+                pnum = str(state["n"]).zfill(4)
+                open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb").close()
+                with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines))
+
+        def _is_drm_hwp(buf):
+            """HWP 페이로드가 DRM/문서보안 래퍼(DOCUMENTSAFER·Fasoo·MarkAny 등)로 잠겼는지 시그니처로 판별."""
+            try:
+                head = buf[:8192]
+                return any(sig in head for sig in
+                           (b"DOCUMENTSAFER", b"Fasoo", b"MarkAny", b"\x00D\x00R\x00M", b"SoftCamp"))
+            except Exception:
+                return False
+
+        # --- 1) 헤더 + 본문 → HTML → PDF → 페이지 ---
+        def _hdr(name):
+            v = msg.get(name)
+            return _html.escape(str(v)) if v else ""
+
+        body_text = ""
+        try:
+            body_obj = msg.get_body(preferencelist=("plain", "html"))
+        except Exception:
+            body_obj = None
+        if body_obj is not None:
+            try:
+                body_text = body_obj.get_content() or ""
+            except Exception:
+                body_text = ""
+            if body_obj.get_content_type() == "text/html":
+                body_text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", body_text)
+                body_text = re.sub(r"(?i)<br\s*/?>", "\n", body_text)
+                body_text = re.sub(r"(?i)</(p|div|tr|li|h[1-6])>", "\n", body_text)
+                body_text = re.sub(r"<[^>]+>", " ", body_text)
+                body_text = _html.unescape(body_text)
+        body_text = re.sub(r"[ \t]+\n", "\n", (body_text or "").strip())
+        # 더블스페이싱 제거 → 단일 간격.
+        body_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", body_text)
+        body_html = _html.escape(body_text).replace("\n", "<br>")
+
+        # 표 대신 시맨틱 태그로 커버 구성.
+        def _row(label, name):
+            v = _hdr(name)
+            return f"<p style='margin:1px 0'><b>{label}:</b> {v}</p>" if v else ""
+        cover_html = (
+            "<html><head><meta charset='utf-8'></head>"
+            "<body style=\"font-family:'NanumGothic','Malgun Gothic',sans-serif;font-size:10pt\">"
+            + _row("보낸사람", "From") + _row("받는사람", "To") + _row("참조", "Cc")
+            + _row("제목", "Subject") + _row("일시", "Date")
+            + f"<hr><div style='font-size:10pt'>{body_html}</div>"
+            + "</body></html>"
+        )
+        _say("EML 본문 렌더 중...", 8)
+        cover_html_path = os.path.join(temp_pdf_dir, f"_eml_body_{uuid.uuid4().hex}.html")
+        with open(cover_html_path, "w", encoding="utf-8") as fh:
+            fh.write(cover_html)
+        body_pdf = cls.convert_to_pdf(cover_html_path, temp_pdf_dir)
+        if body_pdf and os.path.exists(body_pdf):
+            _emit_pdf(body_pdf)
+            try: os.remove(body_pdf)
+            except OSError: pass
+        else:
+            logger.warning("EML 본문 HTML→PDF 변환 실패 — 본문 페이지 없이 첨부만 진행")
+        try: os.remove(cover_html_path)
+        except OSError: pass
+
+        # --- 2) 첨부 재귀 처리 ---
+        IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+        DOC_EXT = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".odt", ".rtf", ".txt", ".csv"}
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            fname = part.get_filename()
+            disp = part.get_content_disposition()
+            ctype = (part.get_content_type() or "").lower()
+            if disp != "attachment" and not fname:
+                continue   # 본문 파트(이미 커버에 반영)
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception:
+                payload = None
+            if not payload:
+                continue
+            aext = os.path.splitext(fname or "")[1].lower()
+            if not aext and ctype.startswith("image/"):
+                aext = "." + ctype.split("/")[-1]
+
+            if aext in IMG_EXT or ctype.startswith("image/"):
+                try:
+                    from PIL import Image
+                    im = Image.open(_io.BytesIO(payload)).convert("RGB")
+                except Exception as e:
+                    logger.warning(f"EML 첨부 이미지 열기 실패({fname}): {e}")
+                    continue
+                if max(im.size) < 32:        # 1x1 트래킹 픽셀·스페이서 — VLM 낭비 없이 제외
+                    continue
+                # 바이트 임계값 대신 VLM 으로 로고/장식 판별(XLSX·HWP figure 경로와 동일 규약)
+                desc = ""
+                if api_key:
+                    tmp = os.path.join(temp_pdf_dir, f"_emlimg_{uuid.uuid4().hex}.png")
+                    try:
+                        im.save(tmp, "PNG")
+                        desc = VLMProcessor.describe_image(tmp, api_key, model_name) or ""
+                    except Exception as e:
+                        logger.warning(f"EML 첨부 이미지 설명 실패({fname}): {e}")
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    if desc.strip().upper().startswith("LOGO"):
+                        logger.info(f"EML 첨부 이미지 로고로 판별 → 스킵: {fname}")
+                        continue
+                _say(f"EML 첨부 이미지 편입: {fname}", 12)
+                _emit_image(im, hint=f"[첨부 이미지: {fname or ''}] {desc}".strip())
+                continue
+
+            if aext in (".hwp", ".hwpx"):
+                # DRM/문서보안 잠금 첨부는 어떤 엔진으로도 복호화 불가 → 렌더 시도 대신 마커로 가시화.
+                if _is_drm_hwp(payload):
+                    logger.info(f"EML 첨부 HWP DRM 잠금 감지 → 마커 페이지: {fname}")
+                    _say(f"EML 첨부 HWP(DRM 보호): {fname}", 12)
+                    _emit_notice(["🔒 DRM 보호 첨부 — 원본 필요",
+                                  f"파일명: {fname or '(이름없음)'}",
+                                  "문서보안(DOCUMENTSAFER 등)으로 잠겨 자동 파싱이 불가합니다.",
+                                  "내용 확인은 원본 열람 권한이 필요합니다."])
+                    continue
+                _say(f"EML 첨부 HWP 렌더: {fname}", 12)
+                sub = os.path.join(temp_pdf_dir, f"_att_{uuid.uuid4().hex}")
+                os.makedirs(sub, exist_ok=True)
+                ap = os.path.join(sub, os.path.basename(fname) or f"att{aext}")
+                with open(ap, "wb") as fh:
+                    fh.write(payload)
+                emitted = 0
+                try:
+                    cnt = cls._render_hwp_with_rhwp(ap, sub)
+                    for k in range(1, cnt + 1):
+                        src_png = os.path.join(sub, f"page_{str(k).zfill(4)}.png")
+                        if not os.path.exists(src_png):
+                            continue
+                        src_txt = os.path.join(sub, f"page_{str(k).zfill(4)}.txt")
+                        state["n"] += 1
+                        emitted += 1
+                        dn = str(state["n"]).zfill(4)
+                        shutil.move(src_png, os.path.join(doc_output_dir, f"page_{dn}.png"))
+                        dst_txt = os.path.join(doc_output_dir, f"page_{dn}.txt")
+                        if os.path.exists(src_txt):
+                            shutil.move(src_txt, dst_txt)
+                        else:
+                            open(dst_txt, "w", encoding="utf-8").close()
+                except Exception as e:
+                    logger.warning(f"EML 첨부 HWP 렌더 실패({fname}): {e}")
+                finally:
+                    shutil.rmtree(sub, ignore_errors=True)
+                # 렌더 결과가 0쪽이면(DRM 미탐지·손상 등) 누락 대신 마커로 가시화.
+                if emitted == 0:
+                    _emit_notice(["⚠ 첨부 HWP 파싱 실패 — 원본 필요",
+                                  f"파일명: {fname or '(이름없음)'}",
+                                  "문서보안 잠금 또는 손상으로 자동 렌더에 실패했습니다."])
+                continue
+
+            if aext in DOC_EXT:
+                _say(f"EML 첨부 문서 렌더: {fname}", 12)
+                ap = os.path.join(temp_pdf_dir, f"_att_{uuid.uuid4().hex}{aext}")
+                with open(ap, "wb") as fh:
+                    fh.write(payload)
+                try:
+                    if aext == ".pdf":
+                        _emit_pdf(ap)
+                    elif aext == ".xlsx":
+                        pdfp, _sm = cls._convert_excel_to_pdf_with_sheet_map(ap, temp_pdf_dir)
+                        if pdfp: _emit_pdf(pdfp)
+                    else:
+                        pdfp = cls.convert_to_pdf(ap, temp_pdf_dir)
+                        if pdfp: _emit_pdf(pdfp)
+                except Exception as e:
+                    logger.warning(f"EML 첨부 변환 실패({fname}): {e}")
+                finally:
+                    if os.path.exists(ap): os.remove(ap)
+                continue
+
+            logger.info(f"EML 첨부 미지원 건너뜀: {fname} ({ctype})")
+
+        return state["n"]
 
     @classmethod
     def convert_hwp_to_pdf_via_odt(cls, input_path, output_dir):
@@ -1408,7 +1937,7 @@ class DocumentProcessor:
         return "\n".join(lines).strip()
 
     @classmethod
-    def process_and_save(cls, file_path, base_output_dir, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-8B-Instruct", progress_callback=None, chunk_strategies=None):
+    def process_and_save(cls, file_path, base_output_dir, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-30B-A3B-Instruct", progress_callback=None, chunk_strategies=None):
         filename = os.path.basename(file_path)
         name, ext = os.path.splitext(filename)
         ext = ext.lower()
@@ -1488,6 +2017,14 @@ class DocumentProcessor:
             else:
                 raise Exception(f"{ext.upper()} → PDF 변환 실패. (Windows: 한글 프로그램 / Linux: LibreOffice+H2Orestart 필요)")
 
+        elif ext == '.eml':
+            set_progress("EML 파싱 중 (본문 디코딩 + 첨부 렌더)...", 5)
+            try:
+                n_eml = cls._render_eml(file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress)
+            except Exception as e:
+                raise Exception(f"EML 처리 실패: {e}")
+            set_progress(f"EML 파싱 완료 ({n_eml}쪽)", 20)
+
         else:
             set_progress("일반 문서 시각 레이아웃 생성 중...", 10)
             if ext == '.pdf':
@@ -1545,10 +2082,11 @@ class DocumentProcessor:
                 logger.warning(f"XLSX 하이브리드 실패 → 일반 VLM 폴백: {e}")
 
         failed_pages = []   # VLM 구조추출이 (재시도 후에도) 실패한 페이지 — 부분 실패 가시화용
+        low_conf_pages = []  # 이미지엔 내용이 있으나 추출이 빈약(저신뢰)한 페이지 — silent-drop 가시화용
         vlm_fmt = "json" if output_format.lower() == "markdown" else output_format
 
         def _persist_page(stem, structured_data):
-            """추출 구조를 후처리(page_number·중복제거) 후 파일로 기록(메인/최종재시도 공용)."""
+            """추출 구조를 후처리(page_number·중복제거·저신뢰탐지·PII) 후 파일로 기록(메인/최종재시도 공용)."""
             if vlm_fmt == "json":
                 try:
                     parsed = json.loads(structured_data)
@@ -1556,14 +2094,144 @@ class DocumentProcessor:
                         parsed["page_number"] = int(stem.split("_")[1])
                     except (IndexError, ValueError):
                         pass
-                    seen_contents, deduped = set(), []
-                    for elem in parsed.get("elements", []):
-                        content_only = elem.get("content", "").strip()
-                        if content_only and content_only in seen_contents:
+                    # 중복 제거(완전일치 + substring 포함). 본문성(text/footnote)만 대상.
+                    _SUBSTR_DROPPABLE = {"text", "footnote"}
+                    elems = [e for e in parsed.get("elements", []) if isinstance(e, dict)]
+                    norm = [re.sub(r"\s+", " ", (e.get("content") or "")).strip() for e in elems]
+                    drop = [False] * len(elems)
+                    for i in range(len(elems)):
+                        if drop[i] or len(norm[i]) < 12:
                             continue
-                        if content_only:
-                            seen_contents.add(content_only)
-                        deduped.append(elem)
+                        for j in range(len(elems)):
+                            if i == j or drop[j] or len(norm[j]) < 12:
+                                continue
+                            if elems[j].get("type", "text") not in _SUBSTR_DROPPABLE:
+                                continue   # heading/table/figure/toc 는 substring 제거 면제
+                            # j 가 i 에 포함되고 i 가 더 길면(또는 동일·앞선 블록) j 를 중복으로 제거
+                            if norm[j] in norm[i] and (len(norm[j]) < len(norm[i]) or j > i):
+                                drop[j] = True
+                    # 근접중복 제거: 정규화(이메일·꺾쇠·기호 제거) 후 일치/포함이면 긴 쪽만 유지.
+                    def _nrm(s):
+                        s = re.sub(r"<[^>]*>", " ", s)                 # <이메일>·꺾쇠 토큰 제거
+                        s = re.sub(r"[\w.%+\-]+@[\w.\-]+", " ", s)      # 남은 이메일
+                        s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)         # 공백·문장부호 제거
+                        return s.lower()
+                    nnorm = [_nrm(n) for n in norm]
+                    for i in range(len(elems)):
+                        if drop[i] or elems[i].get("type", "text") not in _SUBSTR_DROPPABLE or len(nnorm[i]) < 16:
+                            continue
+                        for j in range(i + 1, len(elems)):
+                            if drop[j] or elems[j].get("type", "text") not in _SUBSTR_DROPPABLE or len(nnorm[j]) < 16:
+                                continue
+                            a, b = nnorm[i], nnorm[j]
+                            if a == b or a in b or b in a:
+                                if len(norm[j]) <= len(norm[i]):   # 더 완전한 쪽(원문 긴 쪽) 유지
+                                    drop[j] = True
+                                else:
+                                    drop[i] = True
+                                    break
+                    deduped, seen = [], set()
+                    for k, e in enumerate(elems):
+                        if drop[k]:
+                            continue
+                        c = norm[k]
+                        if c and c in seen:
+                            continue
+                        if c:
+                            seen.add(c)
+                        deduped.append(e)
+                    # silent-drop 탐지: 이미지엔 잉크가 있는데 추출 본문이 페이지번호/푸터 수준이면 저신뢰 표기.
+                    alltext = "".join((e.get("content") or "") + (e.get("caption") or "") +
+                                      (e.get("description") or "") for e in deduped)
+                    core = re.sub(r"\d+", "", re.sub(r"[\s\-–—·.~_=|]", "", alltext))
+                    if len(core) < 8:
+                        png = os.path.join(doc_output_dir, f"{stem}.png")
+                        if _image_has_ink(png):
+                            deduped.insert(0, {"type": "text", "content":
+                                "⚠ 자동 추출 불완전 — 이 페이지는 이미지(표·도해·캡처)로 구성되어 본문이 거의 추출되지 않았습니다. 원본 확인 필요."})
+                            parsed["low_confidence"] = True
+                            try: low_conf_pages.append(int(stem.split("_")[1]))
+                            except (IndexError, ValueError): low_conf_pages.append(stem)
+                    # 표 검증·수리(나란한표 분할·column-bleed 병합·열수 패딩). element 1개가 2개로 분할될 수 있음.
+                    try:
+                        import table_validate
+                        # HWP 네이티브 표 로드(있으면 VLM 이미지표를 정확한 colspan/rowspan 으로 교체)
+                        _native_prep = []
+                        _np = os.path.join(doc_output_dir, "_native_tables.json")
+                        if os.path.exists(_np):
+                            try:
+                                with open(_np, encoding="utf-8") as _nf:
+                                    _native_prep = table_validate.prepare_native(json.load(_nf))
+                            except Exception:
+                                _native_prep = []
+                        rebuilt = []
+                        for e in deduped:
+                            if e.get("type") == "table" and e.get("content"):
+                                # 네이티브 우선: 내용일치하면 정답구조로 교체(검증/수리 생략 — 이미 정확).
+                                _nh = (table_validate.native_substitute(e["content"], _native_prep)
+                                       if _native_prep else None)
+                                if _nh and _nh.strip() and "</table>" in _nh:
+                                    rebuilt.append({**e, "content": _nh, "_native": True})
+                                    continue
+                                new_els, _retry, _iss = table_validate.validate_and_repair_table(
+                                    e["content"], e.get("caption"))
+                                for ne in new_els:
+                                    m = {**e, "content": ne["content"]}
+                                    if ne.get("caption") is not None:
+                                        m["caption"] = ne["caption"]
+                                    rebuilt.append(m)
+                            else:
+                                rebuilt.append(e)
+                        deduped = rebuilt
+                    except Exception as te:
+                        logger.warning(f"표 검증 실패({stem}): {te}")
+                    # figure description 폴백(결정적): 빈 description 으로 RAG 앵커가 사라지지 않게 보정.
+                    #   - 산문이 content 에 잘못 들어간 경우 → description 으로 승급.
+                    #   - HTML/캡처면 caption 또는 ⚠ 마커로 폴백.
+                    #   - 한글문서인데 description 이 외국어(인용 라벨 제외 한글비율 낮음)면 ⚠ 표기(프롬프트 1차 + 코드 하한).
+                    try:
+                        _page_kr = _korean_ratio("".join((e.get("content") or "")
+                                    for e in deduped if e.get("type") != "figure"))
+                        for e in deduped:
+                            if e.get("type") != "figure":
+                                continue
+                            desc = (e.get("description") or "").strip()
+                            # figure 설명 길이 상한 — 초과 시 앞부분만 남기고 절단.
+                            if len(desc) > 1200:
+                                _cap = (e.get("caption") or "").strip()
+                                _head = re.split(r"[.\n]", desc, 1)[0][:160].strip()
+                                desc = ((_cap + " — ") if _cap else "") + (_head or "이미지") + " ⚠(설명 비정상 생성으로 절단)"
+                                e["description"] = desc
+                            if not desc:
+                                content = (e.get("content") or "").strip()
+                                cap = (e.get("caption") or "").strip()
+                                if content and "<" not in content and len(content) >= 12:
+                                    desc = content            # 산문 시각설명이 content 로 잘못 간 경우 구제
+                                elif cap:
+                                    desc = cap
+                                else:
+                                    desc = "⚠ 설명 누락 — 원본 캡처 확인 필요"
+                                e["description"] = desc
+                            if _page_kr >= 0.30 and desc and not desc.startswith("⚠"):
+                                _core = re.sub(r"[\"'].*?[\"']", "", desc)   # 인용된 외국어 라벨 제외
+                                if _korean_ratio(_core) < 0.20:
+                                    e["description"] = "⚠ 외국어 설명 — " + desc
+                    except Exception as fe:
+                        logger.warning(f"figure description 폴백 실패({stem}): {fe}")
+                    # figure 순서 교정(IR 앵커 기반 재배치).
+                    try:
+                        _fa = os.path.join(doc_output_dir, "_figure_anchors.json")
+                        if os.path.exists(_fa) and any(e.get("type") == "figure" for e in deduped):
+                            with open(_fa, encoding="utf-8") as _af:
+                                deduped = _reposition_figures_by_anchor(deduped, json.load(_af))
+                    except Exception as re_e:
+                        logger.warning(f"figure 재배치 실패({stem}): {re_e}")
+                    # PII 마스킹(사용자 지정 타입만; 기본 OFF)
+                    if PII_MASK_TYPES:
+                        for e in deduped:
+                            for key in ("content", "caption", "description"):
+                                if e.get(key):
+                                    e[key] = mask_pii(e[key])
                     parsed["elements"] = deduped
                     structured_data = json.dumps(parsed, ensure_ascii=False, indent=4)
                 except Exception as e:
@@ -1578,57 +2246,154 @@ class DocumentProcessor:
                 with open(os.path.join(doc_output_dir, f"{stem}_structured.{output_format.lower()}"), "w", encoding="utf-8") as f:
                     f.write(structured_data)
 
+        def _extract_multicol(stem, img_path, frac):
+            """다단 페이지: 좌/우 열을 따로 추출해 순서대로(좌→우) 합쳐 읽기순서 보장. 실패 시 None."""
+            try:
+                from PIL import Image
+                with Image.open(img_path) as im:
+                    W, H = im.size
+                    gx = int(W * frac); pad = int(W * 0.012)
+                    crops = [im.crop((0, 0, min(gx + pad, W), H)), im.crop((max(gx - pad, 0), 0, W, H))]
+                merged = []
+                for ci, crop in enumerate(crops):
+                    tmp = os.path.join(doc_output_dir, f".{stem}_col{ci}_{uuid.uuid4().hex}.png")
+                    crop.save(tmp, "PNG")
+                    try:
+                        sd, _ = VLMProcessor.extract_structure(
+                            txt_path=None, img_path=tmp, api_key=api_key,
+                            output_format=vlm_fmt, model_name=model_name)
+                    finally:
+                        try: os.remove(tmp)
+                        except OSError: pass
+                    if not sd:
+                        return None
+                    pj = json.loads(sd)
+                    merged.extend(pj if isinstance(pj, list) else pj.get("elements", []))
+                if not merged:
+                    return None
+                pn = int(stem.split("_")[1]) if "_" in stem else 0
+                return json.dumps({"page_number": pn, "elements": merged}, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"{stem} 다단 분리추출 실패 → 전체페이지 폴백: {e}")
+                return None
+
         def _extract_page(stem):
             """한 페이지 추출 + 성공 시 기록. (성공여부, 재시도가치) 반환.
             재시도가치=False 면 일시적 오류가 아니라(반복 생성·타임아웃·유효성 실패) 최종재시도 무의미."""
             img_path = os.path.join(doc_output_dir, f"{stem}.png")
+            has_img = os.path.exists(img_path)
+            # 다단 페이지면 열별 분리추출 우선(읽기순서 보장). 실패하면 전체페이지 추출로 폴백.
+            if has_img and VLM_MULTICOL:
+                frac = _detect_column_split(img_path)
+                if frac:
+                    sd = _extract_multicol(stem, img_path, frac)
+                    if sd:
+                        _persist_page(stem, sd); return True, True
             sd, retryable = VLMProcessor.extract_structure(
                 txt_path=os.path.join(doc_output_dir, f"{stem}.txt"),
-                img_path=img_path if os.path.exists(img_path) else None,
+                img_path=img_path if has_img else None,
                 api_key=api_key, output_format=vlm_fmt, model_name=model_name)
             if sd:
                 _persist_page(stem, sd)
                 return True, True
             return False, retryable
 
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         retry_eligible = set()        # 일시적 실패라 최종재시도 가치가 있는 페이지 번호
         budget_exceeded = False       # 문서 VLM 시간예산 초과(이후 페이지는 텍스트 폴백)
         _vlm_start = time.monotonic()
-        for idx, txt_file in enumerate(page_files):
-            set_progress(f"⏳ AI 모델 분석 중... ({idx + 1}/{total_vlm_pages} 쪽)",
-                         25 + int((idx / total_vlm_pages) * 75))
-            stem = txt_file[:-4]
-            if os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.json")):
-                continue   # 이미 처리됨(XLSX 하이브리드 등) — 재VLM 안 함
+
+        # 처리 대상(이미 처리된 XLSX 하이브리드 페이지 제외)
+        pending = [tf[:-4] for tf in page_files
+                   if not os.path.exists(os.path.join(doc_output_dir, f"{tf[:-4]}_structured.json"))]
+
+        def _run_page(stem):
+            # 예산 초과면(제출됐어도) 즉시 폴백 처리
             if DOC_VLM_BUDGET_SEC > 0 and (time.monotonic() - _vlm_start) > DOC_VLM_BUDGET_SEC:
-                if not budget_exceeded:
-                    logger.error(f"문서 VLM 시간예산({DOC_VLM_BUDGET_SEC}s) 초과 — 남은 페이지는 텍스트 폴백")
-                budget_exceeded = True
-                try: failed_pages.append(int(stem.split("_")[-1]))
-                except ValueError: failed_pages.append(stem)
-                continue
-            done_pct = 25 + int(((idx + 1) / total_vlm_pages) * 75)
+                return False, False, True
             ok, retryable = _extract_page(stem)
-            if ok:
-                set_progress(f"✅ {idx + 1}쪽 분석 완료!", done_pct)
-            else:
+            return ok, retryable, False
+
+        # 페이지 동시 추출 → vLLM 배칭으로 GPU 포화(순차 대비 수 배 가속).
+        # 집계(failed_pages·retry_eligible)는 메인 스레드의 as_completed 루프에서만 수행 → 락 불필요.
+        # 각 워커는 자기 페이지의 {stem}_structured.json 만 기록(파일 비공유) → 스레드 안전.
+        n_pending = len(pending)
+        workers = max(1, min(VLM_PAGE_CONCURRENCY, n_pending or 1))
+        done_cnt = 0
+        set_progress(f"⏳ AI 모델 분석 중... (0/{n_pending} 쪽, 동시 {workers})", 25)
+        with ThreadPoolExecutor(max_workers=workers) as _ex:
+            _futs = {_ex.submit(_run_page, s): s for s in pending}
+            for fut in as_completed(_futs):
+                stem = _futs[fut]
+                done_cnt += 1
                 try:
-                    pn = int(stem.split("_")[-1]); failed_pages.append(pn)
-                    if retryable: retry_eligible.add(pn)
-                except ValueError:
-                    failed_pages.append(stem)
-                logger.warning(f"{stem} AI 분석 실패 ({'최종 재시도 대상' if retryable else '재시도 무의미'})")
-                set_progress(f"⚠️ {stem} 분석 실패", done_pct)
+                    ok, retryable, skipped = fut.result()
+                except Exception as e:   # 워커 예외(파일쓰기 등)가 문서 전체를 날리지 않게 페이지 단위 격리
+                    logger.warning(f"{stem} 페이지 워커 예외: {e}")
+                    ok, retryable, skipped = False, False, False
+                done_pct = 25 + int((done_cnt / max(n_pending, 1)) * 75)
+                if skipped:
+                    if not budget_exceeded:
+                        logger.error(f"문서 VLM 시간예산({DOC_VLM_BUDGET_SEC}s) 초과 — 남은 페이지는 텍스트 폴백")
+                    budget_exceeded = True
+                    try: failed_pages.append(int(stem.split("_")[-1]))
+                    except ValueError: failed_pages.append(stem)
+                    continue
+                if ok:
+                    set_progress(f"✅ {done_cnt}/{n_pending}쪽 분석 완료", done_pct)
+                else:
+                    try:
+                        pn = int(stem.split("_")[-1]); failed_pages.append(pn)
+                        if retryable: retry_eligible.add(pn)
+                    except ValueError:
+                        failed_pages.append(stem)
+                    logger.warning(f"{stem} AI 분석 실패 ({'최종 재시도 대상' if retryable else '재시도 무의미'})")
+                    set_progress(f"⚠️ {stem} 분석 실패", done_pct)
 
         # 최종 재시도: 부하가 빠진 뒤 '일시적' 실패 페이지만 1회 더 시도해 복구한다.
         # 반복 생성·타임아웃·유효성 실패(retry_eligible 아님)는 동일 입력 재시도가 무의미하므로 제외(런어웨이 방지).
         retry = [pn for pn in failed_pages if isinstance(pn, int) and pn in retry_eligible]
         if retry and not budget_exceeded:
             set_progress(f"🔁 실패 {len(retry)}쪽 최종 재시도 중...", 96)
-            recovered = [pn for pn in retry if _extract_page(f"page_{pn:04d}")[0]]
+            rworkers = max(1, min(VLM_PAGE_CONCURRENCY, len(retry)))
+            recovered = []
+            with ThreadPoolExecutor(max_workers=rworkers) as _ex:
+                _rf = {_ex.submit(_extract_page, f"page_{pn:04d}"): pn for pn in retry}
+                for fut in as_completed(_rf):
+                    try:
+                        if fut.result()[0]:
+                            recovered.append(_rf[fut])
+                    except Exception:
+                        pass
             if recovered:
                 logger.info(f"최종 재시도로 {len(recovered)}쪽 구조 복구: {sorted(recovered)}")
             failed_pages = [pn for pn in failed_pages if pn not in recovered]
+
+        # never-fail 보장: 재시도 후에도 structured.json 이 없는 페이지는 텍스트레이어로 구조를 합성한다.
+        # (데모 요건: 실패 페이지 0. 구조추출이 끝내 안 되면 텍스트 문단을 element 로 감싸 저장 + 저신뢰 표기.)
+        if vlm_fmt == "json":
+            for stem in [tf[:-4] for tf in page_files]:
+                sj = os.path.join(doc_output_dir, f"{stem}_structured.json")
+                if os.path.exists(sj):
+                    continue
+                tp = os.path.join(doc_output_dir, f"{stem}.txt")
+                raw = ""
+                if os.path.exists(tp):
+                    with open(tp, "r", encoding="utf-8") as f:
+                        raw = f.read().strip()
+                paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()] or ([raw] if raw else [])
+                els = [{"type": "text", "content": p} for p in paras]
+                els.insert(0, {"type": "text", "content":
+                               "⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장."})
+                try: pn = int(stem.split("_")[1])
+                except (IndexError, ValueError): pn = 0
+                with open(sj, "w", encoding="utf-8") as f:
+                    json.dump({"page_number": pn, "elements": els, "low_confidence": True},
+                              f, ensure_ascii=False, indent=4)
+                if isinstance(pn, int) and pn not in low_conf_pages:
+                    low_conf_pages.append(pn)
+                logger.info(f"{stem}: 텍스트레이어 폴백으로 structured 합성(never-fail)")
+            failed_pages = []   # 모든 페이지가 structured.json 보유 → 실패 0 보장
 
         if output_format.lower() in ("json", "markdown"):
             toc_entries = []
@@ -1754,6 +2519,7 @@ class DocumentProcessor:
                 metadata = {}
             metadata["vlm_pages_total"] = total_vlm_pages
             metadata["vlm_failed_pages"] = sorted(failed_pages)
+            metadata["low_confidence_pages"] = sorted(p for p in low_conf_pages if isinstance(p, int))
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1762,8 +2528,13 @@ class DocumentProcessor:
         if os.path.exists(temp_pdf_dir):
             shutil.rmtree(temp_pdf_dir, ignore_errors=True)
 
-        if failed_pages:
-            set_progress(f"⚠️ 완료 — 구조추출 실패 {len(failed_pages)}/{total_vlm_pages}쪽"
-                         f"(폴백: {sorted(failed_pages)}). 해당 페이지는 텍스트만 포함.", 100)
+        lc = sorted(p for p in low_conf_pages if isinstance(p, int))
+        if failed_pages or lc:
+            msg = "⚠️ 완료"
+            if failed_pages:
+                msg += f" — 구조추출 실패 {len(failed_pages)}/{total_vlm_pages}쪽(폴백: {sorted(failed_pages)})"
+            if lc:
+                msg += f" — 저신뢰(이미지 추출 빈약) {len(lc)}쪽: {lc} 원본 확인 필요"
+            set_progress(msg, 100)
         else:
             set_progress("🎉 모든 구조화 완료!", 100)

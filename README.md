@@ -118,13 +118,13 @@ pip install -r requirements.txt
 기본적으로 **로컬 VLM**(vLLM 등 OpenAI 호환 엔드포인트)을 사용합니다. 모델을 로컬에 서빙한 뒤, 그 주소를 `VLM_BASE_URL`로 지정하면 됩니다. (별도 API 키 불필요)
 ```bash
 # 1) VLM 로컬 서빙 (예: vLLM, OpenAI 호환 엔드포인트)
-vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000
+vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct --port 8000
 
 # 2) ModuDoc가 이 엔드포인트를 사용하도록 지정
 export VLM_BASE_URL="http://localhost:8000/v1"
 # (인증이 필요한 엔드포인트라면) export VLM_API_KEY="your_key"
 ```
-> 💡 `/api/process`의 `model` 파라미터(기본 `Qwen/Qwen3-VL-8B-Instruct`)는 **서빙 중인 모델 이름과 일치**해야 합니다.
+> 💡 `/api/process`의 `model` 파라미터(기본 `Qwen/Qwen3-VL-30B-A3B-Instruct`)는 **서빙 중인 모델 이름과 일치**해야 합니다.
 
 <details><summary>HWP 렌더(rhwp) 관련 선택 환경변수</summary>
 
@@ -183,7 +183,7 @@ python app.py
 curl -X POST http://localhost:5000/api/process \
   -F "files=@sample_document.pdf" \
   -F "format=json" \
-  -F "model=Qwen/Qwen3-VL-8B-Instruct" \
+  -F "model=Qwen/Qwen3-VL-30B-A3B-Instruct" \
   -F "chunk=toc" -F "chunk=tree" \
   -F "concurrency=3"
 # → {"message": "작업 시작됨", "task_id": "abc123..."}
@@ -192,7 +192,7 @@ curl -X POST http://localhost:5000/api/process \
 |---|---|---|---|
 | `files` | 파일(복수 가능) | — | 업로드할 문서(PDF/HWP/HWPX/DOCX/PPTX/XLSX) |
 | `format` | `json` / `markdown` / `xml` | `json` | 출력 형식 |
-| `model` | 모델명 | `Qwen/Qwen3-VL-8B-Instruct` | **서빙 중인 모델명과 일치해야** |
+| `model` | 모델명 | `Qwen/Qwen3-VL-30B-A3B-Instruct` | **서빙 중인 모델명과 일치해야** |
 | `chunk` | `page` / `toc` / `tree` | (없음) | 청킹 전략(중복 선택). [위 가이드](#어떤-청킹-전략을-쓸까) 참고 |
 | `concurrency` | `1`~`16` | `3` | 페이지 동시 처리 수 |
 
@@ -215,7 +215,7 @@ DocumentProcessor.process_and_save(
     base_output_dir="./processed",
     api_key="local-vllm-noauth-key",     # 로컬 no-auth면 비어있지 않은 아무 값
     output_format="json",                # "json" | "markdown" | "xml"
-    model_name="Qwen/Qwen3-VL-8B-Instruct",
+    model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
     chunk_strategies=["page", "toc", "tree"],
 )
 ```

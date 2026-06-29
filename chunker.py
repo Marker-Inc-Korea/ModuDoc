@@ -17,6 +17,7 @@ _HANGUL_ORD = "가나다라마바사아자차카타파하"
 _NUM_PATTERNS = [
     ("pyeon", re.compile(r'^제\s*\d+\s*[편부]')),
     ("jang",  re.compile(r'^(?:제\s*\d+\s*장|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.\s])')),
+    ("roman", re.compile(r'^[IVXLCDM]{1,7}\.\s')),     # ASCII 로마자 최상위 섹션(I. II. … VIII.)
     ("jeol",  re.compile(r'^제\s*\d+\s*절')),
     ("gwan",  re.compile(r'^제\s*\d+\s*관')),
     ("jo",    re.compile(r'^제\s*\d+\s*조(?:의\s*\d+)?')),
@@ -32,7 +33,7 @@ _NUM_PATTERNS = [
     ("dash",  re.compile(r'^[-–·∙]\s')),                        # -
 ]
 _PATTERN_RANK = {name: i for i, (name, _) in enumerate(_NUM_PATTERNS)}
-_STRONG = {"pyeon", "jang", "jeol", "gwan", "jo"}
+_STRONG = {"pyeon", "jang", "roman", "jeol", "gwan", "jo"}
 MAX_CHUNK_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "4000"))
 # 크기 분할로 생긴 하위청크 사이 오버랩(자). 0=비활성. (크기 분할에만 적용)
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "0"))
@@ -46,14 +47,15 @@ def _detect_pattern(text: str):
     return None
 
 
-_ANCHOR_KW = ("별표", "별지", "부칙", "서식", "신구조문", "신·구조문", "신 · 구조문", "구조문대비표")
+_ANCHOR_KW = ("별표", "별지", "부칙", "서식", "신구조문", "신·구조문", "신 · 구조문", "구조문대비표",
+              "붙임", "첨부", "참고")   # 붙임/참고/첨부 = 본문 섹션과 형제인 최상위 첨부 블록
 # 끝점 십진도 허용: '7.6' / '7.6.' / '7.6.1' / '7.6.1.' 모두 인식(끝 '.' 는 캡처 밖).
 _DECIMAL_RX = re.compile(r'^(\d+(?:\.\d+)+)\.?(?:\s|$|[^\d.])')
 _BYLAW_REF_RX = re.compile(r'\(\s*제\s*\d+\s*조[^)]*관련\s*\)')   # '...(제5조 관련)' 별표 제목
 # 마커별 절대 랭크(작을수록 상위). 같은 랭크 = 형제(같은 레벨). 십진 다단계는 점 개수로.
 # 한국 번호체계 계층: 조 > ①항 > 1.호(+십진) > 가.목 > (1) > (가) > 1) > 가) > □ > ○ > -
 _RANK = {
-    "pyeon": 0, "jang": 2, "jeol": 4, "gwan": 6, "jo": 8,
+    "pyeon": 0, "jang": 2, "roman": 2, "jeol": 4, "gwan": 6, "jo": 8,
     "hang": 20, "ho": 30, "mok": 40,           # 십진 다단계는 _heading_rank 에서 31~35
     "pnum": 50, "pga": 52, "nump": 60, "gap": 62,
     "sq": 70, "circ": 74, "dash": 78,
@@ -266,8 +268,38 @@ def _merge_continued_headings(elements: list) -> list:
     return out
 
 
+def _strip_page_furniture(els: list) -> list:
+    """heading 으로 오라벨된 반복 머리말/꼬리말(running header/footer)을 첫 출현만 남기고 제거."""
+    pages = {e.get("page_number", 0) for e in els}
+    npages = len(pages)
+    if npages < 5:
+        return els
+    freq = {}
+    for e in els:
+        if (e.get("type") or "").startswith("heading"):
+            t = _norm_title(e.get("content", ""))
+            if t and len(t) <= 40:
+                freq.setdefault(t, set()).add(e.get("page_number", 0))
+    # 페이지의 60% 이상(최소 3쪽)에서 heading 으로 반복 → furniture 로 간주.
+    furniture = {t for t, ps in freq.items() if len(ps) >= max(3, int(0.6 * npages))}
+    if not furniture:
+        return els
+    logger.info(f"furniture heading 제거(반복 머리말/배너): {sorted(furniture)}")
+    kept, out = set(), []
+    for e in els:
+        if (e.get("type") or "").startswith("heading"):
+            t = _norm_title(e.get("content", ""))
+            if t in furniture:
+                if t in kept:
+                    continue              # 반복 출현 제거
+                kept.add(t)               # 첫 출현은 보존
+        out.append(e)
+    return out
+
+
 def _flat_normalized(doc_dir: str) -> list:
     els = _flat_elements(_load_pages(doc_dir))
+    els = _strip_page_furniture(els)          # (0) 반복 머리말/배너 furniture heading 제거
     els = _merge_continued_headings(els)      # (2) 페이지 넘김 반복/연속 heading 병합
     return _normalize_heading_levels(els)     # (1) 번호 정규화 + 구조 클램프
 

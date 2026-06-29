@@ -61,7 +61,7 @@ def process_files():
         return jsonify({"error": "파일이 없습니다."}), 400
         
     output_format = request.form.get('format', 'json')
-    model_name = request.form.get('model', 'Qwen/Qwen3-VL-8B-Instruct')
+    model_name = request.form.get('model', 'Qwen/Qwen3-VL-30B-A3B-Instruct')
     chunk_strategies = request.form.getlist('chunk')
     try:
         concurrency = max(1, min(16, int(request.form.get('concurrency', 3))))
