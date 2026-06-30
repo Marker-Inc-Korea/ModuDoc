@@ -790,7 +790,7 @@ Rules for XML:
 2. Repeat <element> tags as needed — multiple elements of the same type are allowed.
 3. If an element does not exist, simply do not include that type.
 4. [TABLE — CRITICAL] Any grid of data with rows and columns MUST be output as HTML table. Rules:
-   a. Use ONLY <table>, <tr>, <td> tags. NEVER use <th>. You MAY use colspan/rowspan (e.g. <td colspan="2">Header</td>).
+   a. Use ONLY <table>, <tr>, <td> tags (and <br> only inside a cell). NEVER use <th>. You MAY use colspan/rowspan (e.g. <td colspan="2">Header</td>).
    b. Always use the layout IMAGE to detect tables visually — raw text extraction often loses column alignment and merges cells.
    c. Include ALL rows: header rows, subheader rows, data rows, and any title row that spans all columns.
    d. Each row must have the same number of cells (accounting for colspan/rowspan). Empty cells must be included as empty <td></td>.
@@ -832,7 +832,7 @@ Rules for JSON:
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading "content" exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items listed on a Table of Contents page. Set content to "title::page_number".
    - text: General body paragraphs, including lists, bullet points, and any text content that is NOT a heading. Use **bold** for bold text within paragraphs.
-   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be <td></td>. NEVER output table data as flat text. Put table title in "caption".
+   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> (and <br> only inside a cell) — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be <td></td>. NEVER output table data as flat text. Put table title in "caption".
    - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart from top-left to bottom-right and output EVERY visible number, label, and text into "content" — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and annotations. List each item on its own line in visual reading order. For photographs or decorative images with no data, leave "content" empty. ALWAYS fill "description" with a detailed visual description, written in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) EVEN IF the figure's own labels/axes/legend are in another language — transcribe the foreign labels verbatim into "content", but NARRATE "description" in the document language. Write "description" with detail matched to the figure TYPE:
      • Chart/graph: name the chart type (막대/선/원), then the CONCRETE shape of the trend (계단식/선형/급증·급락/평탄), WHERE the peak/trough sits, and compare the series/legend entries by name. Include printed numbers (peaks, totals, legend values) ONLY if they are actually printed on the figure.
      • Diagram/flowchart/structure: enumerate the main nodes/components and the relationships, flow direction, or contract/transaction names connecting them.
@@ -868,6 +868,8 @@ Your task is to convert the provided document text (and layout image if availabl
      Worked example — every row resolves to exactly 7 columns:
      <table><tr><th rowspan="2">항목</th><th colspan="2">2024년</th><th colspan="2">2025년</th><th rowspan="2">증감</th><th rowspan="2">비고</th></tr><tr><th>상반기</th><th>하반기</th><th>상반기</th><th>하반기</th></tr><tr><td>매출</td><td>10</td><td>12</td><td>13</td><td>15</td><td>+2</td><td>-</td></tr></table>
      (header row-1 = 1+2+2+1+1 = 7; row-2 fills only the 4 sub-columns under the two colspan groups while 항목·증감·비고 carry down by rowspan; body = 7. All rows = 7. No blank padding column.)
+  (9) MULTI-LINE CELL: when content is stacked on several lines INSIDE one bordered cell (e.g. a name with its phone number beneath it in the SAME cell, or a value with its unit below), transcribe EVERY line of that cell joined by <br> — never keep only the first line. This applies ONLY to lines within one cell's borders; genuinely separate rows stay separate <tr>.
+- TABLE CAPTION + NOTES: put the FULL table title in "caption" INCLUDING any trailing parenthetical unit/as-of suffix exactly as printed (e.g. "현황(억원)", "생산량(단위:천톤)", "(’25.6.23 기준)"). A footnote or source line printed OUTSIDE the table border beneath it ("주) …", "* 출처: …", "* 주:") → emit as its OWN text element (type text, not footnote); do NOT drop it and do NOT duplicate an in-table note row.
 
 
 {schema_instruction}"""
