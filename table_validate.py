@@ -252,6 +252,9 @@ def _slice_native(native_html, vlm_html):
             keep_idx.add(i)
             span = max((_rspan(c) for c in tr.find_all(["td", "th"], recursive=False)), default=1)
             for j in range(i + 1, min(i + span, len(nb))):   # rowspan 그룹 연속행 동반(dangling rowspan 방지)
+                cells_j = nb[j].find_all(["td", "th"], recursive=False)
+                if cells_j and _rspan(cells_j[0]) > 1:       # 다음 그룹 앵커 → 과다 rowspan 확장 중단
+                    break
                 keep_idx.add(j)
     keep = [tr for i, tr in enumerate(nb) if i in keep_idx]
     if len(keep) < max(2, len(vb) // 2):     # 키 매칭 빈약 시 포기
