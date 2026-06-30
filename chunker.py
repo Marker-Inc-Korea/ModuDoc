@@ -49,6 +49,11 @@ def _detect_pattern(text: str):
 
 _ANCHOR_KW = ("별표", "별지", "부칙", "서식", "신구조문", "신·구조문", "신 · 구조문", "구조문대비표",
               "붙임", "첨부", "참고")   # 붙임/참고/첨부 = 본문 섹션과 형제인 최상위 첨부 블록
+# 앵커 매칭은 구분자(가운뎃점·마침표·반각중점)·공백 무시.
+_ANCHOR_SEP_RX = re.compile(r"[·.ㆍ・∙•\s]")
+def _anchor_norm(s: str) -> str:
+    return _ANCHOR_SEP_RX.sub("", s or "")
+_ANCHOR_KW_N = tuple(_anchor_norm(k) for k in _ANCHOR_KW)
 # 끝점 십진도 허용: '7.6' / '7.6.' / '7.6.1' / '7.6.1.' 모두 인식(끝 '.' 는 캡처 밖).
 _DECIMAL_RX = re.compile(r'^(\d+(?:\.\d+)+)\.?(?:\s|$|[^\d.])')
 _BYLAW_REF_RX = re.compile(r'\(\s*제\s*\d+\s*조[^)]*관련\s*\)')   # '...(제5조 관련)' 별표 제목
@@ -70,7 +75,7 @@ _BU_TITLE_RX = re.compile(r'^(제\s*\d+\s*[편장절관부](?:\s*\([^)]*\))?)')
 def _heading_rank(content: str, vlm_type: str) -> int:
     """heading 의 계층 랭크(작을수록 상위). 같은 랭크는 형제로 처리된다."""
     c = (content or "").strip()
-    if any(c.lstrip("[ \t").startswith(k) for k in _ANCHOR_KW) or _BYLAW_REF_RX.search(c):
+    if any(_anchor_norm(c.lstrip("[ \t")).startswith(k) for k in _ANCHOR_KW_N) or _BYLAW_REF_RX.search(c):
         return 1                                       # 별표/별지/부칙·'(제N조 관련)' = 최상위 섹션
     m = _DECIMAL_RX.match(c)
     if m:
