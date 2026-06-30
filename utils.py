@@ -171,6 +171,63 @@ def _reposition_figures_by_anchor(elements, anchors):
     return out
 
 
+def _correct_figure_captions(elements, anchors):
+    """figure 캡션 교정: 직후/페이지내 텍스트 ↔ IR.next 로 앵커 매칭 후, IR.prev 가
+    제목형·현재페이지부재·현재캡션과 상이일 때 IR.prev 로 교정. anchors:[{'prev','next'}]."""
+    if not anchors:
+        return elements
+    def _nm(s):
+        return re.sub(r"[^0-9A-Za-z가-힣]", "", (s or "")).lower()
+    def _title_like(s):
+        s = (s or "").strip()
+        if not s or len(s) > 30 or s[0] in "□◦○●*-–·•":
+            return False
+        if re.match(r"^[①-⑳]", s) or s.endswith((".", "다", "음", "함", "임", "됨")):
+            return False
+        return True
+    def _plen(a, b):
+        m = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            m += 1
+        return m
+    # 페이지에 이미 존재하는 텍스트(본문 content + 모든 figure caption).
+    present = [p for e in elements for p in (_nm(e.get("content")), _nm(e.get("caption"))) if p]
+    txt = lambda x: str(x.get("type", "")).startswith(("text", "heading")) and (x.get("content") or "").strip()
+    for k, e in enumerate(elements):
+        if e.get("type") != "figure":
+            continue
+        foll = next((elements[t].get("content") for t in range(k + 1, len(elements)) if txt(elements[t])), "")
+        fn = _nm(foll)
+        match = None
+        for a in anchors:
+            an = _nm(a.get("next"))
+            if len(an) >= 6 and fn and _plen(fn, an) >= 6:
+                match = a; break
+        if match is None:                       # 직후 불일치(위치까지 어긋난 그림) → 페이지 내 탐색
+            for a in anchors:
+                an = _nm(a.get("next"))
+                if len(an) >= 6 and any(_plen(_nm(x.get("content")), an) >= 6 for x in elements if x is not e and txt(x)):
+                    match = a; break
+        if match is None:
+            continue
+        prev = (match.get("prev") or "").strip()
+        if not _title_like(prev):
+            continue
+        np = _nm(prev)
+        if any(np in p or p in np for p in present):
+            continue                            # 진짜 제목이 이미 페이지에 있음 → 분리 아님
+        cap = (e.get("caption") or "").strip()
+        if cap and (_nm(cap) in np or np in _nm(cap)):
+            continue                            # 이미 일치
+        desc = e.get("description") or ""
+        if cap and desc.startswith(cap):        # 설명 첫 구절이 옛 캡션을 반복하면 함께 교정
+            e["description"] = prev + desc[len(cap):]
+        e["caption"] = prev
+    return elements
+
+
 def _vlm_finish_reason(response):
     """choices[0].finish_reason 안전 추출(백엔드마다 없을 수 있음)."""
     try:
@@ -2218,14 +2275,16 @@ class DocumentProcessor:
                                     e["description"] = "⚠ 외국어 설명 — " + desc
                     except Exception as fe:
                         logger.warning(f"figure description 폴백 실패({stem}): {fe}")
-                    # figure 순서 교정(IR 앵커 기반 재배치).
+                    # figure 캡션 교정(경계 분리) + 순서 교정(IR 앵커 기반).
                     try:
                         _fa = os.path.join(doc_output_dir, "_figure_anchors.json")
                         if os.path.exists(_fa) and any(e.get("type") == "figure" for e in deduped):
                             with open(_fa, encoding="utf-8") as _af:
-                                deduped = _reposition_figures_by_anchor(deduped, json.load(_af))
+                                _anchors = json.load(_af)
+                            deduped = _correct_figure_captions(deduped, _anchors)
+                            deduped = _reposition_figures_by_anchor(deduped, _anchors)
                     except Exception as re_e:
-                        logger.warning(f"figure 재배치 실패({stem}): {re_e}")
+                        logger.warning(f"figure 교정 실패({stem}): {re_e}")
                     # PII 마스킹(사용자 지정 타입만; 기본 OFF)
                     if PII_MASK_TYPES:
                         for e in deduped:
