@@ -499,11 +499,10 @@ def _load_toc(doc_dir: str) -> list:
 
 
 def chunk_by_page(doc_dir: str) -> list:
-    # 1페이지=1청크. heading carry-forward 로 섹션 맥락을 주되, '엉뚱한 헤딩 오부착'을 막기 위해 조건부로만 상속:
+    # 1페이지=1청크. heading carry-forward 로 섹션 맥락 부여:
     #  - 자체 헤딩이 있는 페이지 → 그 헤딩 사용(확정).
-    #  - 헤딩 없는 페이지 → 직전 페이지에서 '같은 내용 흐름이 이어질 때'(표→표·본문→본문 등 페이지 분할
-    #    연속)만 직전 섹션을 상속하고 _heading_inherited=True 로 표시. 흐름이 끊긴 헤딩 없는 표(고아·VLM
-    #    헤딩 누락 등)는 직전 섹션을 붙이면 틀릴 수 있으므로 heading_path 를 비운다(추정 헤딩 오부착 방지).
+    #  - 헤딩 없는 페이지 → 마지막 known-good 섹션을 상속하고 _heading_inherited=True 로 표시.
+    #    빈 heading_path 는 carry-forward 하지 않아 고아 페이지가 이후를 연쇄로 비우지 않게 한다.
     elements = _flat_normalized(doc_dir)
     heading_stack: list[tuple[int, str]] = []
 
@@ -527,8 +526,7 @@ def chunk_by_page(doc_dir: str) -> list:
         by_page[pnum]["elements"].append(elem)
 
     chunks = []
-    prev_last_type = None        # 직전(생성된) 페이지의 마지막 내용 요소 타입
-    prev_path: list = []         # 직전(생성된) 페이지의 '확정된' heading_path
+    last_good_path: list = []    # 마지막으로 확정/상속된 비어있지 않은 heading_path
     for pnum in page_order:
         els = [e for e in by_page[pnum]["elements"] if e.get("type") != "toc_entry"]
         if not els:
@@ -537,11 +535,11 @@ def chunk_by_page(doc_dir: str) -> list:
         inherited = False
         if own is not None:                                        # 자체 헤딩 보유 → 확정
             heading_path = own
-        elif prev_path and prev_last_type is not None and els[0].get("type") == prev_last_type:
-            heading_path = prev_path                               # 같은 흐름의 페이지 분할 연속 → 직전 페이지 섹션 상속
+        elif last_good_path:                                       # 헤딩 없는 연속 페이지 → 마지막 known-good 섹션 상속
+            heading_path = last_good_path
             inherited = True
         else:
-            heading_path = []                                      # 흐름 끊김(고아·헤딩 누락) → 오부착 대신 빈 path
+            heading_path = []                                      # 첫 헤딩 이전 → 맥락 없음
         chunk = {
             "chunk_id": f"page_{pnum:04d}",
             "chunk_type": "page",
@@ -552,8 +550,8 @@ def chunk_by_page(doc_dir: str) -> list:
         if inherited:
             chunk["_heading_inherited"] = True                     # 상속(추정) 표시 — RAG에서 가중조절용
         chunks.append(chunk)
-        prev_last_type = els[-1].get("type")
-        prev_path = heading_path
+        if heading_path:
+            last_good_path = heading_path                          # 고아 빈 path 로는 덮어쓰지 않음(cascade 방지)
     return _split_oversized(chunks)   # XLSX 등 한 페이지에 표 배치가 많은 경우 MAX 초과 분할
 
 
