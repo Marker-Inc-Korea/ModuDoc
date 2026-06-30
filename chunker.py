@@ -498,6 +498,17 @@ def _load_toc(doc_dir: str) -> list:
 
 
 
+def _starts_new_section(els: list) -> bool:
+    """페이지 본문 텍스트에 새 상위 섹션(편/장/로마/앵커=rank≤2) 마커가 있으면 True(상속 금지)."""
+    for e in els:
+        if e.get("type") not in ("text", "paragraph"):
+            continue
+        first = (e.get("content") or "").strip().split("\n", 1)[0][:80]
+        if first and _heading_rank(first, "text") <= 2:
+            return True
+    return False
+
+
 def chunk_by_page(doc_dir: str) -> list:
     # 1페이지=1청크. heading carry-forward 로 섹션 맥락 부여:
     #  - 자체 헤딩이 있는 페이지 → 그 헤딩 사용(확정).
@@ -533,13 +544,16 @@ def chunk_by_page(doc_dir: str) -> list:
             continue   # 빈 페이지(예: XLSX 시트 연속 페이지)는 청크 생성 안 함
         own = by_page[pnum]["own_path"]
         inherited = False
+        new_sec = _starts_new_section(els)                         # 새 상위 섹션 시작 여부
         if own is not None:                                        # 자체 헤딩 보유 → 확정
             heading_path = own
-        elif last_good_path:                                       # 헤딩 없는 연속 페이지 → 마지막 known-good 섹션 상속
+        elif last_good_path and not new_sec:                       # 헤딩 없는 연속 페이지 → 마지막 known-good 섹션 상속
             heading_path = last_good_path
             inherited = True
         else:
-            heading_path = []                                      # 첫 헤딩 이전 → 맥락 없음
+            heading_path = []                                      # 첫 헤딩 이전 · 미식별 새 섹션 → 맥락 없음
+            if new_sec:
+                last_good_path = []                                # 새 상위 섹션(헤딩 미검출) → 이전 섹션 누수 차단
         chunk = {
             "chunk_id": f"page_{pnum:04d}",
             "chunk_type": "page",
