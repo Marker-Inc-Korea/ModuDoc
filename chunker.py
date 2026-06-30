@@ -499,13 +499,24 @@ def _load_toc(doc_dir: str) -> list:
 
 
 def _starts_new_section(els: list) -> bool:
-    """페이지 본문 텍스트에 새 상위 섹션(편/장/로마/앵커=rank≤2) 마커가 있으면 True(상속 금지)."""
+    """페이지 본문 텍스트가 새 상위 섹션으로 시작하면 True(상속 금지).
+    편/장/로마는 정밀 패턴으로, 앵커어(별표/부칙/붙임…)는 뒤가 숫자·괄호·EOL일 때만 인정
+    ('참고로'·'별표에' 같은 줄글 오인 방지)."""
     for e in els:
         if e.get("type") not in ("text", "paragraph"):
             continue
-        first = (e.get("content") or "").strip().split("\n", 1)[0][:80]
-        if first and _heading_rank(first, "text") <= 2:
+        lead = (e.get("content") or "").strip().split("\n", 1)[0][:80].lstrip("[ \t")
+        if not lead:
+            continue
+        if _detect_pattern(lead) in ("pyeon", "jang", "roman"):
             return True
+        an = _anchor_norm(lead)
+        for k in _ANCHOR_KW_N:
+            if an.startswith(k):
+                rest = an[len(k):]
+                # 긴 특정 앵커(신구조문·구조문대비표)는 그대로, 짧은 공통어는 뒤가 숫자·괄호·EOL일 때만.
+                if len(k) >= 4 or rest == "" or rest[:1].isdigit() or rest[:1] in "([<":
+                    return True
     return False
 
 
