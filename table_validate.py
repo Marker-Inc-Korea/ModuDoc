@@ -306,10 +306,21 @@ def _rowspan_groups(nb):
         groups.append(nb[i:end]); i = end
     return groups
 
-def _repartition_rows(native_html, page_keysets):
-    """native 행 그룹을 페이지 키집합에 1회씩 배정 → 페이지별 표 HTML(미배정 페이지는 None)."""
+def _gcells(grp):
+    s = set()
+    for tr in grp:
+        for td in tr.find_all(["td", "th"]):
+            t = _ncell(td.get_text())
+            if t:
+                s.add(t)
+    return s
+
+def _repartition_rows(native_html, page_keysets, other_cells):
+    """native 행 그룹을 run 페이지에 1회씩 배정(미배정 페이지는 None).
+    매칭→해당 페이지; 미매칭→내용 다수가 run 밖 페이지(other_cells)에 있으면 그 페이지 소관으로 버리고,
+    아니면 인접 페이지에 귀속(진짜 seam 복구). 타 run·타 페이지 행이 끌려오는 것을 막는다."""
     nh, nb = _split_header_body(native_html)
-    assign, last = {}, 0
+    assign, last, leading = {}, None, []
     for grp in _rowspan_groups(nb):
         pg = None
         for tr in grp:
@@ -321,10 +332,20 @@ def _repartition_rows(native_html, page_keysets):
                     pg = pi; break
             if pg is not None:
                 break
-        if pg is None:
-            pg = last                          # 미매칭 → 인접 페이지(contiguity)
-        last = pg
-        assign.setdefault(pg, []).extend(grp)
+        if pg is not None:
+            last = pg
+            assign.setdefault(pg, []).extend(grp)
+        else:
+            gc = _gcells(grp)
+            if gc and len(gc & other_cells) > len(gc) / 2:
+                continue                                  # 내용이 타 페이지에 존재 → 그 페이지 소관, drop
+            if last is None:
+                leading.extend(grp)                       # 첫 매칭 전 seam → 보류
+            else:
+                assign.setdefault(last, []).extend(grp)   # 중간·후행 seam → 인접 페이지
+    if leading and assign:
+        fp = min(assign)
+        assign[fp] = leading + assign[fp]                 # 선행 seam → 첫 매칭 페이지 앞
     return [("<table>" + "".join(str(t) for t in nh) + "".join(str(t) for t in assign[pi]) + "</table>")
             if assign.get(pi) else None for pi in range(len(page_keysets))]
 
@@ -362,7 +383,7 @@ def repartition_native_tables(doc_output_dir):
     except Exception:
         return
     nsets = [_cell_set(n.get("html", "")) for n in natives]
-    pages, by_native = {}, defaultdict(list)
+    pages, by_native, allcells = {}, defaultdict(list), {}
     for j in sorted(glob.glob(os.path.join(glob.escape(doc_output_dir), "page_*_structured.json"))):
         pg = os.path.basename(j).replace("_structured.json", "")
         try:
@@ -370,11 +391,13 @@ def repartition_native_tables(doc_output_dir):
         except Exception:
             continue
         pages[pg] = (j, data)
+        pc = set()
         for k, e in enumerate(data.get("elements", [])):
-            if e.get("type") != "table" or not e.get("_native"):
+            if e.get("type") != "table":
                 continue
             vs = _cell_set(e.get("content", ""))
-            if not vs:
+            pc |= vs
+            if not e.get("_native") or not vs:
                 continue
             bi, bsc = None, 0.0
             for ni, ns in enumerate(nsets):
@@ -385,13 +408,17 @@ def repartition_native_tables(doc_output_dir):
                     bi, bsc = ni, sc
             if bi is not None and bsc >= 0.6:
                 by_native[bi].append((pg, k, _table_keyset(e.get("content", ""))))
+        allcells[pg] = pc
     changed = set()
     for bi, items in by_native.items():
         if len(items) < 2:
             continue
         idx_of = {pg: k for pg, k, _ in items}
         for run in _safe_runs([(pg, ks) for pg, _, ks in items]):
-            parts = _repartition_rows(natives[bi].get("html", ""), [ks for _, ks in run])
+            nums = sorted(int(re.search(r"(\d+)", pg).group(1)) for pg, _ in run)
+            adj = (f"page_{nums[0] - 1:04d}", f"page_{nums[-1] + 1:04d}")   # run 직전·직후(분할 spill 소관)
+            other = allcells.get(adj[0], set()) | allcells.get(adj[1], set())
+            parts = _repartition_rows(natives[bi].get("html", ""), [ks for _, ks in run], other)
             for (pg, _ks), html in zip(run, parts):
                 if html is None:
                     continue                         # 행 미배정 → 원본 유지(빈 표 방지)
