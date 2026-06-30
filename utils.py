@@ -2559,6 +2559,14 @@ class DocumentProcessor:
             except Exception as e:
                 logger.warning(f"시각자료 salvage 실패: {e}")
 
+        # 페이지 분할된 네이티브 표의 행을 페이지에 1회씩 재분배(seam 손실·중복 방지).
+        if output_format.lower() in ("json", "markdown"):
+            try:
+                import table_validate
+                table_validate.repartition_native_tables(doc_output_dir)
+            except Exception as e:
+                logger.warning(f"네이티브 표 재분배 실패: {e}")
+
         if chunk_strategies and output_format.lower() in ("json", "markdown"):
             try:
                 from chunker import chunk_document

@@ -286,3 +286,121 @@ def native_substitute(vlm_html, native_prepared, min_score=0.6):
     if best["_n"] > len(vset) * 1.5:          # 분할표 → 슬라이스
         return _slice_native(best["html"], vlm_html)
     return best["html"]
+
+
+def _table_keyset(html):
+    _h, vb = _split_header_body(html)
+    return {_row_key(tr) for tr in vb if _row_key(tr)}
+
+def _rowspan_groups(nb):
+    """native 본문행을 rowspan 그룹(원자단위)으로 묶음."""
+    groups, i = [], 0
+    while i < len(nb):
+        span = max((_rspan(c) for c in nb[i].find_all(["td", "th"], recursive=False)), default=1)
+        end = i + 1
+        while end < min(i + span, len(nb)):
+            c0 = nb[end].find_all(["td", "th"], recursive=False)
+            if c0 and _rspan(c0[0]) > 1:
+                break
+            end += 1
+        groups.append(nb[i:end]); i = end
+    return groups
+
+def _repartition_rows(native_html, page_keysets):
+    """native 행 그룹을 페이지 키집합에 1회씩 배정 → 페이지별 표 HTML(미배정 페이지는 None)."""
+    nh, nb = _split_header_body(native_html)
+    assign, last = {}, 0
+    for grp in _rowspan_groups(nb):
+        pg = None
+        for tr in grp:
+            k = _row_key(tr)
+            if not k:
+                continue
+            for pi, ks in enumerate(page_keysets):
+                if k in ks:
+                    pg = pi; break
+            if pg is not None:
+                break
+        if pg is None:
+            pg = last                          # 미매칭 → 인접 페이지(contiguity)
+        last = pg
+        assign.setdefault(pg, []).extend(grp)
+    return [("<table>" + "".join(str(t) for t in nh) + "".join(str(t) for t in assign[pi]) + "</table>")
+            if assign.get(pi) else None for pi in range(len(page_keysets))]
+
+def _safe_runs(items):
+    """items=[(pg, keyset), ...]. 연속 페이지 + 인접쌍 키겹침<0.3 인 run(길이>=2)만 반환."""
+    def pnum(p):
+        m = re.search(r"(\d+)", p)
+        return int(m.group(1)) if m else 0
+    items = sorted(items, key=lambda x: pnum(x[0]))
+    runs, cur = [], [items[0]]
+    for prev, nxt in zip(items, items[1:]):
+        consec = pnum(nxt[0]) - pnum(prev[0]) == 1
+        a, b = prev[1], nxt[1]
+        ov = len(a & b) / max(1, min(len(a), len(b))) if a and b else 0
+        if consec and ov < 0.3:
+            cur.append(nxt)
+        else:
+            if len(cur) >= 2:
+                runs.append(cur)
+            cur = [nxt]
+    if len(cur) >= 2:
+        runs.append(cur)
+    return runs
+
+def repartition_native_tables(doc_output_dir):
+    """페이지로 분할된 동일 네이티브 표의 행을 연속 페이지에 1회씩 재분배(seam 손실·중복 방지).
+    연속+키 disjoint 인 run 만 처리하고 반복·비연속 표는 그대로 둔다."""
+    import os, json, glob
+    from collections import defaultdict
+    npath = os.path.join(doc_output_dir, "_native_tables.json")
+    if not os.path.exists(npath):
+        return
+    try:
+        natives = json.load(open(npath, encoding="utf-8"))
+    except Exception:
+        return
+    nsets = [_cell_set(n.get("html", "")) for n in natives]
+    pages, by_native = {}, defaultdict(list)
+    for j in sorted(glob.glob(os.path.join(glob.escape(doc_output_dir), "page_*_structured.json"))):
+        pg = os.path.basename(j).replace("_structured.json", "")
+        try:
+            data = json.load(open(j, encoding="utf-8"))
+        except Exception:
+            continue
+        pages[pg] = (j, data)
+        for k, e in enumerate(data.get("elements", [])):
+            if e.get("type") != "table" or not e.get("_native"):
+                continue
+            vs = _cell_set(e.get("content", ""))
+            if not vs:
+                continue
+            bi, bsc = None, 0.0
+            for ni, ns in enumerate(nsets):
+                if not ns:
+                    continue
+                sc = len(vs & ns) / len(vs)
+                if sc > bsc:
+                    bi, bsc = ni, sc
+            if bi is not None and bsc >= 0.6:
+                by_native[bi].append((pg, k, _table_keyset(e.get("content", ""))))
+    changed = set()
+    for bi, items in by_native.items():
+        if len(items) < 2:
+            continue
+        idx_of = {pg: k for pg, k, _ in items}
+        for run in _safe_runs([(pg, ks) for pg, _, ks in items]):
+            parts = _repartition_rows(natives[bi].get("html", ""), [ks for _, ks in run])
+            for (pg, _ks), html in zip(run, parts):
+                if html is None:
+                    continue                         # 행 미배정 → 원본 유지(빈 표 방지)
+                pages[pg][1]["elements"][idx_of[pg]]["content"] = html
+                changed.add(pg)
+    for pg in changed:
+        j, data = pages[pg]
+        try:
+            with open(j, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
