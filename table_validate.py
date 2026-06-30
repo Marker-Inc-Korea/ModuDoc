@@ -233,14 +233,27 @@ def _row_key(tr):
     c = tr.find(["td", "th"])
     return _ncell(c.get_text()) if c else ""
 
+def _rspan(cell):
+    try:
+        return max(1, int(cell.get("rowspan") or 1))
+    except (ValueError, TypeError):
+        return 1
+
 def _slice_native(native_html, vlm_html):
-    """VLM 조각 본문 첫 셀 키에 해당하는 네이티브 본문행 + 네이티브 헤더."""
+    """VLM 조각 본문 첫 셀 키에 해당하는 네이티브 본문행(+rowspan 연속행) + 네이티브 헤더."""
     nh, nb = _split_header_body(native_html)
     _vh, vb = _split_header_body(vlm_html)
     vkeys = {_row_key(tr) for tr in vb if _row_key(tr)}
     if not vkeys:
         return None
-    keep = [tr for tr in nb if _row_key(tr) in vkeys]
+    keep_idx = set()
+    for i, tr in enumerate(nb):
+        if _row_key(tr) in vkeys:
+            keep_idx.add(i)
+            span = max((_rspan(c) for c in tr.find_all(["td", "th"], recursive=False)), default=1)
+            for j in range(i + 1, min(i + span, len(nb))):   # rowspan 그룹 연속행 동반(dangling rowspan 방지)
+                keep_idx.add(j)
+    keep = [tr for i, tr in enumerate(nb) if i in keep_idx]
     if len(keep) < max(2, len(vb) // 2):     # 키 매칭 빈약 시 포기
         return None
     return "<table>" + "".join(str(tr) for tr in nh) + "".join(str(tr) for tr in keep) + "</table>"
