@@ -195,8 +195,10 @@ def validate_and_repair_table(html, caption=None):
 # ───────────────────────── HWP 네이티브 표 치환 ─────────────────────────
 # 내용이 일치하는 표를 HWP/HWPX 네이티브 표(rhwp IR TableBlock.html)로 치환.
 # 페이지 분할표는 본문행을 키로 슬라이스해 네이티브 헤더와 합침.
+_TILDE = str.maketrans({"～": "~", "∼": "~", "〜": "~", "˜": "~"})
 def _ncell(s):
-    return re.sub(r"\s+", "", s or "")
+    # 셀 정규화: 공백 제거·물결 통일·소문자.
+    return re.sub(r"\s+", "", (s or "").translate(_TILDE)).lower()
 
 def _cell_set(html):
     try:
