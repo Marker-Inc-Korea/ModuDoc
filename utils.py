@@ -17,15 +17,15 @@ import xml.etree.ElementTree as ET
 
 _VLM_SEMAPHORE = threading.Semaphore(int(os.environ.get("VLM_CONCURRENCY", "5")))
 _SOFFICE_LOCK = threading.Lock()
-RENDER_DPI = int(os.environ.get("RENDER_DPI", "200"))
+RENDER_DPI = int(os.environ.get("RENDER_DPI", "300"))
 
 # VLM 호출 상한 노브(기본값은 기존 동작과 동일 — 정상 페이지엔 영향 없음)
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "300"))                   # 구조추출 VLM 호출 타임아웃(초)
 VLM_MAX_ATTEMPTS = max(1, int(os.environ.get("VLM_MAX_ATTEMPTS", "3")))   # 한 페이지 추출의 최대 시도 수
 DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
 VLM_PAGE_CONCURRENCY = max(1, int(os.environ.get("VLM_PAGE_CONCURRENCY", "16")))  # 페이지 동시 추출 수(vLLM 배칭으로 가속)
-# VLM 입력 이미지 폭 상한(px). 기본 1568(28의 배수).
-VLM_IMG_MAXW = max(512, int(os.environ.get("VLM_IMG_MAXW", "1568")))
+# VLM 입력 이미지 폭 상한(px). 기본 2464(28의 배수) — 300DPI 렌더와 짝, 나란히 표 분리에 필요.
+VLM_IMG_MAXW = max(512, int(os.environ.get("VLM_IMG_MAXW", "2464")))
 # 재시도 시 낮출 폴백 해상도.
 VLM_IMG_MAXW_FALLBACK = max(512, int(os.environ.get("VLM_IMG_MAXW_FALLBACK", "1024")))
 # repetition_penalty(기본/강).
