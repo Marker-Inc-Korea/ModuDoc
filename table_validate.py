@@ -2,6 +2,7 @@
 수리 불가 시 needs_retry=True. 의존: bs4 + statistics."""
 import re
 import statistics
+from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 
 _CONT = "\x00C\x00"   # rowspan/colspan 연속칸 센티넬
@@ -261,16 +262,99 @@ def _slice_native(native_html, vlm_html):
         return None
     return "<table>" + "".join(str(tr) for tr in nh) + "".join(str(tr) for tr in keep) + "</table>"
 
+def _cell_own_text(cell):
+    """셀의 텍스트(중첩 <table> 내용 제외) 정규화."""
+    frag = BeautifulSoup(str(cell), "html.parser")
+    for t in frag.find_all("table"):
+        t.decompose()
+    return _ncell(frag.get_text(" ", strip=True))
+
+def _outer_own_cellset(table):
+    """outer table 직속 셀들의 own-text 집합(중첩표 내용 제외)."""
+    s = set()
+    for c in table.find_all(["td", "th"]):
+        if c.find_parent("table") is table:
+            t = _cell_own_text(c)
+            if t:
+                s.add(t)
+    return s
+
+def _nested_in_outer(table):
+    """outer table 셀 안의 직속 중첩표 [(셀, 중첩table)]."""
+    out = []
+    for c in table.find_all(["td", "th"]):
+        if c.find_parent("table") is not table:
+            continue
+        for nt in c.find_all("table"):
+            if nt.find_parent("table") is table:
+                out.append((c, nt))
+    return out
+
+def _cap_of(tab):
+    c = tab.find(["th", "td"])
+    return _ncell(c.get_text(" ", strip=True)) if c else ""
+
+def _seq_ratio(a, b):
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+def _graft_nested_native(vlm_html, native_prepared):
+    """중첩표 VLM 표를 native 골격(열수가 더 많은 정답 구조)에 접합해 반환(불가 시 None).
+    중첩표 캡션으로 native 표·삽입 셀을 특정, 중첩표는 소실 없이 그대로 이식."""
+    try:
+        vtable = BeautifulSoup(vlm_html or "", "html.parser").find("table")
+    except Exception:
+        return None
+    if vtable is None:
+        return None
+    nested = _nested_in_outer(vtable)
+    if not nested:
+        return None
+    _g, _w, _R, vcols = _build_grid(_rows_of(vtable))
+    vset = _outer_own_cellset(vtable)
+    cap0 = _cap_of(nested[0][1])
+    if len(cap0) < 4:
+        return None
+    base = None
+    for nt in native_prepared:
+        if cap0 in _ncell(BeautifulSoup(nt["html"], "html.parser").get_text(" ", strip=True)):
+            base = nt
+            break
+    if base is None or len(vset & base["_set"]) < 2:
+        return None
+    try:
+        ntable = BeautifulSoup(base["html"], "html.parser").find("table")
+        _ng, _nw, _nR, ncols = _build_grid(_rows_of(ntable))
+    except Exception:
+        return None
+    if ncols <= vcols:                      # native가 열을 더 가질 때만(붕괴된 열 복원)
+        return None
+    ncells = [c for c in ntable.find_all(["td", "th"]) if c.find_parent("table") is ntable]
+    placed = 0
+    for vcell, ntab in nested:
+        cap = _cap_of(ntab)
+        target = next((c for c in ncells if cap and cap in _cell_own_text(c)), None)
+        if target is None:
+            anchor = _cell_own_text(vcell)
+            cand = max(ncells, key=lambda c: _seq_ratio(anchor, _cell_own_text(c)), default=None)
+            if cand is not None and _seq_ratio(anchor, _cell_own_text(cand)) >= 0.6:
+                target = cand
+        if target is not None:
+            target.append(BeautifulSoup(str(ntab), "html.parser"))
+            placed += 1
+    if placed != len(nested):               # 하나라도 못 넣으면 포기(중첩표 소실 방지)
+        return None
+    return str(ntable)
+
 def native_substitute(vlm_html, native_prepared, min_score=0.6):
     """내용 일치하는 네이티브 표 HTML 반환(없으면 None).
     셀집합 포함도(교집합/VLM셀수) 임계 이상, 네이티브가 훨씬 크면 슬라이스."""
     if not native_prepared:
         return None
-    # 중첩표(표 안의 표)는 치환 제외(원본 유지).
+    # 중첩표(표 안의 표): native 골격에 중첩표 접합 시도(불가 시 원본 유지).
     try:
         _t = BeautifulSoup(vlm_html or "", "html.parser").find("table")
         if _t is not None and _t.find("table") is not None:
-            return None
+            return _graft_nested_native(vlm_html, native_prepared)
     except Exception:
         pass
     vset = _cell_set(vlm_html)
