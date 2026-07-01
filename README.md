@@ -1,6 +1,6 @@
 # 👁️ ModuDoc: VLM-Powered Document Parser for Advanced RAG
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VLM: Qwen-VL](https://img.shields.io/badge/VLM-Qwen--VL-purple.svg)](https://huggingface.co/Qwen)
 
@@ -107,6 +107,8 @@ cd ModuDoc
 pip install -r requirements.txt
 ```
 
+> **시스템 의존성**: PDF·HWP·HWPX 는 별도 설치 없이 동작합니다. **DOCX/PPTX/XLSX**(및 DOC/PPT/ODT/RTF)는 내부적으로 LibreOffice(`soffice`)로 PDF 변환 후 처리하므로 **LibreOffice 설치가 필요**합니다. (Python **3.10+**)
+
 **HWP/HWPX 렌더링**: 리눅스에서는 `rhwp`(Skia 기반 네이티브 렌더러)를 기본으로 사용하여 별도 도구 없이 HWP/HWPX를 페이지 이미지로 렌더합니다. 표 겹침·임베디드 이미지 잘림이 없고 한글 원본에 가까운 페이지네이션을 제공합니다. 정확한 글자 조판을 위해 **한글 폰트(함초롬 HCR / Noto CJK KR / 나눔)** 설치를 권장합니다.
 - 리눅스(x86_64)에서는 OLE 객체까지 완전 렌더하는 **패치 빌드 rhwp**(`vendor/`)를 사용합니다 — ChemDraw 등 **화학구조식(WMF)**, 보도자료 **임베디드 비트맵(StaticDib)**, **초대형 규정문서**(식약처 식품첨가물 기준규격·대한민국약전 등)까지 렌더. 패치 내용·재빌드 방법은 [`patches/`](patches/) 참조.
 - `rhwp` 미설치 또는 렌더 실패(암호화·손상 파일 등) 시 **LibreOffice + H2Orestart 로 자동 폴백**합니다(설치되어 있으면).
@@ -125,6 +127,8 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 # (인증이 필요한 엔드포인트라면) export VLM_API_KEY="your_key"
 ```
 > 💡 `/api/process`의 `model` 파라미터(기본 `Qwen/Qwen3-VL-30B-A3B-Instruct`)는 **서빙 중인 모델 이름과 일치**해야 합니다.
+>
+> 💡 **모델 선택**: 기본 `Qwen3-VL-30B-A3B-Instruct` 는 GPU 메모리 ~60GB(FP16)/~30GB(FP8) 필요. GPU가 작다면 더 작은 Qwen-VL(예: 7B/8B) 또는 양자화 모델을 서빙하고 `model` 을 그 이름으로 맞추세요 — **OpenAI 호환 엔드포인트면 어떤 VLM 이든 동작**합니다(품질은 모델 성능에 비례).
 
 <details><summary>HWP 렌더(rhwp) 관련 선택 환경변수</summary>
 
@@ -132,8 +136,12 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 |---|---|---|
 | `USE_RHWP` | `1` | HWP/HWPX 를 rhwp 로 렌더. `0` 이면 LibreOffice 만 사용 |
 | `RHWP_FONTCONFIG` | (자동) | 한글 폰트만 담은 최소 `fonts.conf` 경로. 미지정 시 자동 생성(시스템 폰트가 수천 개면 렌더가 느려지는 것을 방지) |
-| `RENDER_DPI` | `200` | 렌더 해상도 |
+| `RENDER_DPI` | `300` | 페이지 렌더 해상도(**PDF 포함 전 포맷**). 높을수록 나란히 붙은 표·조밀한 표를 정확히 분리하나 VLM 토큰/시간이 늘어남 |
+| `VLM_IMG_MAXW` | `2464` | VLM 입력 이미지 최대 폭(px, 28의 배수). `RENDER_DPI` 와 짝 — 이 값이 렌더 폭보다 작으면 다운스케일돼 표 분리 효과가 줄어듦 |
+| `VLM_IMG_MAXW_FALLBACK` | `1024` | 반복 폭주/타임아웃 재시도 시 낮추는 폴백 폭 |
 
+> 💡 **표 구조 정확도 ↔ 비용**: 기본값 `300`DPI/`2464`px 는 서로 붙어 있는 표(예: 좌측 평가표 + 우측 등급표)를 **각각 별도 `<table>` 로 분리**합니다. 속도·토큰을 아끼려면 `RENDER_DPI=200 VLM_IMG_MAXW=1568` 로 낮출 수 있습니다(페이지 수·내용은 동일하나 나란히 표의 분리 정확도는 하락).
+>
 > rhwp 코어는 레이아웃 진단(`LAYOUT_OVERFLOW` 등)을 **stderr** 로 출력합니다(기능엔 무해). 로그가 거슬리면 프로세스 stderr 를 리다이렉트하세요.
 
 </details>
@@ -194,7 +202,7 @@ curl -X POST http://localhost:5000/api/process \
 | `format` | `json` / `markdown` / `xml` | `json` | 출력 형식 |
 | `model` | 모델명 | `Qwen/Qwen3-VL-30B-A3B-Instruct` | **서빙 중인 모델명과 일치해야** |
 | `chunk` | `page` / `toc` / `tree` | (없음) | 청킹 전략(중복 선택). [위 가이드](#어떤-청킹-전략을-쓸까) 참고 |
-| `concurrency` | `1`~`16` | `3` | 페이지 동시 처리 수 |
+| `concurrency` | `1`~`16` | `3` | **문서(파일) 동시 처리 수**(여러 파일 업로드 시). 페이지 단위 동시성은 `VLM_PAGE_CONCURRENCY`(기본 `16`) |
 
 **2) 진행 조회 — `GET /api/progress/<task_id>`** (`is_done` 가 `true` 될 때까지 폴링)
 ```bash
@@ -247,6 +255,8 @@ ModuDoc/
 ├── hwp_extract.py    # 네이티브 HWP/HWPX 텍스트·표 추출기 (외부 의존성 없음)
 ├── hwpx_paginate.py  # HWPX 페이지 경계 추정 유틸
 ├── hwp_figures.py    # HWP/HWPX 임베디드 이미지(시각자료) 위치-인식 salvage + VLM 설명
+├── table_validate.py # 표 HTML 검증·수리 + HWP/HWPX 네이티브 표 치환·페이지 재분배
+├── hwp_memo.py       # HWP/HWPX 편집기 메모(주석) 추출
 ├── chunker.py        # RAG 청킹·후처리 (page / toc / tree, 계층 경로 heading_path)
 ├── hwp_to_pdf.py     # Windows COM 기반 HWP/HWPX 무손실 변환기
 └── templates/        # 웹 UI 템플릿
