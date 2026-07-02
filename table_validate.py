@@ -311,15 +311,15 @@ def _graft_nested_native(vlm_html, native_prepared):
         return None
     _g, _w, _R, vcols = _build_grid(_rows_of(vtable))
     vset = _outer_own_cellset(vtable)
-    cap0 = _cap_of(nested[0][1])
-    if len(cap0) < 4:
+    if len(vset) < 2:
         return None
-    base = None
+    # base(native) 선택: outer 셀집합 포함도 최대(중첩표 첫셀 캡션보다 안정적).
+    base, best = None, 0.0
     for nt in native_prepared:
-        if cap0 in _ncell(BeautifulSoup(nt["html"], "html.parser").get_text(" ", strip=True)):
-            base = nt
-            break
-    if base is None or len(vset & base["_set"]) < 2:
+        ov = len(vset & nt["_set"]) / len(vset)
+        if ov > best:
+            base, best = nt, ov
+    if base is None or best < 0.5:
         return None
     try:
         ntable = BeautifulSoup(base["html"], "html.parser").find("table")
@@ -331,18 +331,27 @@ def _graft_nested_native(vlm_html, native_prepared):
     ncells = [c for c in ntable.find_all(["td", "th"]) if c.find_parent("table") is ntable]
     placed = 0
     for vcell, ntab in nested:
-        cap = _cap_of(ntab)
-        target = next((c for c in ncells if cap and cap in _cell_own_text(c)), None)
-        if target is None:
-            anchor = _cell_own_text(vcell)
-            cand = max(ncells, key=lambda c: _seq_ratio(anchor, _cell_own_text(c)), default=None)
-            if cand is not None and _seq_ratio(anchor, _cell_own_text(cand)) >= 0.6:
-                target = cand
+        # 삽입 대상 native 셀: 중첩표를 품은 VLM 셀의 텍스트(중첩표 제외)와 최대 유사 셀.
+        anchor = _cell_own_text(vcell)
+        target = max(ncells, key=lambda c: _seq_ratio(anchor, _cell_own_text(c)), default=None)
+        if target is None or _seq_ratio(anchor, _cell_own_text(target)) < 0.5:
+            cap = _cap_of(ntab)                 # 보조: 중첩표 첫 셀 캡션 부분매칭
+            target = next((c for c in ncells if cap and len(cap) >= 4 and cap in _cell_own_text(c)), None)
         if target is not None:
             target.append(BeautifulSoup(str(ntab), "html.parser"))
             placed += 1
     if placed != len(nested):               # 하나라도 못 넣으면 포기(중첩표 소실 방지)
         return None
+    # 무손실 게이트: graft 로 사라지는 VLM outer 셀(=native 골격에 없는 셀)의 실질 내용이
+    # native 전체 텍스트에 실재해야 교체(재구조화는 통과, native 축약본 교체는 거부).
+    gtext = _ncell(ntable.get_text(" ", strip=True))
+    gset = {_ncell(c.get_text(" ", strip=True)) for c in ntable.find_all(["td", "th"]) if c.get_text(strip=True)}
+    for c in vset:
+        if len(c) < 8 or c in gset:
+            continue
+        toks = re.findall(r"[가-힣A-Za-z0-9]{4,}", c)     # 셀의 실체 토큰(불릿/기호 배제)
+        if toks and sum(t in gtext for t in toks) < len(toks) * 0.7:
+            return None                                    # 실체 다수가 native 부재 → 손실
     return str(ntable)
 
 def native_substitute(vlm_html, native_prepared, min_score=0.6):
