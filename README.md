@@ -139,6 +139,7 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `RENDER_DPI` | `300` | 페이지 렌더 해상도(**PDF 포함 전 포맷**). 높을수록 나란히 붙은 표·조밀한 표를 정확히 분리하나 VLM 토큰/시간이 늘어남 |
 | `VLM_IMG_MAXW` | `2464` | VLM 입력 이미지 최대 폭(px, 28의 배수). `RENDER_DPI` 와 짝 — 이 값이 렌더 폭보다 작으면 다운스케일돼 표 분리 효과가 줄어듦 |
 | `VLM_IMG_MAXW_FALLBACK` | `1024` | 반복 폭주/타임아웃 재시도 시 낮추는 폴백 폭 |
+| `ZOOM_RASTER_TABLES` | `1` | HWP/HWPX 임베디드 raster 표를 확대 재추출해 오구조를 수리(`0` 으로 끄기). VLM 심판이 승인할 때만 교체 |
 
 > 💡 **표 구조 정확도 ↔ 비용**: 기본값 `300`DPI/`2464`px 는 서로 붙어 있는 표(예: 좌측 평가표 + 우측 등급표)를 **각각 별도 `<table>` 로 분리**합니다. 속도·토큰을 아끼려면 `RENDER_DPI=200 VLM_IMG_MAXW=1568` 로 낮출 수 있습니다(페이지 수·내용은 동일하나 나란히 표의 분리 정확도는 하락).
 >
@@ -256,6 +257,7 @@ ModuDoc/
 ├── hwpx_paginate.py  # HWPX 페이지 경계 추정 유틸
 ├── hwp_figures.py    # HWP/HWPX 임베디드 이미지(시각자료) 위치-인식 salvage + VLM 설명
 ├── table_validate.py # 표 HTML 검증·수리 + HWP/HWPX 네이티브 표 치환·페이지 재분배
+├── zoom_tables.py    # HWP/HWPX 임베디드 raster 표 확대 재추출(VLM 심판 승인 시 교체)
 ├── hwp_memo.py       # HWP/HWPX 편집기 메모(주석) 추출
 ├── chunker.py        # RAG 청킹·후처리 (page / toc / tree, 계층 경로 heading_path)
 ├── hwp_to_pdf.py     # Windows COM 기반 HWP/HWPX 무손실 변환기
