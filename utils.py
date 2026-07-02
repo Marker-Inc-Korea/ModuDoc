@@ -2569,6 +2569,16 @@ class DocumentProcessor:
             except Exception as e:
                 logger.warning(f"네이티브 표 재분배 실패: {e}")
 
+        # 임베디드 raster 표: 격리·확대 재추출로 오구조(열 붕괴·병합)를 수리(VLM 심판 승인 시만 교체).
+        if ext in ('.hwp', '.hwpx') and api_key and output_format.lower() in ("json", "markdown"):
+            try:
+                from zoom_tables import zoom_raster_tables
+                nz = zoom_raster_tables(doc_output_dir, file_path, api_key, model_name)
+                if nz:
+                    logger.info(f"raster 표 zoom-pass: {nz}건 교체")
+            except Exception as e:
+                logger.warning(f"raster 표 zoom-pass 실패: {e}")
+
         if chunk_strategies and output_format.lower() in ("json", "markdown"):
             try:
                 from chunker import chunk_document
