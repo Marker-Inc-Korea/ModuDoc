@@ -680,6 +680,44 @@ class HWPTextExtractor:
         return [cls.text_preprocessing(p) for p in pages if cls.text_preprocessing(p)]
 
 
+def _salvage_truncated_json(text: str):
+    """max_tokens 로 잘려 파싱 불가한 JSON 에서 elements 배열의 완결 객체만 복구.
+    닫히지 않은 마지막 객체는 버리고 그 앞까지의 요소로 유효 dict 를 재구성(불가 시 None)."""
+    m = re.search(r'"elements"\s*:\s*\[', text)
+    if not m:
+        return None
+    i = m.end()
+    depth, in_str, esc, start, objs = 0, False, False, None, []
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                frag = text[start:i + 1]
+                try:
+                    objs.append(json.loads(frag))
+                except Exception:
+                    pass
+                start = None
+        elif c == ']' and depth == 0:
+            break
+        i += 1
+    return {"elements": objs} if objs else None
+
+
 def _sanitize_json_strings(text: str) -> str:
     _CTRL_ESCAPES = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
     _VALID_ESCAPES = set('"\\\/bfnrtu')
@@ -948,6 +986,11 @@ Based on the raw text and the visual layout in the image (if provided), structur
                             if not last:
                                 time.sleep(5 * (attempt + 1))
                                 continue
+                            if best_result is None:          # 최종 실패 → 잘린 JSON 부분 복구 시도
+                                salv = _salvage_truncated_json(result)
+                                if salv and salv.get("elements"):
+                                    logger.warning(f"잘린 JSON 부분 복구: element {len(salv['elements'])}개 보존")
+                                    return json.dumps(salv, ensure_ascii=False), True
                             logger.error("JSON 유효성 검증 실패, 건너뜀")
                             return best_result, False
                     # coverage 검사(공백 제거 후 캡처/입력 비율, 임계 0.7). 미완(length)도 재시도.
