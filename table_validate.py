@@ -409,18 +409,23 @@ def _gcells(grp):
                 s.add(t)
     return s
 
-def _repartition_rows(native_html, page_keysets, other_cells):
+def _repartition_rows(native_html, page_keysets, other_cells, homed_keys=None):
     """native 행 그룹을 run 페이지에 1회씩 배정(미배정 페이지는 None).
-    매칭→해당 페이지; 미매칭→내용 다수가 run 밖 페이지(other_cells)에 있으면 그 페이지 소관으로 버리고,
-    아니면 인접 페이지에 귀속(진짜 seam 복구). 타 run·타 페이지 행이 끌려오는 것을 막는다."""
+    매칭→해당 페이지; 미매칭→(a) 행 키가 run 밖 다른 페이지에 실재하거나(homed_keys) 내용 다수가
+    인접 페이지(other_cells)에 있으면 그 페이지 소관으로 drop, (b) 어디에도 없는 진짜 seam만 인접
+    페이지에 귀속. 다중페이지 요약표의 far-page 행이 경계 페이지로 쏠리는 것을 막는다."""
+    homed_keys = homed_keys or set()
     nh, nb = _split_header_body(native_html)
     assign, last, leading = {}, None, []
     for grp in _rowspan_groups(nb):
         pg = None
+        grp_key = ""
         for tr in grp:
             k = _row_key(tr)
             if not k:
                 continue
+            if not grp_key:
+                grp_key = k
             for pi, ks in enumerate(page_keysets):
                 if k in ks:
                     pg = pi; break
@@ -430,9 +435,11 @@ def _repartition_rows(native_html, page_keysets, other_cells):
             last = pg
             assign.setdefault(pg, []).extend(grp)
         else:
+            if grp_key and grp_key in homed_keys:
+                continue                                  # 행 키가 run 밖 페이지에 실재 → 그 페이지 소관, drop
             gc = _gcells(grp)
             if gc and len(gc & other_cells) > len(gc) / 2:
-                continue                                  # 내용이 타 페이지에 존재 → 그 페이지 소관, drop
+                continue                                  # 내용이 인접 페이지에 존재 → 그 페이지 소관, drop
             if last is None:
                 leading.extend(grp)                       # 첫 매칭 전 seam → 보류
             else:
@@ -477,7 +484,7 @@ def repartition_native_tables(doc_output_dir):
     except Exception:
         return
     nsets = [_cell_set(n.get("html", "")) for n in natives]
-    pages, by_native, allcells = {}, defaultdict(list), {}
+    pages, by_native, allcells, page_rowkeys = {}, defaultdict(list), {}, {}
     for j in sorted(glob.glob(os.path.join(glob.escape(doc_output_dir), "page_*_structured.json"))):
         pg = os.path.basename(j).replace("_structured.json", "")
         try:
@@ -485,12 +492,13 @@ def repartition_native_tables(doc_output_dir):
         except Exception:
             continue
         pages[pg] = (j, data)
-        pc = set()
+        pc, pk = set(), set()
         for k, e in enumerate(data.get("elements", [])):
             if e.get("type") != "table":
                 continue
             vs = _cell_set(e.get("content", ""))
             pc |= vs
+            pk |= _table_keyset(e.get("content", ""))   # 이 페이지 표들의 행 키(순번 등)
             if not e.get("_native") or not vs:
                 continue
             bi, bsc = None, 0.0
@@ -503,6 +511,7 @@ def repartition_native_tables(doc_output_dir):
             if bi is not None and bsc >= 0.6:
                 by_native[bi].append((pg, k, _table_keyset(e.get("content", ""))))
         allcells[pg] = pc
+        page_rowkeys[pg] = pk
     changed = set()
     for bi, items in by_native.items():
         if len(items) < 2:
@@ -512,7 +521,12 @@ def repartition_native_tables(doc_output_dir):
             nums = sorted(int(re.search(r"(\d+)", pg).group(1)) for pg, _ in run)
             adj = (f"page_{nums[0] - 1:04d}", f"page_{nums[-1] + 1:04d}")   # run 직전·직후(분할 spill 소관)
             other = allcells.get(adj[0], set()) | allcells.get(adj[1], set())
-            parts = _repartition_rows(natives[bi].get("html", ""), [ks for _, ks in run], other)
+            run_pgs = {pg for pg, _ in run}
+            homed = set()                                 # run 밖 페이지가 소유한 행 키(그 페이지 소관 → drop)
+            for opg, oks in page_rowkeys.items():
+                if opg not in run_pgs:
+                    homed |= oks
+            parts = _repartition_rows(natives[bi].get("html", ""), [ks for _, ks in run], other, homed)
             for (pg, _ks), html in zip(run, parts):
                 if html is None:
                     continue                         # 행 미배정 → 원본 유지(빈 표 방지)
