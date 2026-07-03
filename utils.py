@@ -1475,14 +1475,29 @@ class DocumentProcessor:
             return 0
         scale = RENDER_DPI / 96.0
         out_page = 0
+        rendered_ok = 0            # 실제 렌더 성공한 본문 페이지 수(전부 실패 시 폴백 판단용)
+        failed_pages = []
         for i in range(n):
+            out_page += 1          # 실패해도 번호를 소비해 페이지 정합 유지(조용한 시프트 방지)
+            pnum = str(out_page).zfill(4)
             try:
                 png = doc.render_png(i, scale=scale)
             except Exception as e:
-                logger.warning(f"rhwp page {i} render 실패: {e}")
+                logger.warning(f"rhwp page {i} render 실패(placeholder 대체): {e}")
+                failed_pages.append(out_page)
+                try:                # 번호 정합용 placeholder(흰 페이지) + 실패 마커 텍스트
+                    from PIL import Image as _PILImg
+                    import io as _io2
+                    _buf = _io2.BytesIO()
+                    _PILImg.new("RGB", (int(8.27 * RENDER_DPI), int(11.69 * RENDER_DPI)), "white").save(_buf, format="PNG")
+                    with open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb") as f:
+                        f.write(_buf.getvalue())
+                except Exception:
+                    pass
+                with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as f:
+                    f.write("")
                 continue
-            out_page += 1
-            pnum = str(out_page).zfill(4)
+            rendered_ok += 1
             with open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb") as f:
                 f.write(png)
             try:
@@ -1494,6 +1509,18 @@ class DocumentProcessor:
                 txt = ""
             with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as f:
                 f.write(HWPTextExtractor.text_preprocessing(txt) if txt else "")
+        # 렌더 실패가 많으면(전부 or 30%↑) placeholder 대신 전체 폴백(LibreOffice)에 맡김.
+        if rendered_ok == 0 or len(failed_pages) > n * 0.3:
+            logger.warning(f"rhwp 렌더 실패 과다({len(failed_pages)}/{n}) — 폴백 사용")
+            for _pp in range(1, out_page + 1):
+                for _ext in (".png", ".txt"):
+                    _f = os.path.join(doc_output_dir, f"page_{str(_pp).zfill(4)}{_ext}")
+                    if os.path.exists(_f):
+                        try: os.remove(_f)
+                        except OSError: pass
+            return 0
+        if failed_pages:
+            logger.warning(f"rhwp 렌더 실패 페이지(placeholder 대체): {failed_pages}")
         # 메모(주석)는 렌더에 안 나오므로 파일에서 직접 추출해 본문 뒤 페이지로 편입(있을 때만).
         try:
             out_page += cls._emit_hwp_memo_page(input_path, doc, doc_output_dir, out_page + 1)
