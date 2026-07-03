@@ -3,6 +3,7 @@
 import re
 import statistics
 from difflib import SequenceMatcher
+from html import escape
 from bs4 import BeautifulSoup
 
 _CONT = "\x00C\x00"   # rowspan/colspan 연속칸 센티넬
@@ -70,7 +71,7 @@ def _grid_to_html(grid, lo, hi, caption=None):
             if v == _CONT:
                 out.append("<td></td>")
             else:
-                out.append(f"<td>{v}</td>")
+                out.append(f"<td>{escape(str(v))}</td>")
         out.append("</tr>")
     out.append("</table>")
     return "".join(out)
