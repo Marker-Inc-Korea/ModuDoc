@@ -113,9 +113,14 @@ def _is_clause_body(content: str) -> bool:
     return pat == "hang" or len((content or "").strip()) > CLAUSE_HEADING_MAX
 
 
+_PAGE_FOOTER_RX = re.compile(r"\s*-\s*[\d\s]{1,7}-\s*$")   # 말미 페이지번호 꼬리말('- 21 -', 자간 '- 2 1 -')
+
 def _clean_heading_title(content: str) -> str:
     """heading 의 짧은 제목만 추출(잘린 제목/본문혼입 방지). 제N조(제목) 또는 정의 'N."용어"'."""
     c = (content or "").strip()
+    c2 = _PAGE_FOOTER_RX.sub("", c).strip()               # 러닝헤더에 붙은 페이지번호 furniture 제거
+    if c2:
+        c = c2
     m = _DEF_TITLE_RX.match(c)
     if m and len(m.group(1)) < len(c):
         return m.group(1).strip()                  # 'N. "용어"' (정의 항목)
