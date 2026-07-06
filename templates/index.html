@@ -165,7 +165,7 @@
 
         // XML 태그가 깨지지 않게 화면용 문자로 치환하는 함수
         function escapeHtml(unsafe) {
-            return unsafe
+            return String(unsafe ?? '')
                  .replace(/&/g, "&amp;")
                  .replace(/</g, "&lt;")
                  .replace(/>/g, "&gt;")
@@ -174,7 +174,12 @@
         }
 
         fileInput.addEventListener('change', e => {
-            document.getElementById('fileList').innerHTML = Array.from(e.target.files).map(f => `📄 ${f.name}`).join('<br>');
+            const list = document.getElementById('fileList');
+            list.replaceChildren();
+            Array.from(e.target.files).forEach((f, idx) => {
+                if (idx) list.appendChild(document.createElement('br'));
+                list.appendChild(document.createTextNode(`📄 ${f.name}`));
+            });
         });
 
         // 미리보기 버튼 클릭 시 
@@ -190,18 +195,18 @@
                 const data = await res.json();
                 
                 if (data.error) {
-                    viewerContent.innerHTML = `<p class="text-red-400 text-center mt-10">${data.error}</p>`;
+                    viewerContent.innerHTML = `<p class="text-red-400 text-center mt-10">${escapeHtml(data.error)}</p>`;
                     return;
                 }
 
-                const currentFormat = outputFormatSelect.value; // xml or json
+                const currentFormat = ['json', 'xml', 'markdown'].includes(outputFormatSelect.value) ? outputFormatSelect.value : 'plaintext';
                 let html = '';
                 
                 // 받아온 여러 페이지의 코드를 순서대로 렌더링
                 for (const [filename, codeContent] of Object.entries(data)) {
                     html += `
                         <div class="mb-8">
-                            <h3 class="text-lg font-semibold text-blue-400 mb-2 border-b border-gray-700 pb-1">${filename}</h3>
+                            <h3 class="text-lg font-semibold text-blue-400 mb-2 border-b border-gray-700 pb-1">${escapeHtml(filename)}</h3>
                             <pre><code class="language-${currentFormat} rounded-lg shadow-inner !bg-gray-950">${escapeHtml(codeContent)}</code></pre>
                         </div>
                     `;
@@ -254,17 +259,20 @@
                     const docList = document.getElementById('docProgressList');
                     const docs = progData.docs || {};
                     if (Object.keys(docs).length > 1) {
-                        docList.innerHTML = Object.entries(docs).map(([name, d]) => `
+                        docList.innerHTML = Object.entries(docs).map(([name, d]) => {
+                            const pct = Math.max(0, Math.min(100, Number(d.progress) || 0));
+                            return `
                             <div>
                                 <div class="flex justify-between text-xs text-gray-600 mb-0.5">
-                                    <span class="truncate max-w-xs">${name}</span>
-                                    <span class="font-medium">${d.progress}%</span>
+                                    <span class="truncate max-w-xs">${escapeHtml(name)}</span>
+                                    <span class="font-medium">${pct}%</span>
                                 </div>
                                 <div class="w-full bg-gray-200 rounded-full h-2">
-                                    <div class="h-2 rounded-full transition-all duration-300 ${d.progress === 100 ? 'bg-green-500' : 'bg-blue-400'}" style="width: ${d.progress}%"></div>
+                                    <div class="h-2 rounded-full transition-all duration-300 ${pct === 100 ? 'bg-green-500' : 'bg-blue-400'}" style="width: ${pct}%"></div>
                                 </div>
-                                <p class="text-xs text-gray-400 truncate">${d.status}</p>
-                            </div>`).join('');
+                                <p class="text-xs text-gray-400 truncate">${escapeHtml(d.status)}</p>
+                            </div>`;
+                        }).join('');
                     } else {
                         docList.innerHTML = '';
                     }
@@ -276,12 +284,18 @@
 
                         if (progData.error) {
                             finalMessage.className = "p-4 rounded-lg text-center font-bold bg-red-100 text-red-800";
-                            finalMessage.innerHTML = `❌ 오류 발생: ${progData.error}`;
+                            finalMessage.textContent = `❌ 오류 발생: ${progData.error}`;
                             downloadBtn.classList.add('hidden');
                             previewBtn.classList.add('hidden');
+                        } else if (progData.warnings && progData.warnings.length) {
+                            finalMessage.className = "p-4 rounded-lg text-center font-bold bg-yellow-100 text-yellow-800";
+                            finalMessage.textContent = `⚠ 일부 작업 실패: ${progData.warnings.join(' / ')}`;
+                            downloadBtn.classList.remove('hidden');
+                            previewBtn.classList.remove('hidden');
+                            downloadBtn.href = `/api/download/${currentTaskId}`;
                         } else {
                             finalMessage.className = "p-4 rounded-lg text-center font-bold bg-green-100 text-green-800";
-                            finalMessage.innerHTML = `✅ 변환이 모두 완료되었습니다!`;
+                            finalMessage.textContent = `✅ 변환이 모두 완료되었습니다!`;
                             downloadBtn.classList.remove('hidden');
                             previewBtn.classList.remove('hidden');
                             downloadBtn.href = `/api/download/${currentTaskId}`;

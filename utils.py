@@ -22,6 +22,17 @@ RENDER_DPI = int(os.environ.get("RENDER_DPI", "300"))
 # VLM 호출 상한 노브(기본값은 기존 동작과 동일 — 정상 페이지엔 영향 없음)
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "300"))                   # 구조추출 VLM 호출 타임아웃(초)
 VLM_MAX_ATTEMPTS = max(1, int(os.environ.get("VLM_MAX_ATTEMPTS", "3")))   # 한 페이지 추출의 최대 시도 수
+VLM_MAX_TOKENS = max(512, int(os.environ.get("VLM_MAX_TOKENS", "16384"))) # 한 페이지 구조추출 응답 토큰 상한
+VLM_STREAM_ABORT = os.environ.get("VLM_STREAM_ABORT", "0") == "1"         # 스트리밍 중 반복 생성 조기 중단(검증/운영 선택)
+VLM_STREAM_ABORT_MIN_CHARS = max(2048, int(os.environ.get("VLM_STREAM_ABORT_MIN_CHARS", "4096")))
+VLM_COVERAGE_VERIFY = os.environ.get("VLM_COVERAGE_VERIFY", "1") == "1"   # 낮은 coverage 페이지를 이미지 기준 VLM 판정으로 재검증
+VLM_COVERAGE_VERIFY_TIMEOUT = int(os.environ.get("VLM_COVERAGE_VERIFY_TIMEOUT", "180"))
+VLM_COVERAGE_VERIFY_MAX_TOKENS = max(256, int(os.environ.get("VLM_COVERAGE_VERIFY_MAX_TOKENS", "768")))
+VLM_COVERAGE_VERIFY_IMG_MAXW = max(768, int(os.environ.get("VLM_COVERAGE_VERIFY_IMG_MAXW", "1600")))
+VLM_COVERAGE_REPAIR = os.environ.get("VLM_COVERAGE_REPAIR", "1") == "1"   # verifier 실패 시 이미지 기준 재추출 1회
+VLM_COVERAGE_REPAIR_TIMEOUT = int(os.environ.get("VLM_COVERAGE_REPAIR_TIMEOUT", "300"))
+VLM_COVERAGE_REPAIR_MAX_TOKENS = max(512, int(os.environ.get("VLM_COVERAGE_REPAIR_MAX_TOKENS", str(VLM_MAX_TOKENS))))
+VLM_COVERAGE_REPAIR_IMG_MAXW = max(768, int(os.environ.get("VLM_COVERAGE_REPAIR_IMG_MAXW", "1600")))
 DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
 VLM_PAGE_CONCURRENCY = max(1, int(os.environ.get("VLM_PAGE_CONCURRENCY", "16")))  # 페이지 동시 추출 수(vLLM 배칭으로 가속)
 # VLM 입력 이미지 폭 상한(px). 기본 2464(28의 배수) — 300DPI 렌더와 짝, 나란히 표 분리에 필요.
@@ -720,7 +731,7 @@ def _salvage_truncated_json(text: str):
 
 def _sanitize_json_strings(text: str) -> str:
     _CTRL_ESCAPES = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
-    _VALID_ESCAPES = set('"\\\/bfnrtu')
+    _VALID_ESCAPES = {'"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'}
     result = []
     in_string = False
     i = 0
@@ -894,6 +905,11 @@ Your task is to convert the provided document text (and layout image if availabl
 - FIGURE description LENGTH (hard limit): keep every figure "description" to AT MOST ~300 characters (about 2–4 sentences). Describe ONLY what is visibly in the frame. NEVER repeat a phrase, and do NOT drift into background knowledge, history, geography, or speculation triggered by a place-name, sign, or label you read in the image — if you catch yourself restating or elaborating beyond what is visible, STOP immediately.
 - READING ORDER on multi-column pages: finish the ENTIRE left column top-to-bottom BEFORE starting the right column. NEVER interleave left/right rows. Use the image to count columns.
 - Transcribe ONLY what is visibly printed on THIS page. Do NOT repeat, re-emit, or duplicate any block of text — each piece appears exactly once.
+- TABLE OF CONTENTS — STRUCTURE FIDELITY (critical):
+  (1) If the page is a table of contents (e.g. "목차", "목 차", "Contents", dotted leader lines, right-aligned page numbers), preserve the page as TOC structure.
+  (2) A TOC row with a visible page number MUST be one toc_entry whose content is exactly "title::page_number". The title is the printed text before the leader dots; the page_number is the visible right-aligned number. Do NOT include leader dots.
+  (3) Section/group labels on a TOC page that do NOT have their own visible page number (e.g. "I. 시스템 개요 및 사용자 등록") are headings, not toc_entry. Do NOT copy a child row's page number onto a parent/group label.
+  (4) Keep every visible TOC title and page number, including lower-page entries near the bottom. Never summarize the TOC.
 - TABLES — STRUCTURE FIDELITY (critical):
   (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right) or are separated by any gap, ruled gutter, blank column, or different column structure, output EACH as its OWN separate <table> element. NEVER merge two side-by-side grids into one <table>, and never put the right grid's columns into the same <tr> as the left grid's.
   (2) Count the column count ONCE from the vertical border lines; EVERY <tr> must sum (counting colspan) to exactly that count — pad missing cells with <td></td>, never invent or drop columns.
@@ -935,9 +951,198 @@ Based on the raw text and the visual layout in the image (if provided), structur
             if t.endswith("```"): t = t[:-3]
             return t.strip()
 
+        def _clip_prompt_text(text, limit):
+            text = text or ""
+            if len(text) <= limit:
+                return text
+            half = max(1, limit // 2)
+            return text[:half] + "\n...[middle omitted]...\n" + text[-half:]
+
+        def _candidate_for_prompt(candidate, limit=12000):
+            try:
+                candidate_obj = json.loads(candidate)
+                candidate_text = json.dumps(candidate_obj, ensure_ascii=False)
+            except Exception:
+                candidate_text = candidate or ""
+            return _clip_prompt_text(candidate_text, limit)
+
+        def _json_coverage(result_text):
+            parsed = json.loads(result_text)
+            elements = parsed if isinstance(parsed, list) else parsed.get("elements", [])
+            in_clean = re.sub(r"\s", "", extracted_text)
+            cap_clean = re.sub(r"\s", "", "".join((e.get("content") or "") for e in elements if isinstance(e, dict)))
+            return (len(cap_clean) / len(in_clean)) if in_clean else 1.0
+
+        def _verify_low_coverage(candidate, cov):
+            if not VLM_COVERAGE_VERIFY or output_format.lower() != "json":
+                return False, "coverage verifier disabled"
+            if not img_path or not os.path.exists(img_path):
+                return False, "coverage verifier needs page image"
+            try:
+                candidate_text = _candidate_for_prompt(candidate)
+
+                verifier_system = """You are a strict visual document QA verifier.
+Decide whether the structured extraction preserves the important VISIBLE text on the page image.
+Use the page IMAGE as the source of truth. Ignore PDF text-layer noise such as duplicated characters,
+leader dots, page-number artifacts, background watermarks, and repeated OCR fragments.
+For TOC pages, a toc_entry value like "title::page_number" preserves both the visible title and page number;
+missing dotted leaders are NOT missing content. Section/group headings may be heading elements.
+Return ONLY valid JSON:
+{"pass": true|false, "reason": "short Korean reason", "missing_visible_text": ["..."]}
+pass=true means no important visible text is missing, even if formatting is simplified.
+pass=false means important visible text from the image is absent or materially wrong in the extraction."""
+                verifier_user = (
+                    f"Coverage score against the noisy PDF text layer was {cov:.2f}.\n"
+                    "Structured extraction candidate:\n"
+                    "<candidate>\n"
+                    f"{candidate_text}\n"
+                    "</candidate>\n\n"
+                    "Judge against the page image. Korean answer in JSON values."
+                )
+                b64 = cls.encode_image(img_path, max_width=VLM_COVERAGE_VERIFY_IMG_MAXW)
+                with _VLM_SEMAPHORE:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": verifier_system},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": verifier_user},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            ]},
+                        ],
+                        temperature=0,
+                        max_tokens=VLM_COVERAGE_VERIFY_MAX_TOKENS,
+                        timeout=VLM_COVERAGE_VERIFY_TIMEOUT,
+                        extra_body={"repetition_penalty": 1.05},
+                    )
+                verdict_raw = _strip_fences(response.choices[0].message.content or "")
+                verdict = json.loads(_sanitize_json_strings(verdict_raw))
+                passed = bool(verdict.get("pass"))
+                reason = verdict.get("reason") or ""
+                missing = verdict.get("missing_visible_text") or []
+                if missing:
+                    reason = f"{reason} missing={missing}"
+                return passed, reason
+            except Exception as e:
+                logger.warning(f"coverage verifier 실패: {e}")
+                return False, f"coverage verifier error: {e}"
+
+        def _repair_low_coverage(candidate, verify_reason):
+            if not VLM_COVERAGE_REPAIR or output_format.lower() != "json":
+                return None, "coverage repair disabled"
+            if not img_path or not os.path.exists(img_path):
+                return None, "coverage repair needs page image"
+            try:
+                repair_system = system_prompt + """
+
+[REPAIR MODE]
+The previous extraction failed visual QA or text coverage. Re-extract the page from scratch.
+Use the IMAGE as the source of truth and the raw PDF text only as support for exact spelling.
+Keep all important visible text. Do not summarize, do not invent, and do not copy PDF text-layer noise.
+For TOC pages: output "목차/목 차" as a heading, every row with a visible page number as toc_entry
+"title::page_number", omit dotted leaders, and do not assign a child page number to a parent/group label."""
+                repair_user = (
+                    f"Verifier failure reason: {verify_reason}\n\n"
+                    "Previous extraction candidate:\n"
+                    "<candidate>\n"
+                    f"{_candidate_for_prompt(candidate)}\n"
+                    "</candidate>\n\n"
+                    "Raw PDF text layer:\n"
+                    "<raw_text>\n"
+                    f"{_clip_prompt_text(extracted_text, 20000)}\n"
+                    "</raw_text>\n\n"
+                    "Return the repaired extraction as valid JSON only."
+                )
+                b64 = cls.encode_image(img_path, max_width=VLM_COVERAGE_REPAIR_IMG_MAXW)
+                with _VLM_SEMAPHORE:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": repair_system},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": repair_user},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            ]},
+                        ],
+                        temperature=0,
+                        max_tokens=VLM_COVERAGE_REPAIR_MAX_TOKENS,
+                        timeout=VLM_COVERAGE_REPAIR_TIMEOUT,
+                        extra_body={"repetition_penalty": max(VLM_REP_PENALTY, 1.08)},
+                    )
+                finish = _vlm_finish_reason(response)
+                if finish == "length":
+                    return None, "repair truncated"
+                repaired = _strip_fences(response.choices[0].message.content or "")
+                try:
+                    parsed = json.loads(repaired)
+                except json.JSONDecodeError:
+                    repaired = _sanitize_json_strings(repaired)
+                    parsed = json.loads(repaired)
+                if isinstance(parsed, list):
+                    parsed = {"page_number": 0, "elements": parsed}
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("elements"), list) or not parsed.get("elements"):
+                    return None, "repair returned empty elements"
+                return json.dumps(parsed, ensure_ascii=False), "repair generated"
+            except Exception as e:
+                logger.warning(f"coverage repair 실패: {e}")
+                return None, f"coverage repair error: {e}"
+
         N = VLM_MAX_ATTEMPTS
         best_result, best_cov = None, -1.0   # 최고 coverage 후보 — 재시도가 결과를 악화시키지 못하게
         escalated = False                     # 루프/타임아웃 의심 시 1회 한정 고온 탈출
+
+        def _chat_completion(rep, img_w, temperature):
+            req = {
+                "model": model_name,
+                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": _payload(img_w)}],
+                "temperature": temperature,
+                "max_tokens": VLM_MAX_TOKENS,
+                "timeout": VLM_TIMEOUT,
+                "extra_body": {
+                    "repetition_penalty": rep,
+                    "no_repeat_ngram_size": (24 if escalated else 0),
+                },
+            }
+            if not VLM_STREAM_ABORT:
+                response = client.chat.completions.create(**req)
+                return response.choices[0].message.content or "", _vlm_finish_reason(response)
+
+            stream = None
+            chunks = []
+            finish = None
+            char_count = 0
+            last_check = 0
+            try:
+                stream = client.chat.completions.create(**req, stream=True)
+                for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = getattr(choice, "delta", None)
+                    content = getattr(delta, "content", None) or ""
+                    if content:
+                        chunks.append(content)
+                        char_count += len(content)
+                        if char_count >= VLM_STREAM_ABORT_MIN_CHARS and char_count - last_check >= 2048:
+                            last_check = char_count
+                            current = "".join(chunks)
+                            if _is_runaway_repeat(current, min_repeats=8, tail=8192):
+                                logger.warning("스트리밍 반복 생성 감지 — 응답 조기 중단")
+                                if hasattr(stream, "close"):
+                                    stream.close()
+                                return current, "stream_runaway"
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr:
+                        finish = fr
+                return "".join(chunks), finish
+            finally:
+                if stream is not None and hasattr(stream, "close"):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
         for attempt in range(N):
             last = attempt >= N - 1
             try:
@@ -945,26 +1150,17 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     # 재시도(escalated) 시 rep_penalty↑·no_repeat_ngram·저해상도로 전환.
                     rep = VLM_REP_PENALTY_HI if escalated else VLM_REP_PENALTY
                     img_w = VLM_IMG_MAXW_FALLBACK if escalated else VLM_IMG_MAXW
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": _payload(img_w)}],
-                        temperature=0.5 if escalated else 0.1,   # 의심(반복/타임아웃) 시에만 고온으로 전환
-                        max_tokens=16384,
-                        timeout=VLM_TIMEOUT,
-                        extra_body={"repetition_penalty": rep,
-                                    "no_repeat_ngram_size": (24 if escalated else 0)}
-                    )
-                finish = _vlm_finish_reason(response)
-                result = _strip_fences(response.choices[0].message.content or "")
+                    result, finish = _chat_completion(rep, img_w, 0.5 if escalated else 0.1)   # 의심(반복/타임아웃) 시에만 고온으로 전환
+                result = _strip_fences(result or "")
 
                 # 반복 생성 차단: 1회 escalated 탈출 후에도 반복이면 폐기.
-                if result and _is_runaway_repeat(result):
+                if finish == "stream_runaway" or (result and _is_runaway_repeat(result)):
                     logger.warning(f"반복 생성 감지 (시도 {attempt+1}/{N}, finish={finish}) — 토큰 런어웨이 차단")
                     if not escalated and not last:
                         escalated = True
                         time.sleep(2)
                         continue
-                    return best_result, False
+                    return None, False
 
                 truncated = (finish == "length")   # max_tokens 도달 = 미완(반복이거나 초대형 페이지)
 
@@ -992,7 +1188,7 @@ Based on the raw text and the visual layout in the image (if provided), structur
                                     logger.warning(f"잘린 JSON 부분 복구: element {len(salv['elements'])}개 보존")
                                     return json.dumps(salv, ensure_ascii=False), True
                             logger.error("JSON 유효성 검증 실패, 건너뜀")
-                            return best_result, False
+                            return None, False
                     # coverage 검사(공백 제거 후 캡처/입력 비율, 임계 0.7). 미완(length)도 재시도.
                     elements = parsed if isinstance(parsed, list) else parsed.get("elements", [])
                     in_clean = re.sub(r"\s", "", extracted_text)
@@ -1000,32 +1196,61 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     cov = (len(cap_clean) / len(in_clean)) if in_clean else 1.0
                     if cov > best_cov:
                         best_cov, best_result = cov, result
-                    if (truncated or (in_clean and cov < 0.7)) and not last:
+                    low_coverage = bool(in_clean and cov < 0.7)
+                    if truncated or low_coverage:
                         why = "출력 미완(length)" if truncated else f"내용 부족(cov={cov:.2f})"
-                        logger.warning(f"{why} (시도 {attempt+1}/{N}) — 재시도")
-                        # 미완(length) → 1회 escalated 전환.
-                        if truncated and not escalated:
-                            escalated = True
-                        time.sleep(5 * (attempt + 1))
-                        continue
+                        if not last:
+                            logger.warning(f"{why} (시도 {attempt+1}/{N}) — 재시도")
+                            # 미완(length) → 1회 escalated 전환.
+                            if truncated and not escalated:
+                                escalated = True
+                            time.sleep(5 * (attempt + 1))
+                            continue
+                        if low_coverage and not truncated:
+                            candidate = best_result or result
+                            passed, reason = _verify_low_coverage(candidate, best_cov if best_result else cov)
+                            if passed:
+                                logger.info(f"{why} — 이미지 verifier 통과: {reason}")
+                                return candidate, True
+                            logger.warning(f"{why} — 이미지 verifier 실패: {reason}")
+                            repaired, repair_reason = _repair_low_coverage(candidate, reason)
+                            if repaired:
+                                try:
+                                    repair_cov = _json_coverage(repaired)
+                                except Exception:
+                                    repair_cov = 0.0
+                                repair_passed, repair_verify_reason = _verify_low_coverage(repaired, repair_cov)
+                                if repair_passed:
+                                    logger.info(f"{why} — coverage repair+이미지 verifier 통과(cov={repair_cov:.2f}): {repair_verify_reason}")
+                                    return repaired, True
+                                if repair_cov >= 0.7 and not VLM_COVERAGE_VERIFY:
+                                    logger.info(f"{why} — coverage repair 통과(cov={repair_cov:.2f}): verifier disabled")
+                                    return repaired, True
+                                logger.warning(f"{why} — coverage repair 검증 실패(cov={repair_cov:.2f}): {repair_verify_reason}")
+                            else:
+                                logger.warning(f"{why} — coverage repair 실패: {repair_reason}")
+                        logger.warning(f"{why} (최종 시도) — 구조추출 실패로 폴백 처리")
+                        return None, True
                     return (best_result or result), True
                 else:
                     # 비-JSON(xml 등)은 파싱 스키마가 달라 원시 길이 기반 검사 유지
-                    if best_result is None:
-                        best_result = result
                     input_len = len(extracted_text)
-                    if (truncated or (input_len and len(result) < input_len * 0.9)) and not last:
-                        logger.warning(f"출력 미완/부족 (시도 {attempt+1}/{N}, finish={finish}) — 재시도")
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    return (best_result or result), True
+                    short_output = bool(input_len and len(result) < input_len * 0.9)
+                    if truncated or short_output:
+                        if not last:
+                            logger.warning(f"출력 미완/부족 (시도 {attempt+1}/{N}, finish={finish}) — 재시도")
+                            time.sleep(5 * (attempt + 1))
+                            continue
+                        logger.warning(f"출력 미완/부족 (최종 시도, finish={finish}) — 구조추출 실패로 폴백 처리")
+                        return None, True
+                    return result, True
             except _APITimeout as e:
                 # 타임아웃: 일시적 오류와 분리해 1회만 고온 재시도 후 중단
                 logger.warning(f"VLM 타임아웃 (시도 {attempt+1}/{N}): {e} — 반복 생성 의심")
                 if not escalated and not last:
                     escalated = True
                     continue
-                return best_result, False
+                return None, False
             except Exception as e:
                 # 연결/5xx/429 등 일시적 오류 → 백오프 후 재시도(최종재시도 패스 자격 유지)
                 logger.warning(f"VLM API 에러 (시도 {attempt+1}/{N}): {e}")
@@ -1033,8 +1258,8 @@ Based on the raw text and the visual layout in the image (if provided), structur
                     time.sleep(5 * (attempt + 1))
                 else:
                     logger.error("VLM API 재시도 소진, 건너뜀")
-                    return best_result, True
-        return best_result, (best_result is not None)
+                    return None, True
+        return None, False
 
     @classmethod
     def describe_image(cls, img_path, api_key, model_name="Qwen/Qwen3-VL-30B-A3B-Instruct"):
@@ -1805,6 +2030,9 @@ class DocumentProcessor:
                     im = Image.open(_io.BytesIO(payload)).convert("RGB")
                 except Exception as e:
                     logger.warning(f"EML 첨부 이미지 열기 실패({fname}): {e}")
+                    _emit_notice(["⚠ 첨부 이미지 열기 실패 — 원본 필요",
+                                  f"파일명: {fname or '(이름없음)'}",
+                                  f"오류: {str(e)[:120]}"])
                     continue
                 if max(im.size) < 32:        # 1x1 트래킹 픽셀·스페이서 — VLM 낭비 없이 제외
                     continue
@@ -1876,6 +2104,7 @@ class DocumentProcessor:
                 ap = os.path.join(temp_pdf_dir, f"_att_{uuid.uuid4().hex}{aext}")
                 with open(ap, "wb") as fh:
                     fh.write(payload)
+                before_pages = state["n"]
                 try:
                     if aext == ".pdf":
                         _emit_pdf(ap)
@@ -1889,10 +2118,21 @@ class DocumentProcessor:
                     logger.warning(f"EML 첨부 변환 실패({fname}): {e}")
                 finally:
                     if os.path.exists(ap): os.remove(ap)
+                if state["n"] == before_pages:
+                    _emit_notice(["⚠ 첨부 문서 변환 실패 — 원본 필요",
+                                  f"파일명: {fname or '(이름없음)'}",
+                                  "자동 렌더 결과 페이지가 생성되지 않았습니다."])
                 continue
 
             logger.info(f"EML 첨부 미지원 건너뜀: {fname} ({ctype})")
+            _emit_notice(["⚠ 미지원 첨부 — 원본 필요",
+                          f"파일명: {fname or '(이름없음)'}",
+                          f"Content-Type: {ctype or 'unknown'}"])
 
+        if state["n"] == 0:
+            _emit_notice(["⚠ EML 렌더 결과 없음",
+                          f"파일명: {os.path.basename(file_path)}",
+                          "본문 또는 첨부를 페이지로 생성하지 못했습니다. 원본 확인이 필요합니다."])
         return state["n"]
 
     @classmethod
@@ -2066,14 +2306,28 @@ class DocumentProcessor:
         return "\n".join(lines).strip()
 
     @classmethod
-    def process_and_save(cls, file_path, base_output_dir, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-30B-A3B-Instruct", progress_callback=None, chunk_strategies=None):
-        filename = os.path.basename(file_path)
-        name, ext = os.path.splitext(filename)
-        ext = ext.lower()
-        
-        doc_output_dir = os.path.join(base_output_dir, name)
-        if os.path.exists(doc_output_dir): shutil.rmtree(doc_output_dir)
-        os.makedirs(doc_output_dir)
+    def process_and_save(cls, file_path, base_output_dir, api_key=None, output_format="json", model_name="Qwen/Qwen3-VL-30B-A3B-Instruct", progress_callback=None, chunk_strategies=None, output_name=None, source_filename=None):
+        filename = os.path.basename(source_filename or file_path)
+        storage_filename = os.path.basename(file_path)
+        name, _ = os.path.splitext(filename)
+        ext = os.path.splitext(storage_filename)[1].lower()
+
+        os.makedirs(base_output_dir, exist_ok=True)
+        base_name = output_name or name or "document"
+        base_name = re.sub(r'[\/\\\:\*\?\"\<\>\|\x00-\x1f\x7f]', '_', base_name).strip(' ._') or "document"
+        # 같은 stem을 병렬 처리해도 서로의 출력 폴더를 지우지 않도록 새 폴더를 원자적으로 점유한다.
+        for attempt in range(1000):
+            candidate = base_name if attempt == 0 else f"{base_name}__{attempt + 1}"
+            doc_output_dir = os.path.join(base_output_dir, candidate)
+            try:
+                os.makedirs(doc_output_dir)
+                break
+            except FileExistsError:
+                continue
+        else:
+            candidate = f"{base_name}__{uuid.uuid4().hex[:8]}"
+            doc_output_dir = os.path.join(base_output_dir, candidate)
+            os.makedirs(doc_output_dir)
 
         def set_progress(msg, percent):
             logger.info(msg)
@@ -2179,12 +2433,14 @@ class DocumentProcessor:
                     set_progress(f"문서 파싱 완료 ({total_pages}쪽)", 20)
                     doc.close()
                 except Exception as e:
-                    set_progress(f"❌ 문서 파싱 에러: {e}", 20)
+                    raise Exception(f"문서 파싱 에러: {e}")
 
         page_files = sorted(f for f in os.listdir(doc_output_dir) if f.startswith("page_") and f.endswith(".txt"))
         total_vlm_pages = len(page_files)
 
-        if not page_files: return set_progress("분석할 텍스트가 없어 종료합니다.", 100)
+        if not page_files:
+            set_progress("❌ 분석할 페이지를 생성하지 못했습니다.", 100)
+            raise Exception("분석할 페이지를 생성하지 못했습니다. 입력 파일 변환 또는 렌더링에 실패했습니다.")
         if not api_key or "여기에" in api_key: raise Exception("API 키가 누락되었거나 유효하지 않습니다.")
 
         set_progress("문서 메타데이터 추출 중...", 22)
@@ -2269,6 +2525,64 @@ class DocumentProcessor:
                         if c:
                             seen.add(c)
                         deduped.append(e)
+                    # TOC sanity cleanup: VLM sometimes assigns the first child page number to a parent/group
+                    # label ("I. ...::7") even when no page number is printed on that line. Keep only page
+                    # numbers supported by the text-layer leader/page pattern; demote unsupported group labels.
+                    try:
+                        if any(e.get("type") == "toc_entry" for e in deduped):
+                            def _toc_norm(s):
+                                s = re.sub(r"\s+", " ", (s or "")).strip()
+                                return s.rstrip(".·•∙⋯…").strip()
+
+                            def _leader_line(s):
+                                compact = re.sub(r"\s+", "", s or "")
+                                return bool(compact) and bool(re.fullmatch(r"[.\u2026·•∙⋯…_\-]{3,}", compact))
+
+                            def _page_line(s):
+                                return bool(re.fullmatch(r"\d{1,4}", (s or "").strip()))
+
+                            def _looks_toc_group(title):
+                                title = (title or "").strip()
+                                return bool(
+                                    re.match(r"^(?:[IVXLCDM]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+)[.)]?\s+", title, re.I) or
+                                    re.match(r"^제\s*\d+\s*[장부편]\b", title)
+                                )
+
+                            raw_lines = []
+                            tp = os.path.join(doc_output_dir, f"{stem}.txt")
+                            if os.path.exists(tp):
+                                with open(tp, "r", encoding="utf-8") as _tf:
+                                    raw_lines = [ln.strip() for ln in _tf.read().splitlines() if ln.strip()]
+
+                            visible_pairs = set()
+                            inline_re = re.compile(r"^(?P<title>.+?)[.\u2026·•∙⋯…_ \t-]{3,}(?P<page>\d{1,4})$")
+                            for idx, line in enumerate(raw_lines):
+                                m = inline_re.match(line)
+                                if m:
+                                    visible_pairs.add((_toc_norm(m.group("title")), m.group("page")))
+                                if idx + 2 < len(raw_lines) and _leader_line(raw_lines[idx + 1]) and _page_line(raw_lines[idx + 2]):
+                                    visible_pairs.add((_toc_norm(line), raw_lines[idx + 2].strip()))
+
+                            if visible_pairs:
+                                cleaned_toc = []
+                                for e in deduped:
+                                    if e.get("type") != "toc_entry":
+                                        cleaned_toc.append(e)
+                                        continue
+                                    raw = (e.get("content") or "").strip()
+                                    title, sep, pg = raw.rpartition("::")
+                                    title = title.strip() if sep else raw
+                                    pg = pg.strip() if sep else ""
+                                    if _looks_toc_group(title) and (not sep or (_toc_norm(title), pg) not in visible_pairs):
+                                        fixed = {k: v for k, v in e.items() if k not in ("caption", "description")}
+                                        fixed["type"] = "heading_2"
+                                        fixed["content"] = title
+                                        cleaned_toc.append(fixed)
+                                    else:
+                                        cleaned_toc.append(e)
+                                deduped = cleaned_toc
+                    except Exception as te:
+                        logger.warning(f"TOC sanity cleanup 실패({stem}): {te}")
                     # silent-drop 탐지: 이미지엔 잉크가 있는데 추출 본문이 페이지번호/푸터 수준이면 저신뢰 표기.
                     alltext = "".join((e.get("content") or "") + (e.get("caption") or "") +
                                       (e.get("description") or "") for e in deduped)
@@ -2500,31 +2814,65 @@ class DocumentProcessor:
                 logger.info(f"최종 재시도로 {len(recovered)}쪽 구조 복구: {sorted(recovered)}")
             failed_pages = [pn for pn in failed_pages if pn not in recovered]
 
-        # never-fail 보장: 재시도 후에도 structured.json 이 없는 페이지는 텍스트레이어로 구조를 합성한다.
-        # (데모 요건: 실패 페이지 0. 구조추출이 끝내 안 되면 텍스트 문단을 element 로 감싸 저장 + 저신뢰 표기.)
-        if vlm_fmt == "json":
-            for stem in [tf[:-4] for tf in page_files]:
-                sj = os.path.join(doc_output_dir, f"{stem}_structured.json")
-                if os.path.exists(sj):
-                    continue
-                tp = os.path.join(doc_output_dir, f"{stem}.txt")
-                raw = ""
-                if os.path.exists(tp):
-                    with open(tp, "r", encoding="utf-8") as f:
-                        raw = f.read().strip()
+        def _page_num_from_stem(stem):
+            try:
+                return int(stem.split("_")[1])
+            except (IndexError, ValueError):
+                return 0
+
+        def _fallback_payload(stem):
+            tp = os.path.join(doc_output_dir, f"{stem}.txt")
+            raw = ""
+            if os.path.exists(tp):
+                with open(tp, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+            paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()] or ([raw] if raw else [])
+            els = [{"type": "text", "content": p} for p in paras]
+            els.insert(0, {"type": "text", "content":
+                           "⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장."})
+            return raw, {"page_number": _page_num_from_stem(stem), "elements": els, "low_confidence": True}
+
+        def _write_fallback_page(stem):
+            raw, payload = _fallback_payload(stem)
+            pn = payload["page_number"]
+            if vlm_fmt == "json":
+                _persist_page(stem, json.dumps(payload, ensure_ascii=False))
+            elif vlm_fmt == "xml":
+                import html as _html
+                parts = [
+                    "<document>",
+                    f"  <page_number>{pn}</page_number>",
+                    "  <elements>",
+                    "    <element type=\"text\">⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장.</element>",
+                ]
                 paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()] or ([raw] if raw else [])
-                els = [{"type": "text", "content": p} for p in paras]
-                els.insert(0, {"type": "text", "content":
-                               "⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장."})
-                try: pn = int(stem.split("_")[1])
-                except (IndexError, ValueError): pn = 0
-                with open(sj, "w", encoding="utf-8") as f:
-                    json.dump({"page_number": pn, "elements": els, "low_confidence": True},
-                              f, ensure_ascii=False, indent=4)
-                if isinstance(pn, int) and pn not in low_conf_pages:
+                for para in paras:
+                    parts.append(f"    <element type=\"text\">{_html.escape(para)}</element>")
+                parts.extend(["  </elements>", "  <low_confidence>true</low_confidence>", "</document>"])
+                with open(os.path.join(doc_output_dir, f"{stem}_structured.xml"), "w", encoding="utf-8") as f:
+                    f.write("\n".join(parts))
+            else:
+                with open(os.path.join(doc_output_dir, f"{stem}_structured.{output_format.lower()}"), "w", encoding="utf-8") as f:
+                    f.write(raw)
+            if isinstance(pn, int):
+                if pn not in low_conf_pages:
                     low_conf_pages.append(pn)
-                logger.info(f"{stem}: 텍스트레이어 폴백으로 structured 합성(never-fail)")
-            failed_pages = []   # 모든 페이지가 structured.json 보유 → 실패 0 보장
+                if pn and pn not in failed_pages:
+                    failed_pages.append(pn)
+            logger.info(f"{stem}: 텍스트레이어 폴백으로 structured 합성")
+
+        # 재시도 후에도 structured 결과가 없는 페이지는 포맷별 fallback을 생성해 누락을 막되,
+        # metadata/status에는 VLM 구조추출 실패 페이지로 남긴다.
+        for stem in [tf[:-4] for tf in page_files]:
+            if output_format.lower() == "markdown":
+                exists = (
+                    os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.json")) and
+                    os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.md"))
+                )
+            else:
+                exists = os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.{output_format.lower()}"))
+            if not exists:
+                _write_fallback_page(stem)
 
         if output_format.lower() in ("json", "markdown"):
             toc_entries = []
@@ -2657,6 +3005,11 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"청킹 오류: {e}")
 
+        def _unique_page_list(values):
+            ints = sorted({p for p in values if isinstance(p, int)})
+            others = sorted({str(p) for p in values if not isinstance(p, int)})
+            return ints + others
+
         # 부분 실패 가시화: VLM 구조추출 실패 페이지를 metadata 에 기록(프로그램 접근용).
         # 실패 페이지는 raw 텍스트로 폴백되어 내용은 보존되나 구조(heading/표)는 빠진다.
         try:
@@ -2667,8 +3020,10 @@ class DocumentProcessor:
             except Exception:
                 metadata = {}
             metadata["vlm_pages_total"] = total_vlm_pages
-            metadata["vlm_failed_pages"] = sorted(failed_pages)
-            metadata["low_confidence_pages"] = sorted(p for p in low_conf_pages if isinstance(p, int))
+            failed_pages = _unique_page_list(failed_pages)
+            low_conf_pages = _unique_page_list(low_conf_pages)
+            metadata["vlm_failed_pages"] = failed_pages
+            metadata["low_confidence_pages"] = low_conf_pages
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -2677,13 +3032,14 @@ class DocumentProcessor:
         if os.path.exists(temp_pdf_dir):
             shutil.rmtree(temp_pdf_dir, ignore_errors=True)
 
-        lc = sorted(p for p in low_conf_pages if isinstance(p, int))
+        lc = _unique_page_list(low_conf_pages)
         if failed_pages or lc:
             msg = "⚠️ 완료"
             if failed_pages:
-                msg += f" — 구조추출 실패 {len(failed_pages)}/{total_vlm_pages}쪽(폴백: {sorted(failed_pages)})"
+                msg += f" — 구조추출 실패 {len(failed_pages)}/{total_vlm_pages}쪽(폴백: {failed_pages})"
             if lc:
                 msg += f" — 저신뢰(이미지 추출 빈약) {len(lc)}쪽: {lc} 원본 확인 필요"
             set_progress(msg, 100)
         else:
             set_progress("🎉 모든 구조화 완료!", 100)
+        return doc_output_dir

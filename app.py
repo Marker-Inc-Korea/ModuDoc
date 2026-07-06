@@ -3,6 +3,7 @@ import io
 import json
 import uuid
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 import re
@@ -13,7 +14,13 @@ from utils import DocumentProcessor
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = './documents'
 app.config['OUTPUT_FOLDER'] = './processed'
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("MAX_UPLOAD_MB", "512")) * 1024 * 1024
 HISTORY_FILE = 'history.json'
+ALLOWED_FORMATS = {"json", "xml", "markdown"}
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".hwp", ".hwpx", ".docx", ".doc", ".pptx", ".ppt",
+    ".xlsx", ".xls", ".odt", ".rtf", ".txt", ".csv", ".eml",
+}
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
@@ -22,10 +29,33 @@ VLM_BASE_URL = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
 API_KEY = os.environ.get("VLM_API_KEY", "local-vllm-noauth-key")
 
 tasks_progress = {}
+history_lock = threading.Lock()
 
 def get_safe_filename(filename):
-    basename = os.path.basename(filename)
-    return re.sub(r'[\/\\\:\*\?\"\<\>\|]', '', basename)
+    basename = os.path.basename(filename or "")
+    basename = re.sub(r'[\x00-\x1f\x7f]', '', basename)
+    basename = re.sub(r'[\/\\\:\*\?\"\<\>\|]', '_', basename)
+    basename = re.sub(r'\s+', ' ', basename).strip(' ._')
+    return basename[:180]
+
+def make_output_name(filename, task_id, idx):
+    stem = os.path.splitext(filename)[0]
+    stem = re.sub(r'[^\w가-힣.-]+', '_', stem, flags=re.UNICODE).strip('._') or "document"
+    return f"{stem}__{task_id[:8]}__{idx:03d}"
+
+def processed_entries(task):
+    entries = []
+    for item in task.get('processed', []):
+        if isinstance(item, dict):
+            entries.append(item)
+        else:
+            name = str(item)
+            entries.append({
+                "filename": name,
+                "display": name,
+                "output_dir": os.path.splitext(name)[0],
+            })
+    return entries
 
 def load_history():
     if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 0:
@@ -60,7 +90,9 @@ def process_files():
     if 'files' not in request.files:
         return jsonify({"error": "파일이 없습니다."}), 400
         
-    output_format = request.form.get('format', 'json')
+    output_format = (request.form.get('format', 'json') or 'json').lower()
+    if output_format not in ALLOWED_FORMATS:
+        return jsonify({"error": "지원하지 않는 출력 포맷입니다."}), 400
     model_name = request.form.get('model', 'Qwen/Qwen3-VL-30B-A3B-Instruct')
     chunk_strategies = request.form.getlist('chunk')
     try:
@@ -68,24 +100,50 @@ def process_files():
     except (TypeError, ValueError):
         concurrency = 3
     task_id = str(uuid.uuid4())
-    tasks_progress[task_id] = {"progress": 0, "status": "업로드 중...", "is_done": False, "error": None, "processed": [], "docs": {}}
+    tasks_progress[task_id] = {"progress": 0, "status": "업로드 중...", "is_done": False, "error": None, "warnings": [], "processed": [], "docs": {}}
 
     saved_files = []
-    for file in request.files.getlist('files'):
+    task_upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], task_id)
+    os.makedirs(task_upload_dir, exist_ok=True)
+    seen_names = {}
+    for idx, file in enumerate(request.files.getlist('files'), start=1):
         if file.filename != '':
             filename = get_safe_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(file_path)
-            saved_files.append((file_path, filename))
+            if not filename:
+                tasks_progress.pop(task_id, None)
+                shutil.rmtree(task_upload_dir, ignore_errors=True)
+                return jsonify({"error": "유효하지 않은 파일명입니다."}), 400
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                tasks_progress.pop(task_id, None)
+                shutil.rmtree(task_upload_dir, ignore_errors=True)
+                return jsonify({"error": f"지원하지 않는 파일 형식입니다: {filename}"}), 400
+            seen_names[filename] = seen_names.get(filename, 0) + 1
+            display_name = filename if seen_names[filename] == 1 else f"{filename} ({seen_names[filename]})"
+            stored_name = f"{idx:03d}_{filename}"
+            file_path = os.path.join(task_upload_dir, stored_name)
+            try:
+                file.save(file_path)
+            except Exception as e:
+                tasks_progress.pop(task_id, None)
+                shutil.rmtree(task_upload_dir, ignore_errors=True)
+                return jsonify({"error": f"파일 저장 실패: {filename} ({e})"}), 500
+            saved_files.append({
+                "path": file_path,
+                "filename": filename,
+                "display": display_name,
+                "output_name": make_output_name(filename, task_id, idx),
+            })
 
     if not saved_files:
         tasks_progress.pop(task_id, None)
+        shutil.rmtree(task_upload_dir, ignore_errors=True)
         return jsonify({"error": "유효한 파일이 없습니다."}), 400
 
     def background_worker(t_id, files_info, out_fmt, mod_name, chunk_strats, conc):
         total_files = len(files_info)
-        doc_progress = {f_name: 0 for _, f_name in files_info}
-        doc_status = {f_name: "대기 중..." for _, f_name in files_info}
+        doc_progress = {info["display"]: 0 for info in files_info}
+        doc_status = {info["display"]: "대기 중..." for info in files_info}
         lock = threading.Lock()
 
         def update_overall():
@@ -104,39 +162,62 @@ def process_files():
                     update_overall()
             return cb
 
-        def process_one(f_path, f_name):
-            DocumentProcessor.process_and_save(
-                file_path=f_path, base_output_dir=app.config['OUTPUT_FOLDER'],
+        def process_one(info):
+            output_dir = DocumentProcessor.process_and_save(
+                file_path=info["path"], base_output_dir=app.config['OUTPUT_FOLDER'],
                 api_key=API_KEY, output_format=out_fmt, model_name=mod_name,
-                progress_callback=make_progress_cb(f_name),
-                chunk_strategies=chunk_strats or None
+                progress_callback=make_progress_cb(info["display"]),
+                chunk_strategies=chunk_strats or None,
+                output_name=info["output_name"],
+                source_filename=info["filename"],
             )
-            return f_name
+            return {
+                "filename": info["filename"],
+                "display": info["display"],
+                "output_dir": os.path.basename(output_dir),
+            }
 
         try:
             processed_docs = []
+            errors = []
             max_workers = max(1, min(total_files, conc))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_one, f_path, f_name): f_name
-                           for f_path, f_name in files_info}
+                futures = {executor.submit(process_one, info): info["display"]
+                           for info in files_info}
                 for future in as_completed(futures):
                     f_name = futures[future]
                     try:
                         processed_docs.append(future.result())
                     except Exception as e:
-                        tasks_progress[t_id]["error"] = f"[{f_name}] {e}"
+                        errors.append(f"[{f_name}] {e}")
+                        with lock:
+                            doc_progress[f_name] = 100
+                            doc_status[f_name] = f"실패: {e}"
+                            update_overall()
 
             if processed_docs:
-                hist = load_history()
-                hist.insert(0, {"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "files": processed_docs, "format": out_fmt.upper(), "model": mod_name})
-                save_history(hist)
+                with history_lock:
+                    hist = load_history()
+                    hist.insert(0, {"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "files": [d["display"] for d in processed_docs], "format": out_fmt.upper(), "model": mod_name})
+                    save_history(hist)
 
             tasks_progress[t_id]["progress"] = 100
-            tasks_progress[t_id]["status"] = "모든 작업 완료!"
+            if errors and not processed_docs:
+                tasks_progress[t_id]["status"] = "작업 실패"
+                tasks_progress[t_id]["error"] = " / ".join(errors)
+            elif errors:
+                tasks_progress[t_id]["status"] = "일부 작업 실패"
+                tasks_progress[t_id]["warnings"] = errors
+            else:
+                tasks_progress[t_id]["status"] = "모든 작업 완료!"
             tasks_progress[t_id]["processed"] = processed_docs
         except Exception as e:
             tasks_progress[t_id]["error"] = str(e)
         finally:
+            if files_info:
+                upload_dir = os.path.dirname(files_info[0]["path"])
+                if os.path.basename(upload_dir) == t_id:
+                    shutil.rmtree(upload_dir, ignore_errors=True)
             tasks_progress[t_id]["is_done"] = True
 
     threading.Thread(target=background_worker, args=(task_id, saved_files, output_format, model_name, chunk_strategies, concurrency)).start()
@@ -150,8 +231,8 @@ def download_result(task_id):
         
     memory_file = io.BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for f_name in task['processed']:
-            doc_dir_name = os.path.splitext(f_name)[0]
+        for entry in processed_entries(task):
+            doc_dir_name = entry["output_dir"]
             doc_dir_path = os.path.join(app.config['OUTPUT_FOLDER'], doc_dir_name)
             
             if os.path.exists(doc_dir_path):
@@ -171,8 +252,9 @@ def view_result(task_id):
         return jsonify({"error": "결과를 찾을 수 없습니다."}), 404
 
     results = {}
-    for f_name in task['processed']:
-        doc_dir_name = os.path.splitext(f_name)[0]
+    for entry in processed_entries(task):
+        doc_dir_name = entry["output_dir"]
+        display = entry.get("display") or entry.get("filename") or doc_dir_name
         doc_dir_path = os.path.join(app.config['OUTPUT_FOLDER'], doc_dir_name)
 
         if os.path.exists(doc_dir_path):
@@ -181,7 +263,7 @@ def view_result(task_id):
                     if file.endswith('_structured.json') or file.endswith('_structured.xml') or file.endswith('_structured.md'):
                         f_path = os.path.join(root, file)
                         with open(f_path, 'r', encoding='utf-8') as f:
-                            results[f"{doc_dir_name} / {file}"] = f.read()
+                            results[f"{display} / {file}"] = f.read()
                             
     return jsonify(results)
 
@@ -267,4 +349,6 @@ def api_file(name, filename):
     return send_from_directory(d, safe)
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(debug=debug, port=port)

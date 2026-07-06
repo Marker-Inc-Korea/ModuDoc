@@ -72,8 +72,27 @@
 const $ = s => document.querySelector(s);
 let DOC = null, idx = 0;
 
-function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#039;'}[c])); }
 function mdBold(s){ return escapeHtml(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>'); }
+function sanitizeTableHtml(html){
+    const tpl = document.createElement('template');
+    tpl.innerHTML = String(html ?? '');
+    const allowed = new Set(['TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'TD', 'TH', 'BR']);
+    const nodes = [];
+    const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_ELEMENT);
+    while(walker.nextNode()) nodes.push(walker.currentNode);
+    for(const node of nodes.reverse()){
+        if(!allowed.has(node.tagName)){
+            node.replaceWith(document.createTextNode(node.textContent || ''));
+            continue;
+        }
+        for(const attr of [...node.attributes]){
+            const name = attr.name.toLowerCase();
+            if(!['colspan', 'rowspan'].includes(name)) node.removeAttribute(attr.name);
+        }
+    }
+    return tpl.innerHTML;
+}
 
 function renderElements(els){
     if(!els || !els.length) return '<div class="text-gray-400">추출된 요소가 없습니다.</div>';
@@ -85,7 +104,7 @@ function renderElements(els){
         else if(t === 'heading_2') out.push(`<h3 class="el text-base font-semibold text-gray-800 mt-4 mb-1 ml-2">${escapeHtml(c)}</h3>`);
         else if(t === 'heading_3') out.push(`<h4 class="el text-sm font-semibold text-gray-700 mt-3 mb-1 ml-4">${escapeHtml(c)}</h4>`);
         else if(t === 'toc_entry') out.push(`<div class="el text-xs text-gray-500 ml-2">· ${escapeHtml(c)}</div>`);
-        else if(t === 'table') out.push(`<div class="el my-2 overflow-x-auto">${e.caption?`<div class="text-xs font-medium text-gray-500 mb-1">▤ ${escapeHtml(e.caption)}</div>`:''}${c}</div>`);
+        else if(t === 'table') out.push(`<div class="el my-2 overflow-x-auto">${e.caption?`<div class="text-xs font-medium text-gray-500 mb-1">▤ ${escapeHtml(e.caption)}</div>`:''}${sanitizeTableHtml(c)}</div>`);
         else if(t === 'figure') out.push(`<div class="el my-3 p-3 rounded-lg bg-amber-50 border border-amber-200">
                 <div class="text-xs font-semibold text-amber-700">🖼️ figure${e.caption?` · ${escapeHtml(e.caption)}`:''}</div>
                 ${e.description?`<div class="text-sm text-gray-700 mt-1">${escapeHtml(e.description)}</div>`:''}
