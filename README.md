@@ -140,10 +140,38 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `VLM_IMG_MAXW` | `2464` | VLM 입력 이미지 최대 폭(px, 28의 배수). `RENDER_DPI` 와 짝 — 이 값이 렌더 폭보다 작으면 다운스케일돼 표 분리 효과가 줄어듦 |
 | `VLM_IMG_MAXW_FALLBACK` | `1024` | 반복 폭주/타임아웃 재시도 시 낮추는 폴백 폭 |
 | `ZOOM_RASTER_TABLES` | `1` | HWP/HWPX 임베디드 raster 표를 확대 재추출해 오구조를 수리(`0` 으로 끄기). VLM 심판이 승인할 때만 교체 |
+| `ZOOM_VLM_MAX_TOKENS` | `4096` | raster 표 zoom-pass 재추출 응답 토큰 상한. 큰 값을 쓰면 복잡한 표를 더 잘 살릴 수 있지만 장시간 생성 위험이 커짐 |
+| `ZOOM_VLM_TIMEOUT` | `180` | raster 표 zoom-pass 재추출 VLM 호출 타임아웃(초) |
+| `ZOOM_JUDGE_MAX_TOKENS` | `256` | zoom-pass A/B 심판 응답 토큰 상한 |
+| `ZOOM_JUDGE_TIMEOUT` | `60` | zoom-pass A/B 심판 VLM 호출 타임아웃(초) |
+| `ZOOM_MAX_CANDIDATES` | `16` | 문서당 zoom-pass 후보 raster 표 최대 개수. 큰 표부터 처리하며 `0`이면 제한 없음 |
+| `ZOOM_DOC_BUDGET_SEC` | `900` | 문서당 zoom-pass 전체 시간 예산(초). 예산 초과 시 남은 후보를 건너뜀, `0`이면 제한 없음 |
 
 > 💡 **표 구조 정확도 ↔ 비용**: 기본값 `300`DPI/`2464`px 는 서로 붙어 있는 표(예: 좌측 평가표 + 우측 등급표)를 **각각 별도 `<table>` 로 분리**합니다. 속도·토큰을 아끼려면 `RENDER_DPI=200 VLM_IMG_MAXW=1568` 로 낮출 수 있습니다(페이지 수·내용은 동일하나 나란히 표의 분리 정확도는 하락).
 >
 > rhwp 코어는 레이아웃 진단(`LAYOUT_OVERFLOW` 등)을 **stderr** 로 출력합니다(기능엔 무해). 로그가 거슬리면 프로세스 stderr 를 리다이렉트하세요.
+
+</details>
+
+<details><summary>검증 도구</summary>
+
+파서 산출물(`*_structured.json`)은 GPU 없이 deterministic golden rule로 먼저 검사할 수 있습니다.
+
+```bash
+python tools/golden_verify.py /path/to/parser-run \
+  --rules tools/golden_rules.example.json \
+  --out /tmp/golden_summary.json
+```
+
+VLM 시각 판정은 OpenAI 호환 endpoint를 사용합니다. GPU 검증 환경에서는 vLLM 서버를 **Slurm 할당 안에서** 띄운 뒤 `VLM_BASE_URL`과 `JUDGE_MODEL`을 그 endpoint/model로 맞춰 실행하세요.
+
+```bash
+export VLM_BASE_URL="http://<slurm-node>:<port>/v1"
+export JUDGE_MODEL="Qwen/Qwen3-VL-30B-A3B-Instruct"
+python tools/visual_judge_pages.py /path/to/parser-run --docs "sample" --pages "1,2"
+```
+
+각 element에는 `_source`, `_confidence`, `_issues` 메타가 붙을 수 있으며, 문서 `metadata.json`에는 `provenance_summary`가 기록됩니다. 복잡 표의 colspan/열 붕괴 의심은 자동 복원하지 못한 경우에도 `_issues`로 남겨 회귀검증에서 잡을 수 있습니다.
 
 </details>
 

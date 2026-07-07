@@ -2,7 +2,7 @@
 
 임베디드 이미지를 확대해 VLM 으로 표를 다시 추출하고, VLM 심판이 원본보다 낫다고
 판정할 때만 해당 표 요소를 교체한다. 원본 셀 손실이 임계를 넘으면 교체하지 않는다."""
-import os, io, re, json, glob, base64
+import os, io, re, json, glob, base64, time
 
 ZOOM_RASTER_TABLES = os.environ.get("ZOOM_RASTER_TABLES", "1") == "1"
 ZOOM_MIN_INCH = float(os.environ.get("ZOOM_MIN_INCH", "3.0"))
@@ -13,12 +13,19 @@ ZOOM_OVERLAP = float(os.environ.get("ZOOM_OVERLAP", "0.55"))
 ZOOM_MAX_LOSS = float(os.environ.get("ZOOM_MAX_LOSS", "0.10"))
 ZOOM_JUDGES = int(os.environ.get("ZOOM_JUDGES", "5"))
 ZOOM_WIN_FRAC = float(os.environ.get("ZOOM_WIN_FRAC", "0.8"))
+ZOOM_VLM_TIMEOUT = int(os.environ.get("ZOOM_VLM_TIMEOUT", "180"))
+ZOOM_VLM_MAX_TOKENS = max(1024, int(os.environ.get("ZOOM_VLM_MAX_TOKENS", "4096")))
+ZOOM_JUDGE_TIMEOUT = int(os.environ.get("ZOOM_JUDGE_TIMEOUT", "60"))
+ZOOM_JUDGE_MAX_TOKENS = max(128, int(os.environ.get("ZOOM_JUDGE_MAX_TOKENS", "256")))
+ZOOM_MAX_CANDIDATES = max(0, int(os.environ.get("ZOOM_MAX_CANDIDATES", "16")))
+ZOOM_DOC_BUDGET_SEC = max(0.0, float(os.environ.get("ZOOM_DOC_BUDGET_SEC", "900")))
 
 _SYS = """You are an expert document parsing AI. Convert the provided image into structured JSON.
 
 [OUTPUT]
 Output ONLY valid JSON (no code fences, no commentary): {"page_number": int, "elements": [{"type": "heading_1|heading_2|heading_3|text|table|figure|footnote", "content": "...", "caption": "..."}]}.
 Write natural-language strings in the document's language (Korean for a Korean document).
+If the image is not primarily a bordered table/grid, output exactly {"page_number":1,"elements":[]}.
 
 [TABLES — STRUCTURE FIDELITY]
 - table content = HTML using ONLY <table>,<tr>,<td> (and <br> only inside a cell) — NEVER <th>. colspan/rowspan allowed. Put the title in "caption".
@@ -75,7 +82,7 @@ def _rect_ok(html):
 def _client(api_key):
     from openai import OpenAI
     return OpenAI(base_url=os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1"),
-                  api_key=api_key or "EMPTY", timeout=600, max_retries=0)
+                  api_key=api_key or "EMPTY", timeout=ZOOM_VLM_TIMEOUT, max_retries=0)
 
 
 def _first_json(text):
@@ -111,7 +118,7 @@ def _vlm_tables(client, model, img_bytes):
                   {"role": "user", "content": [
                       {"type": "text", "text": "Structure this image strictly as JSON."},
                       {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
-        temperature=0.0, max_tokens=16384,
+        temperature=0.0, max_tokens=ZOOM_VLM_MAX_TOKENS, timeout=ZOOM_VLM_TIMEOUT,
         extra_body={"repetition_penalty": 1.05, "no_repeat_ngram_size": 24})
     obj = _first_json(r.choices[0].message.content or "")
     if not obj:
@@ -160,7 +167,7 @@ def _judge_once(client, model, img_bytes, html_a, html_b):
                   {"role": "user", "content": [
                       {"type": "text", "text": user},
                       {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
-        temperature=0.0, max_tokens=512)
+        temperature=0.0, max_tokens=ZOOM_JUDGE_MAX_TOKENS, timeout=ZOOM_JUDGE_TIMEOUT)
     obj = _first_json(r.choices[0].message.content or "")
     v = (obj or {}).get("verdict", "").strip().upper()[:1]
     return v if v in ("A", "B") else "TIE" if obj else None
@@ -202,6 +209,9 @@ def zoom_raster_tables(doc_output_dir, source_path, api_key, model_name):
     except Exception:
         return 0
     cands = [f for f in figs if f.get("w_in", 0) >= ZOOM_MIN_INCH and f.get("h_in", 0) >= ZOOM_MIN_INCH]
+    cands.sort(key=lambda f: f.get("w_in", 0) * f.get("h_in", 0), reverse=True)
+    if ZOOM_MAX_CANDIDATES > 0:
+        cands = cands[:ZOOM_MAX_CANDIDATES]
     if not cands:
         return 0
     pages = sorted(glob.glob(os.path.join(doc_output_dir, "page_*_structured.json")))
@@ -216,7 +226,10 @@ def zoom_raster_tables(doc_output_dir, source_path, api_key, model_name):
 
     client = _client(api_key)
     replaced = 0
+    deadline = time.monotonic() + ZOOM_DOC_BUDGET_SEC if ZOOM_DOC_BUDGET_SEC > 0 else None
     for f in cands:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             im = Image.open(io.BytesIO(f["data"])).convert("RGB")
         except Exception:
@@ -274,7 +287,14 @@ def zoom_raster_tables(doc_output_dir, source_path, api_key, model_name):
             zc = _cellset(z.get("content", ""))
             bi = max(match, key=lambda i: _overlap(_cellset(els[i].get("content", "")), zc), default=None)
             cap = (els[bi].get("caption", "") if bi is not None else "") or z.get("caption", "")
-            newz.append({"type": "table", "content": z.get("content", ""), "caption": cap, "_zoom": True})
+            newz.append({
+                "type": "table",
+                "content": z.get("content", ""),
+                "caption": cap,
+                "_zoom": True,
+                "_source": "zoom_table",
+                "_confidence": 0.88,
+            })
         pdata[pj]["elements"] = ([e for i, e in enumerate(els) if i < pos and i not in mset]
                                  + newz
                                  + [e for i, e in enumerate(els) if i > pos and i not in mset])

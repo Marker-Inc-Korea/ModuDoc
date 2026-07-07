@@ -194,6 +194,37 @@ def validate_and_repair_table(html, caption=None):
         return [{"content": html, "caption": caption}], False, ["validator_error"]
 
 
+def assess_table_quality(html, caption=None):
+    """Return lightweight table quality signals for provenance/confidence metadata."""
+    out = {"confidence": 0.95, "issues": [], "rows": 0, "cols": 0}
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        table = soup.find("table")
+        if table is None:
+            out["confidence"] = 0.0
+            out["issues"].append("no_table")
+            return out
+        rows = _rows_of(table)
+        grid, row_width, R, C = _build_grid(rows)
+        out["rows"], out["cols"] = R, C
+        if not rows:
+            out["confidence"] = 0.2
+            out["issues"].append("empty_table")
+            return out
+        if len(set(row_width)) > 1:
+            out["issues"].append("ragged_rows")
+            out["confidence"] = min(out["confidence"], 0.65)
+        if table.find("th") is not None:
+            out["issues"].append("th_tags_present")
+            out["confidence"] = min(out["confidence"], 0.90)
+
+        return out
+    except Exception:
+        out["confidence"] = 0.4
+        out["issues"].append("quality_check_error")
+        return out
+
+
 # ───────────────────────── HWP 네이티브 표 치환 ─────────────────────────
 # 내용이 일치하는 표를 HWP/HWPX 네이티브 표(rhwp IR TableBlock.html)로 치환.
 # 페이지 분할표는 본문행을 키로 슬라이스해 네이티브 헤더와 합침.

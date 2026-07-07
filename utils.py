@@ -142,6 +142,94 @@ def _korean_ratio(text):
     return (kr / tot) if tot else 0.0
 
 
+def _collapse_compound_repeat_text(text):
+    """Collapse short adjacent duplicate runs such as '참고참고1717' -> '참고17'."""
+    if not isinstance(text, str):
+        return text
+    leading = text[:len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()):]
+    core = text.strip()
+    if not core or len(core) > 40 or re.search(r"\s", core):
+        return text
+    # Whole-string exact repetition: AAAAAA -> A.
+    for n in range(1, min(20, len(core) // 2) + 1):
+        if len(core) % n == 0:
+            unit = core[:n]
+            if unit and unit * (len(core) // n) == core:
+                return leading + unit + trailing
+    # Two adjacent duplicate runs: A A B B -> A B.
+    max_part = min(16, len(core) // 2)
+    for a_len in range(1, max_part + 1):
+        a = core[:a_len]
+        if not core.startswith(a * 2):
+            continue
+        rest = core[a_len * 2:]
+        for b_len in range(1, min(16, len(rest) // 2) + 1):
+            b = rest[:b_len]
+            if b and len(rest) % b_len == 0 and b * (len(rest) // b_len) == rest:
+                return leading + a + b + trailing
+    return text
+
+
+def _mark_element(e, source=None, confidence=None, issues=None):
+    """Attach lightweight provenance/confidence without changing public content fields."""
+    if not isinstance(e, dict):
+        return e
+    if source and not e.get("_source"):
+        e["_source"] = source
+    if confidence is not None and e.get("_confidence") is None:
+        try:
+            e["_confidence"] = round(float(confidence), 3)
+        except (TypeError, ValueError):
+            pass
+    if issues:
+        cur = e.get("_issues")
+        if not isinstance(cur, list):
+            cur = []
+        norm_cur = []
+        for issue in cur:
+            if isinstance(issue, (list, tuple)):
+                issue = ":".join(str(x) for x in issue)
+            elif issue is not None:
+                issue = str(issue)
+            if issue and issue not in norm_cur:
+                norm_cur.append(issue)
+        cur = norm_cur
+        for issue in issues:
+            if isinstance(issue, (list, tuple)):
+                issue = ":".join(str(x) for x in issue)
+            elif issue is not None:
+                issue = str(issue)
+            if issue and issue not in cur:
+                cur.append(issue)
+        if cur:
+            e["_issues"] = cur
+    return e
+
+
+def _collect_provenance_summary(elements):
+    summary = {"sources": {}, "issues": {}, "low_confidence_elements": 0}
+    for e in elements or []:
+        if not isinstance(e, dict):
+            continue
+        src = e.get("_source") or "unknown"
+        summary["sources"][src] = summary["sources"].get(src, 0) + 1
+        try:
+            if float(e.get("_confidence", 1.0)) < 0.75:
+                summary["low_confidence_elements"] += 1
+        except (TypeError, ValueError):
+            pass
+        for issue in e.get("_issues") or []:
+            if isinstance(issue, (list, tuple)):
+                issue = ":".join(str(x) for x in issue)
+            elif issue is not None:
+                issue = str(issue)
+            if not issue:
+                continue
+            summary["issues"][issue] = summary["issues"].get(issue, 0) + 1
+    return summary
+
+
 def _reposition_figures_by_anchor(elements, anchors):
     """figure 를 IR 앵커의 직후 텍스트 앞으로 이동(그림만 이동, 텍스트·표 불변).
     anchors: [{'prev':앞문단, 'next':뒷문단}] 문서순. 매칭 실패 그림은 제자리."""
@@ -225,6 +313,16 @@ def _correct_figure_captions(elements, anchors):
             continue
         prev = (match.get("prev") or "").strip()
         if not _title_like(prev):
+            continue
+        # If the anchor's "next" is already a heading on this page, the
+        # anchor likely spans a page/section boundary. In that case "prev"
+        # belongs to the preceding section/figure and must not be copied as
+        # this figure's caption.
+        nn = _nm(match.get("next"))
+        if nn and any(
+            str(x.get("type", "")).startswith("heading") and _plen(_nm(x.get("content")), nn) >= 6
+            for x in elements if x is not e
+        ):
             continue
         np = _nm(prev)
         if any(np in p or p in np for p in present):
@@ -1872,7 +1970,8 @@ class DocumentProcessor:
             if os.path.exists(generated_temp_pdf): os.remove(generated_temp_pdf)
 
     @classmethod
-    def _render_eml(cls, file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress=None):
+    def _render_eml(cls, file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress=None,
+                    output_format="json"):
         """EML → page_NNNN.png/.txt 연속 시퀀스.
 
         1) 헤더(보낸/받는/제목/일시) + 디코딩된 본문을 한 페이지로 렌더.
@@ -1891,7 +1990,61 @@ class DocumentProcessor:
         state = {"n": 0}
         mat = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
 
-        def _emit_pdf(pdf_path):
+        def _page_number(stem):
+            try:
+                return int(stem.split("_")[1])
+            except (IndexError, ValueError):
+                return 0
+
+        def _write_text_structured(stem, text, low_confidence=False, warning=None):
+            """Write deterministic structure for generated EML text/notice pages.
+
+            These pages are created by this renderer from trusted text, so sending
+            them back through VLM only adds latency and can trigger long repeats.
+            """
+            text = HWPTextExtractor.text_preprocessing((text or "").strip())
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            if not paras and text:
+                paras = [text]
+            elem_source = "eml_notice" if warning else "eml_text"
+            elem_conf = 0.35 if low_confidence else 1.0
+            payload = {
+                "page_number": _page_number(stem),
+                "elements": [
+                    _mark_element({"type": "text", "content": p}, elem_source, elem_conf)
+                    for p in paras
+                ],
+            }
+            if low_confidence:
+                payload["low_confidence"] = True
+            if warning:
+                payload["warning"] = warning
+            raw_json = json.dumps(payload, ensure_ascii=False, indent=4)
+            with open(os.path.join(doc_output_dir, f"{stem}_structured.json"), "w", encoding="utf-8") as fh:
+                fh.write(raw_json)
+            fmt = (output_format or "json").lower()
+            if fmt == "markdown":
+                with open(os.path.join(doc_output_dir, f"{stem}_structured.md"), "w", encoding="utf-8") as fh:
+                    fh.write(cls.json_to_markdown(raw_json))
+            elif fmt == "xml":
+                import html as _html
+                parts = [
+                    "<document>",
+                    f"  <page_number>{payload['page_number']}</page_number>",
+                    "  <elements>",
+                ]
+                for elem in payload["elements"]:
+                    parts.append(f"    <element type=\"text\">{_html.escape(elem.get('content') or '')}</element>")
+                parts.append("  </elements>")
+                if low_confidence:
+                    parts.append("  <low_confidence>true</low_confidence>")
+                if warning:
+                    parts.append(f"  <warning>{_html.escape(warning)}</warning>")
+                parts.append("</document>")
+                with open(os.path.join(doc_output_dir, f"{stem}_structured.xml"), "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(parts))
+
+        def _emit_pdf(pdf_path, direct_structured=False):
             try:
                 d = fitz.open(pdf_path)
             except Exception as e:
@@ -1903,17 +2056,27 @@ class DocumentProcessor:
                     pnum = str(state["n"]).zfill(4)
                     d[i].get_pixmap(matrix=mat).save(os.path.join(doc_output_dir, f"page_{pnum}.png"))
                     raw = d[i].get_text().strip()
+                    cleaned = HWPTextExtractor.text_preprocessing(raw)
                     with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
-                        fh.write(HWPTextExtractor.text_preprocessing(raw))
+                        fh.write(cleaned)
+                    if direct_structured:
+                        _write_text_structured(f"page_{pnum}", cleaned)
             finally:
                 d.close()
 
-        def _emit_image(im, hint=""):
+        def _emit_image(im, hint="", direct_structured=False, low_confidence=False, warning=None):
             state["n"] += 1
             pnum = str(state["n"]).zfill(4)
             im.save(os.path.join(doc_output_dir, f"page_{pnum}.png"), "PNG")
             with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
                 fh.write(hint)
+            if direct_structured:
+                _write_text_structured(
+                    f"page_{pnum}",
+                    hint,
+                    low_confidence=low_confidence,
+                    warning=warning,
+                )
 
         def _emit_notice(lines):
             """첨부를 렌더할 수 없을 때(DRM·실패) 가시적 마커 페이지를 한 장 생성.
@@ -1933,7 +2096,13 @@ class DocumentProcessor:
                 for i, ln in enumerate(lines):
                     dr.text((110, y), ln, font=(fb if i == 0 else fr), fill=(150, 30, 30) if i == 0 else (40, 40, 40))
                     y += 70
-                _emit_image(im, hint="\n".join(lines))
+                _emit_image(
+                    im,
+                    hint="\n".join(lines),
+                    direct_structured=True,
+                    low_confidence=True,
+                    warning="렌더 불가 첨부 — 원본 확인 필요.",
+                )
             except Exception:
                 # PIL 실패시 텍스트 페이지라도 남김
                 state["n"] += 1
@@ -1941,6 +2110,12 @@ class DocumentProcessor:
                 open(os.path.join(doc_output_dir, f"page_{pnum}.png"), "wb").close()
                 with open(os.path.join(doc_output_dir, f"page_{pnum}.txt"), "w", encoding="utf-8") as fh:
                     fh.write("\n".join(lines))
+                _write_text_structured(
+                    f"page_{pnum}",
+                    "\n".join(lines),
+                    low_confidence=True,
+                    warning="렌더 불가 첨부 — 원본 확인 필요.",
+                )
 
         def _is_drm_hwp(buf):
             """HWP 페이로드가 DRM/문서보안 래퍼(DOCUMENTSAFER·Fasoo·MarkAny 등)로 잠겼는지 시그니처로 판별."""
@@ -1995,7 +2170,7 @@ class DocumentProcessor:
             fh.write(cover_html)
         body_pdf = cls.convert_to_pdf(cover_html_path, temp_pdf_dir)
         if body_pdf and os.path.exists(body_pdf):
-            _emit_pdf(body_pdf)
+            _emit_pdf(body_pdf, direct_structured=True)
             try: os.remove(body_pdf)
             except OSError: pass
         else:
@@ -2403,7 +2578,9 @@ class DocumentProcessor:
         elif ext == '.eml':
             set_progress("EML 파싱 중 (본문 디코딩 + 첨부 렌더)...", 5)
             try:
-                n_eml = cls._render_eml(file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress)
+                n_eml = cls._render_eml(
+                    file_path, doc_output_dir, temp_pdf_dir, api_key, model_name, set_progress,
+                    output_format=output_format)
             except Exception as e:
                 raise Exception(f"EML 처리 실패: {e}")
             set_progress(f"EML 파싱 완료 ({n_eml}쪽)", 20)
@@ -2590,8 +2767,7 @@ class DocumentProcessor:
                     if len(core) < 8:
                         png = os.path.join(doc_output_dir, f"{stem}.png")
                         if _image_has_ink(png):
-                            deduped.insert(0, {"type": "text", "content":
-                                "⚠ 자동 추출 불완전 — 이 페이지는 이미지(표·도해·캡처)로 구성되어 본문이 거의 추출되지 않았습니다. 원본 확인 필요."})
+                            parsed["warning"] = "자동 추출 불완전 — 이 페이지는 이미지(표·도해·캡처)로 구성되어 본문이 거의 추출되지 않았습니다. 원본 확인 필요."
                             parsed["low_confidence"] = True
                             try: low_conf_pages.append(int(stem.split("_")[1]))
                             except (IndexError, ValueError): low_conf_pages.append(stem)
@@ -2614,7 +2790,11 @@ class DocumentProcessor:
                                 _nh = (table_validate.native_substitute(e["content"], _native_prep)
                                        if _native_prep else None)
                                 if _nh and _nh.strip() and "</table>" in _nh:
-                                    rebuilt.append({**e, "content": _nh, "_native": True})
+                                    q = table_validate.assess_table_quality(_nh, e.get("caption"))
+                                    rebuilt.append(_mark_element(
+                                        {**e, "content": _nh, "_native": True},
+                                        "native_table", min(0.99, q.get("confidence", 0.99)),
+                                        q.get("issues")))
                                     continue
                                 new_els, _retry, _iss = table_validate.validate_and_repair_table(
                                     e["content"], e.get("caption"))
@@ -2622,6 +2802,11 @@ class DocumentProcessor:
                                     m = {**e, "content": ne["content"]}
                                     if ne.get("caption") is not None:
                                         m["caption"] = ne["caption"]
+                                    q = table_validate.assess_table_quality(m.get("content"), m.get("caption"))
+                                    src = "vlm_table_repaired" if _iss else "vlm_table"
+                                    conf = min(q.get("confidence", 0.85), 0.80 if _iss else 0.88)
+                                    issues = list(_iss or []) + list(q.get("issues") or [])
+                                    _mark_element(m, src, conf, issues)
                                     rebuilt.append(m)
                             else:
                                 rebuilt.append(e)
@@ -2671,6 +2856,25 @@ class DocumentProcessor:
                             deduped = _reposition_figures_by_anchor(deduped, _anchors)
                     except Exception as re_e:
                         logger.warning(f"figure 교정 실패({stem}): {re_e}")
+                    # Short VLM title/header duplicates such as "참고참고1717" are
+                    # mechanical repeats, not meaningful document text.
+                    for e in deduped:
+                        et = e.get("type", "text")
+                        for key in ("content", "caption"):
+                            val = e.get(key)
+                            if val and (key == "caption" or et.startswith(("text", "heading", "toc"))):
+                                e[key] = _collapse_compound_repeat_text(val)
+                        if not e.get("_source"):
+                            if e.get("salvaged"):
+                                _mark_element(e, "hwp_embedded_figure", 0.78)
+                            elif e.get("_zoom"):
+                                _mark_element(e, "zoom_table", 0.88)
+                            elif et == "figure":
+                                _mark_element(e, "vlm_figure", 0.82)
+                            elif et == "table":
+                                _mark_element(e, "vlm_table", 0.85)
+                            else:
+                                _mark_element(e, "vlm_page", 0.88)
                     # PII 마스킹(사용자 지정 타입만; 기본 OFF)
                     if PII_MASK_TYPES:
                         for e in deduped:
@@ -2751,6 +2955,7 @@ class DocumentProcessor:
         # 처리 대상(이미 처리된 XLSX 하이브리드 페이지 제외)
         pending = [tf[:-4] for tf in page_files
                    if not os.path.exists(os.path.join(doc_output_dir, f"{tf[:-4]}_structured.json"))]
+        total_vlm_analyzed_pages = len(pending)
 
         def _run_page(stem):
             # 예산 초과면(제출됐어도) 즉시 폴백 처리
@@ -2765,35 +2970,38 @@ class DocumentProcessor:
         n_pending = len(pending)
         workers = max(1, min(VLM_PAGE_CONCURRENCY, n_pending or 1))
         done_cnt = 0
-        set_progress(f"⏳ AI 모델 분석 중... (0/{n_pending} 쪽, 동시 {workers})", 25)
-        with ThreadPoolExecutor(max_workers=workers) as _ex:
-            _futs = {_ex.submit(_run_page, s): s for s in pending}
-            for fut in as_completed(_futs):
-                stem = _futs[fut]
-                done_cnt += 1
-                try:
-                    ok, retryable, skipped = fut.result()
-                except Exception as e:   # 워커 예외(파일쓰기 등)가 문서 전체를 날리지 않게 페이지 단위 격리
-                    logger.warning(f"{stem} 페이지 워커 예외: {e}")
-                    ok, retryable, skipped = False, False, False
-                done_pct = 25 + int((done_cnt / max(n_pending, 1)) * 75)
-                if skipped:
-                    if not budget_exceeded:
-                        logger.error(f"문서 VLM 시간예산({DOC_VLM_BUDGET_SEC}s) 초과 — 남은 페이지는 텍스트 폴백")
-                    budget_exceeded = True
-                    try: failed_pages.append(int(stem.split("_")[-1]))
-                    except ValueError: failed_pages.append(stem)
-                    continue
-                if ok:
-                    set_progress(f"✅ {done_cnt}/{n_pending}쪽 분석 완료", done_pct)
-                else:
+        if n_pending == 0:
+            set_progress("⏭️ VLM 구조추출 대상 페이지 없음", 95)
+        else:
+            set_progress(f"⏳ AI 모델 분석 중... (0/{n_pending} 쪽, 동시 {workers})", 25)
+            with ThreadPoolExecutor(max_workers=workers) as _ex:
+                _futs = {_ex.submit(_run_page, s): s for s in pending}
+                for fut in as_completed(_futs):
+                    stem = _futs[fut]
+                    done_cnt += 1
                     try:
-                        pn = int(stem.split("_")[-1]); failed_pages.append(pn)
-                        if retryable: retry_eligible.add(pn)
-                    except ValueError:
-                        failed_pages.append(stem)
-                    logger.warning(f"{stem} AI 분석 실패 ({'최종 재시도 대상' if retryable else '재시도 무의미'})")
-                    set_progress(f"⚠️ {stem} 분석 실패", done_pct)
+                        ok, retryable, skipped = fut.result()
+                    except Exception as e:   # 워커 예외(파일쓰기 등)가 문서 전체를 날리지 않게 페이지 단위 격리
+                        logger.warning(f"{stem} 페이지 워커 예외: {e}")
+                        ok, retryable, skipped = False, False, False
+                    done_pct = 25 + int((done_cnt / max(n_pending, 1)) * 75)
+                    if skipped:
+                        if not budget_exceeded:
+                            logger.error(f"문서 VLM 시간예산({DOC_VLM_BUDGET_SEC}s) 초과 — 남은 페이지는 텍스트 폴백")
+                        budget_exceeded = True
+                        try: failed_pages.append(int(stem.split("_")[-1]))
+                        except ValueError: failed_pages.append(stem)
+                        continue
+                    if ok:
+                        set_progress(f"✅ {done_cnt}/{n_pending}쪽 분석 완료", done_pct)
+                    else:
+                        try:
+                            pn = int(stem.split("_")[-1]); failed_pages.append(pn)
+                            if retryable: retry_eligible.add(pn)
+                        except ValueError:
+                            failed_pages.append(stem)
+                        logger.warning(f"{stem} AI 분석 실패 ({'최종 재시도 대상' if retryable else '재시도 무의미'})")
+                        set_progress(f"⚠️ {stem} 분석 실패", done_pct)
 
         # 최종 재시도: 부하가 빠진 뒤 '일시적' 실패 페이지만 1회 더 시도해 복구한다.
         # 반복 생성·타임아웃·유효성 실패(retry_eligible 아님)는 동일 입력 재시도가 무의미하므로 제외(런어웨이 방지).
@@ -2820,17 +3028,46 @@ class DocumentProcessor:
             except (IndexError, ValueError):
                 return 0
 
+        def _clean_fallback_text(raw):
+            def _collapse_unit(s):
+                t = s.strip()
+                if not t:
+                    return s
+                max_unit = min(40, len(t) // 2)
+                for n in range(1, max_unit + 1):
+                    if len(t) % n == 0:
+                        unit = t[:n]
+                        if unit and unit * (len(t) // n) == t:
+                            return s[:len(s) - len(s.lstrip())] + unit + s[len(s.rstrip()):]
+                return s
+
+            cleaned = []
+            prev = None
+            for line in (raw or "").splitlines():
+                line = _collapse_unit(line)
+                key = re.sub(r"\s+", "", line)
+                if key and key == prev:
+                    continue
+                cleaned.append(line)
+                prev = key if key else None
+            return "\n".join(cleaned).strip()
+
         def _fallback_payload(stem):
             tp = os.path.join(doc_output_dir, f"{stem}.txt")
             raw = ""
             if os.path.exists(tp):
                 with open(tp, "r", encoding="utf-8") as f:
                     raw = f.read().strip()
+            raw = _clean_fallback_text(raw)
             paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()] or ([raw] if raw else [])
-            els = [{"type": "text", "content": p} for p in paras]
-            els.insert(0, {"type": "text", "content":
-                           "⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장."})
-            return raw, {"page_number": _page_num_from_stem(stem), "elements": els, "low_confidence": True}
+            els = [_mark_element({"type": "text", "content": p}, "text_layer_fallback", 0.45)
+                   for p in paras]
+            return raw, {
+                "page_number": _page_num_from_stem(stem),
+                "elements": els,
+                "low_confidence": True,
+                "warning": "구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장.",
+            }
 
         def _write_fallback_page(stem):
             raw, payload = _fallback_payload(stem)
@@ -2843,12 +3080,16 @@ class DocumentProcessor:
                     "<document>",
                     f"  <page_number>{pn}</page_number>",
                     "  <elements>",
-                    "    <element type=\"text\">⚠ 구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장.</element>",
                 ]
                 paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()] or ([raw] if raw else [])
                 for para in paras:
                     parts.append(f"    <element type=\"text\">{_html.escape(para)}</element>")
-                parts.extend(["  </elements>", "  <low_confidence>true</low_confidence>", "</document>"])
+                parts.extend([
+                    "  </elements>",
+                    "  <low_confidence>true</low_confidence>",
+                    "  <warning>구조추출 미완 — 텍스트레이어 기반 폴백(레이아웃·표 구조 없음). 원본 확인 권장.</warning>",
+                    "</document>",
+                ])
                 with open(os.path.join(doc_output_dir, f"{stem}_structured.xml"), "w", encoding="utf-8") as f:
                     f.write("\n".join(parts))
             else:
@@ -2955,7 +3196,8 @@ class DocumentProcessor:
                             "anchor": fobj.get("anchor", ""),
                             "element": {"type": "figure", "content": "", "caption": "",
                                         "description": desc, "image": f"figures/{fname}",
-                                        "salvaged": True, "para_index": fobj["para_index"]},
+                                        "salvaged": True, "para_index": fobj["para_index"],
+                                        "_source": "hwp_embedded_figure", "_confidence": 0.78},
                         })
                     with open(os.path.join(doc_output_dir, "figures.json"), "w", encoding="utf-8") as ff:
                         json.dump(records, ff, ensure_ascii=False, indent=2)
@@ -3020,6 +3262,29 @@ class DocumentProcessor:
             except Exception:
                 metadata = {}
             metadata["vlm_pages_total"] = total_vlm_pages
+            metadata["vlm_pages_analyzed"] = total_vlm_analyzed_pages
+            provenance_totals = {"sources": {}, "issues": {}, "low_confidence_elements": 0}
+            if output_format.lower() in ("json", "markdown"):
+                for fname in sorted(f for f in os.listdir(doc_output_dir) if f.endswith("_structured.json")):
+                    fpath = os.path.join(doc_output_dir, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            pdata = json.load(f)
+                    except Exception:
+                        continue
+                    if pdata.get("low_confidence"):
+                        stem = fname[:-len("_structured.json")]
+                        try:
+                            low_conf_pages.append(int(stem.split("_")[1]))
+                        except (IndexError, ValueError):
+                            low_conf_pages.append(stem)
+                    ps = _collect_provenance_summary(pdata.get("elements", []))
+                    provenance_totals["low_confidence_elements"] += ps["low_confidence_elements"]
+                    for k, v in ps["sources"].items():
+                        provenance_totals["sources"][k] = provenance_totals["sources"].get(k, 0) + v
+                    for k, v in ps["issues"].items():
+                        provenance_totals["issues"][k] = provenance_totals["issues"].get(k, 0) + v
+            metadata["provenance_summary"] = provenance_totals
             failed_pages = _unique_page_list(failed_pages)
             low_conf_pages = _unique_page_list(low_conf_pages)
             metadata["vlm_failed_pages"] = failed_pages

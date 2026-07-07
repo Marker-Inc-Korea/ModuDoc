@@ -1,0 +1,26 @@
+{
+  "documents": {
+    "regex:sample-document-name": {
+      "pages": {
+        "1": {
+          "required_text": ["expected visible text"],
+          "forbidden_text": ["known hallucination"],
+          "min_elements": 1,
+          "allow_low_confidence": false,
+          "required_element_types": {
+            "table": 1
+          },
+          "tables": [
+            {
+              "caption_contains": "table title",
+              "min_rows": 2,
+              "min_cols": 2,
+              "forbidden_issues": ["ragged_rows"],
+              "min_confidence": 0.75
+            }
+          ]
+        }
+      }
+    }
+  }
+}
