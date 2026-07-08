@@ -33,6 +33,10 @@ VLM_COVERAGE_REPAIR = os.environ.get("VLM_COVERAGE_REPAIR", "1") == "1"   # veri
 VLM_COVERAGE_REPAIR_TIMEOUT = int(os.environ.get("VLM_COVERAGE_REPAIR_TIMEOUT", "300"))
 VLM_COVERAGE_REPAIR_MAX_TOKENS = max(512, int(os.environ.get("VLM_COVERAGE_REPAIR_MAX_TOKENS", str(VLM_MAX_TOKENS))))
 VLM_COVERAGE_REPAIR_IMG_MAXW = max(768, int(os.environ.get("VLM_COVERAGE_REPAIR_IMG_MAXW", "1600")))
+VLM_COMPACT_RETRY = os.environ.get("VLM_COMPACT_RETRY", "1") == "1"       # 반복/타임아웃 페이지를 간결 모드로 1회 구조화
+VLM_COMPACT_RETRY_TIMEOUT = int(os.environ.get("VLM_COMPACT_RETRY_TIMEOUT", "240"))
+VLM_COMPACT_RETRY_MAX_TOKENS = max(512, int(os.environ.get("VLM_COMPACT_RETRY_MAX_TOKENS", "2048")))
+VLM_COMPACT_RETRY_IMG_MAXW = max(768, int(os.environ.get("VLM_COMPACT_RETRY_IMG_MAXW", "1400")))
 DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
 VLM_PAGE_CONCURRENCY = max(1, int(os.environ.get("VLM_PAGE_CONCURRENCY", "16")))  # 페이지 동시 추출 수(vLLM 배칭으로 가속)
 # VLM 입력 이미지 폭 상한(px). 기본 2464(28의 배수) — 300DPI 렌더와 짝, 나란히 표 분리에 필요.
@@ -1185,6 +1189,71 @@ For TOC pages: output "목차/목 차" as a heading, every row with a visible pa
                 logger.warning(f"coverage repair 실패: {e}")
                 return None, f"coverage repair error: {e}"
 
+        def _compact_visual_retry(reason):
+            """Recovery path for chart/figure-heavy pages that trigger long generation."""
+            if not VLM_COMPACT_RETRY or output_format.lower() != "json":
+                return None, "compact retry disabled"
+            if not img_path or not os.path.exists(img_path):
+                return None, "compact retry needs page image"
+            try:
+                compact_system = """You are a document parsing recovery model.
+Return ONLY compact valid JSON with this schema:
+{"page_number": int, "elements": [{"type": "heading_1|heading_2|heading_3|text|table|figure|footnote|toc_entry", "content": "...", "caption": "", "description": ""}]}
+
+Rules:
+- Preserve the visible reading order.
+- Extract headings and body/list text exactly enough for retrieval.
+- For charts, graphs, maps, screenshots, or photos: output ONE figure element with a short Korean description.
+- Do NOT transcribe every chart axis tick, every plotted point, or dense UI/chart micro-label. Put only key visible labels in content if useful.
+- Use table only for real bordered tables. Do not invent table structure.
+- Output no markdown fences and no commentary."""
+                compact_user = (
+                    f"Previous full extraction failed because: {reason}\n\n"
+                    "Raw text layer, if useful for exact spelling:\n"
+                    "<raw_text>\n"
+                    f"{_clip_prompt_text(extracted_text, 12000)}\n"
+                    "</raw_text>\n\n"
+                    "Re-extract this page compactly from the image."
+                )
+                b64 = cls.encode_image(img_path, max_width=VLM_COMPACT_RETRY_IMG_MAXW)
+                with _VLM_SEMAPHORE:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": compact_system},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": compact_user},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            ]},
+                        ],
+                        temperature=0,
+                        max_tokens=VLM_COMPACT_RETRY_MAX_TOKENS,
+                        timeout=VLM_COMPACT_RETRY_TIMEOUT,
+                        extra_body={"repetition_penalty": max(VLM_REP_PENALTY_HI, 1.08), "no_repeat_ngram_size": 16},
+                    )
+                finish = _vlm_finish_reason(response)
+                if finish == "length":
+                    return None, "compact retry truncated"
+                text = _strip_fences(response.choices[0].message.content or "")
+                try:
+                    parsed, _ = json.JSONDecoder().raw_decode(text)
+                except json.JSONDecodeError:
+                    text = _sanitize_json_strings(text)
+                    parsed, _ = json.JSONDecoder().raw_decode(text)
+                if isinstance(parsed, list):
+                    parsed = {"page_number": 0, "elements": parsed}
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("elements"), list) or not parsed.get("elements"):
+                    return None, "compact retry returned empty elements"
+                for elem in parsed.get("elements", []):
+                    if isinstance(elem, dict) and elem.get("type") not in {
+                        "heading_1", "heading_2", "heading_3", "text", "table", "figure", "footnote", "toc_entry"
+                    }:
+                        elem["type"] = "text"
+                return json.dumps(parsed, ensure_ascii=False), "compact retry generated"
+            except Exception as e:
+                logger.warning(f"compact visual retry 실패: {e}")
+                return None, f"compact retry error: {e}"
+
         N = VLM_MAX_ATTEMPTS
         best_result, best_cov = None, -1.0   # 최고 coverage 후보 — 재시도가 결과를 악화시키지 못하게
         escalated = False                     # 루프/타임아웃 의심 시 1회 한정 고온 탈출
@@ -1297,6 +1366,12 @@ For TOC pages: output "목차/목 차" as a heading, every row with a visible pa
                     low_coverage = bool(in_clean and cov < 0.7)
                     if truncated or low_coverage:
                         why = "출력 미완(length)" if truncated else f"내용 부족(cov={cov:.2f})"
+                        if truncated and escalated:
+                            compact, compact_reason = _compact_visual_retry(why)
+                            if compact:
+                                logger.info(f"{why} — compact visual retry 통과: {compact_reason}")
+                                return compact, True
+                            logger.warning(f"{why} — compact visual retry 실패: {compact_reason}")
                         if not last:
                             logger.warning(f"{why} (시도 {attempt+1}/{N}) — 재시도")
                             # 미완(length) → 1회 escalated 전환.
@@ -1345,6 +1420,12 @@ For TOC pages: output "목차/목 차" as a heading, every row with a visible pa
             except _APITimeout as e:
                 # 타임아웃: 일시적 오류와 분리해 1회만 고온 재시도 후 중단
                 logger.warning(f"VLM 타임아웃 (시도 {attempt+1}/{N}): {e} — 반복 생성 의심")
+                if escalated:
+                    compact, compact_reason = _compact_visual_retry(f"timeout after escalated retry: {e}")
+                    if compact:
+                        logger.info(f"VLM 타임아웃 — compact visual retry 통과: {compact_reason}")
+                        return compact, True
+                    logger.warning(f"VLM 타임아웃 — compact visual retry 실패: {compact_reason}")
                 if not escalated and not last:
                     escalated = True
                     continue

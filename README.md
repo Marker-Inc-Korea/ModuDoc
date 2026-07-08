@@ -139,6 +139,9 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `RENDER_DPI` | `300` | 페이지 렌더 해상도(**PDF 포함 전 포맷**). 높을수록 나란히 붙은 표·조밀한 표를 정확히 분리하나 VLM 토큰/시간이 늘어남 |
 | `VLM_IMG_MAXW` | `2464` | VLM 입력 이미지 최대 폭(px, 28의 배수). `RENDER_DPI` 와 짝 — 이 값이 렌더 폭보다 작으면 다운스케일돼 표 분리 효과가 줄어듦 |
 | `VLM_IMG_MAXW_FALLBACK` | `1024` | 반복 폭주/타임아웃 재시도 시 낮추는 폴백 폭 |
+| `VLM_COMPACT_RETRY` | `1` | 반복 생성/타임아웃 페이지를 차트·그림 간결 모드로 1회 재추출. 차트 축값 전체 전사 대신 figure 요약+본문 추출로 런어웨이를 회피 |
+| `VLM_COMPACT_RETRY_MAX_TOKENS` | `2048` | compact retry 응답 토큰 상한 |
+| `VLM_COMPACT_RETRY_TIMEOUT` | `240` | compact retry 호출 타임아웃(초) |
 | `ZOOM_RASTER_TABLES` | `1` | HWP/HWPX 임베디드 raster 표를 확대 재추출해 오구조를 수리(`0` 으로 끄기). VLM 심판이 승인할 때만 교체 |
 | `ZOOM_VLM_MAX_TOKENS` | `4096` | raster 표 zoom-pass 재추출 응답 토큰 상한. 큰 값을 쓰면 복잡한 표를 더 잘 살릴 수 있지만 장시간 생성 위험이 커짐 |
 | `ZOOM_VLM_TIMEOUT` | `180` | raster 표 zoom-pass 재추출 VLM 호출 타임아웃(초) |
