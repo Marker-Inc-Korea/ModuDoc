@@ -107,10 +107,13 @@
             <div id="finalActions" class="hidden mt-6 space-y-3">
                 <div id="finalMessage" class="p-4 rounded-lg text-center font-bold"></div>
                 
-                <div class="grid grid-cols-2 gap-3">
+                <div class="grid grid-cols-3 gap-3">
                     <button id="previewBtn" class="w-full text-center text-gray-700 bg-gray-100 hover:bg-gray-200 border border-gray-300 font-medium rounded-lg text-lg px-5 py-3 transition shadow-sm">
                         👀 결과 미리보기
                     </button>
+                    <a id="compareBtn" href="/compare" class="block w-full text-center text-gray-700 bg-gray-100 hover:bg-gray-200 border border-gray-300 font-medium rounded-lg text-lg px-5 py-3 transition shadow-sm">
+                        원본 비교
+                    </a>
                     <a id="downloadBtn" href="#" class="block w-full text-center text-white bg-green-600 hover:bg-green-700 font-medium rounded-lg text-lg px-5 py-3 transition shadow-sm">
                         ⬇️ 파일 다운로드 (ZIP)
                     </a>
@@ -143,6 +146,7 @@
         const finalActions = document.getElementById('finalActions');
         const finalMessage = document.getElementById('finalMessage');
         const downloadBtn = document.getElementById('downloadBtn');
+        const compareBtn = document.getElementById('compareBtn');
         
         // 뷰어 관련 요소
         const previewBtn = document.getElementById('previewBtn');
@@ -287,17 +291,20 @@
                             finalMessage.textContent = `❌ 오류 발생: ${progData.error}`;
                             downloadBtn.classList.add('hidden');
                             previewBtn.classList.add('hidden');
+                            compareBtn.classList.add('hidden');
                         } else if (progData.warnings && progData.warnings.length) {
                             finalMessage.className = "p-4 rounded-lg text-center font-bold bg-yellow-100 text-yellow-800";
                             finalMessage.textContent = `⚠ 일부 작업 실패: ${progData.warnings.join(' / ')}`;
                             downloadBtn.classList.remove('hidden');
                             previewBtn.classList.remove('hidden');
+                            compareBtn.classList.remove('hidden');
                             downloadBtn.href = `/api/download/${currentTaskId}`;
                         } else {
                             finalMessage.className = "p-4 rounded-lg text-center font-bold bg-green-100 text-green-800";
                             finalMessage.textContent = `✅ 변환이 모두 완료되었습니다!`;
                             downloadBtn.classList.remove('hidden');
                             previewBtn.classList.remove('hidden');
+                            compareBtn.classList.remove('hidden');
                             downloadBtn.href = `/api/download/${currentTaskId}`;
                         }
                         

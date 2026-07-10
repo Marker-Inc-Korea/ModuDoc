@@ -8,168 +8,378 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/atom-one-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
     <style>
-        /* 파싱된 표 가독성(추출 HTML 표엔 클래스가 없어 전역 스타일로 처리) */
-        #parsed table { border-collapse: collapse; width: 100%; margin: .5rem 0; font-size: .8rem; }
+        html, body { height: 100%; }
+        #parsed table { border-collapse: collapse; width: 100%; margin: .4rem 0; font-size: .78rem; }
         #parsed td, #parsed th { border: 1px solid #d1d5db; padding: 4px 7px; vertical-align: top; }
-        #parsed th { background: #f3f4f6; font-weight: 600; }
-        #parsed { line-height: 1.6; }
-        .el { scroll-margin-top: .5rem; }
+        #parsed th { background: #f3f4f6; font-weight: 700; }
+        #parsed mark { background: #fef08a; color: #111827; padding: 0 .1rem; border-radius: .15rem; }
+        .page-chip { width: 2.35rem; height: 2rem; }
+        .element-block { scroll-margin-top: .75rem; }
+        .source-image { max-width: none; transform-origin: top left; }
     </style>
 </head>
-<body class="bg-gray-50 text-gray-800 flex h-screen overflow-hidden">
-
+<body class="bg-gray-50 text-gray-900 flex h-screen overflow-hidden">
     <aside class="w-64 bg-gray-900 text-white flex flex-col flex-shrink-0">
-        <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">🤖 ModuDoc</div>
+        <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">ModuDoc</div>
         <nav class="flex-1 p-4 space-y-2">
             <a href="/" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">새 변환 작업</a>
             <a href="/history" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">변환 이력</a>
             <a href="/compare" class="block py-2.5 px-4 rounded transition bg-gray-800">원본 비교 뷰어</a>
         </nav>
-        <div class="p-4 text-xs text-gray-500 border-t border-gray-700">원본 페이지와 파싱 결과를 나란히 비교합니다.</div>
     </aside>
 
-    <main class="flex-1 flex flex-col overflow-hidden">
-        <!-- 상단 컨트롤 -->
-        <header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-4 flex-wrap flex-shrink-0">
-            <div class="flex items-center gap-2">
-                <label class="text-sm font-medium text-gray-600">문서</label>
-                <select id="docSelect" class="border border-gray-300 rounded-lg p-2 text-sm min-w-[18rem] focus:ring-blue-500"></select>
+    <main class="flex-1 grid grid-cols-[19rem_minmax(0,1fr)] overflow-hidden">
+        <section class="bg-white border-r border-gray-200 flex flex-col min-w-0">
+            <div class="px-4 py-3 border-b border-gray-200">
+                <div class="text-sm font-semibold text-gray-900">문서</div>
+                <div id="docCount" class="text-xs text-gray-500 mt-0.5">-</div>
             </div>
-            <div class="flex items-center gap-2 ml-auto">
-                <button id="prevBtn" class="px-3 py-1.5 rounded-lg border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">◀ 이전</button>
-                <span id="pageInfo" class="text-sm text-gray-600 tabular-nums min-w-[5rem] text-center">– / –</span>
-                <button id="nextBtn" class="px-3 py-1.5 rounded-lg border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">다음 ▶</button>
-            </div>
-            <label class="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer">
-                <input type="checkbox" id="jsonToggle" class="w-4 h-4 rounded text-blue-600"> 원본 JSON 보기
-            </label>
-        </header>
-
-        <!-- 메타/청크 배지 -->
-        <div id="metaBar" class="bg-gray-50 border-b border-gray-200 px-6 py-2 text-xs text-gray-500 hidden"></div>
-
-        <!-- 2단 비교 -->
-        <section class="flex-1 grid grid-cols-2 overflow-hidden">
-            <!-- 좌: 원본 -->
-            <div class="overflow-auto bg-gray-100 border-r border-gray-200 p-4 flex flex-col items-center">
-                <div class="text-xs font-semibold text-gray-500 mb-2 self-start sticky top-0">📄 원본 페이지</div>
-                <img id="pageImg" class="max-w-full shadow border border-gray-300 bg-white" alt="원본 페이지">
-                <div id="noImg" class="text-sm text-gray-400 mt-10 hidden">이 페이지의 원본 이미지가 없습니다.</div>
-            </div>
-            <!-- 우: 파싱 결과 -->
-            <div class="overflow-auto bg-white p-6">
-                <div class="text-xs font-semibold text-gray-500 mb-3">🧩 파싱 결과</div>
-                <div id="parsed" class="text-sm"></div>
-                <pre id="rawJson" class="hidden text-xs rounded-lg overflow-x-auto"><code class="language-json"></code></pre>
+            <div id="docList" class="flex-1 overflow-y-auto p-3 space-y-2"></div>
+            <div id="emptyDocs" class="hidden flex-1 items-center justify-center text-sm text-gray-500 px-6 text-center">
+                처리된 문서가 없습니다.
             </div>
         </section>
-        <div id="empty" class="flex-1 flex items-center justify-center text-gray-400 text-sm hidden">
-            처리된 문서가 없습니다. 먼저 <a href="/" class="text-blue-600 underline mx-1">새 변환 작업</a>에서 문서를 변환하세요.
-        </div>
+
+        <section class="flex flex-col min-w-0 overflow-hidden">
+            <header class="bg-white border-b border-gray-200 px-5 py-3 flex items-center gap-3 flex-wrap">
+                <div class="min-w-0 mr-auto">
+                    <h1 id="docTitle" class="text-base font-semibold text-gray-950 truncate">원본 비교 뷰어</h1>
+                    <div id="docMeta" class="text-xs text-gray-500 truncate mt-0.5"></div>
+                </div>
+
+                <div class="flex items-center gap-2">
+                    <button id="prevBtn" class="px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">이전</button>
+                    <input id="pageInput" type="number" min="1" class="w-20 px-2 py-2 border border-gray-300 rounded text-sm text-center tabular-nums">
+                    <span id="pageTotal" class="text-sm text-gray-500 tabular-nums">/ -</span>
+                    <button id="nextBtn" class="px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">다음</button>
+                </div>
+
+                <select id="pageFilter" class="px-3 py-2 border border-gray-300 rounded text-sm bg-white">
+                    <option value="all">전체 페이지</option>
+                    <option value="flagged">점검 필요</option>
+                    <option value="tables">표 포함</option>
+                    <option value="figures">그림 포함</option>
+                    <option value="low">저신뢰</option>
+                    <option value="missing">원본 이미지 없음</option>
+                </select>
+            </header>
+
+            <div id="summaryBar" class="bg-gray-50 border-b border-gray-200 px-5 py-2 flex items-center gap-2 overflow-x-auto text-xs"></div>
+            <div id="pageStrip" class="bg-white border-b border-gray-200 px-4 py-2 flex gap-1 overflow-x-auto"></div>
+
+            <div class="flex-1 grid grid-cols-2 min-h-0 overflow-hidden">
+                <section class="bg-gray-100 border-r border-gray-200 flex flex-col min-w-0">
+                    <div class="h-12 px-4 border-b border-gray-200 bg-white flex items-center gap-3">
+                        <div class="font-semibold text-sm mr-auto">원본 페이지</div>
+                        <button id="fitBtn" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">맞춤</button>
+                        <input id="zoomRange" type="range" min="60" max="220" value="100" class="w-32">
+                        <span id="zoomLabel" class="text-xs text-gray-500 w-11 text-right tabular-nums">100%</span>
+                        <a id="openImageBtn" href="#" target="_blank" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">열기</a>
+                    </div>
+                    <div id="imagePane" class="flex-1 overflow-auto p-4">
+                        <img id="pageImg" class="source-image bg-white border border-gray-300 shadow-sm" alt="원본 페이지">
+                        <div id="noImg" class="hidden h-full items-center justify-center text-sm text-gray-500">원본 이미지 없음</div>
+                    </div>
+                </section>
+
+                <section class="bg-white flex flex-col min-w-0">
+                    <div class="h-12 px-4 border-b border-gray-200 flex items-center gap-3">
+                        <div class="font-semibold text-sm whitespace-nowrap mr-auto">파싱 결과</div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <input id="searchBox" type="search" placeholder="결과 검색" class="w-44 px-2.5 py-1.5 border border-gray-300 rounded text-sm">
+                            <div class="inline-flex rounded border border-gray-300 overflow-hidden">
+                                <button id="renderBtn" class="px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap">렌더링</button>
+                                <button id="jsonBtn" class="px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap">JSON</button>
+                            </div>
+                            <button id="copyJsonBtn" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100 whitespace-nowrap">복사</button>
+                        </div>
+                    </div>
+                    <div id="pageBadges" class="px-4 py-2 border-b border-gray-200 flex items-center gap-1 overflow-x-auto text-xs"></div>
+                    <div id="parsedPane" class="flex-1 overflow-auto">
+                        <div id="parsed" class="p-5 text-sm leading-6"></div>
+                        <pre id="rawJson" class="hidden h-full m-0 rounded-none overflow-auto"><code class="language-json text-xs"></code></pre>
+                    </div>
+                </section>
+            </div>
+        </section>
     </main>
 
 <script>
-const $ = s => document.querySelector(s);
-let DOC = null, idx = 0;
+const $ = (s) => document.querySelector(s);
+const state = { docs: [], doc: null, idx: 0, mode: 'rendered', filter: 'all', search: '', zoom: 100 };
 
-function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#039;'}[c])); }
-function mdBold(s){ return escapeHtml(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>'); }
-function sanitizeTableHtml(html){
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#039;'}[c]));
+}
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function highlight(value) {
+    let html = escapeHtml(value);
+    const q = state.search.trim();
+    if (!q) return html;
+    return html.replace(new RegExp(escapeRegExp(escapeHtml(q)), 'gi'), m => `<mark>${m}</mark>`);
+}
+function countValues(map) {
+    return Object.values(map || {}).reduce((a, b) => a + Number(b || 0), 0);
+}
+function chip(text, tone='gray') {
+    const tones = {
+        gray: 'bg-gray-100 text-gray-700 border-gray-200',
+        blue: 'bg-blue-50 text-blue-700 border-blue-200',
+        amber: 'bg-amber-50 text-amber-800 border-amber-200',
+        red: 'bg-red-50 text-red-700 border-red-200',
+        green: 'bg-green-50 text-green-700 border-green-200',
+        slate: 'bg-slate-100 text-slate-700 border-slate-200'
+    };
+    return `<span class="inline-flex items-center px-2 py-0.5 rounded border ${tones[tone] || tones.gray} whitespace-nowrap">${escapeHtml(text)}</span>`;
+}
+function pageText(page) {
+    return (page?.elements || []).map(el => [el.type, el.content, el.caption, el.description].filter(Boolean).join(' ')).join(' ');
+}
+function pageMatchesFilter(page) {
+    if (!page) return false;
+    if (state.filter === 'flagged') return page.failed || page.low_confidence || page.has_issues || (page.warnings || []).length || !page.image;
+    if (state.filter === 'tables') return page.has_table;
+    if (state.filter === 'figures') return Boolean(page.summary?.types?.figure);
+    if (state.filter === 'low') return page.low_confidence || Number(page.summary?.min_confidence || 1) < 0.7;
+    if (state.filter === 'missing') return !page.image;
+    return true;
+}
+function pageMatchesSearch(page) {
+    const q = state.search.trim().toLowerCase();
+    return !q || pageText(page).toLowerCase().includes(q);
+}
+function visiblePages() {
+    return (state.doc?.pages || []).filter(p => pageMatchesFilter(p) && pageMatchesSearch(p));
+}
+function currentPage() {
+    return state.doc?.pages?.[state.idx] || null;
+}
+function sanitizeTableHtml(html) {
     const tpl = document.createElement('template');
     tpl.innerHTML = String(html ?? '');
     const allowed = new Set(['TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'TD', 'TH', 'BR']);
     const nodes = [];
     const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_ELEMENT);
-    while(walker.nextNode()) nodes.push(walker.currentNode);
-    for(const node of nodes.reverse()){
-        if(!allowed.has(node.tagName)){
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes.reverse()) {
+        if (!allowed.has(node.tagName)) {
             node.replaceWith(document.createTextNode(node.textContent || ''));
             continue;
         }
-        for(const attr of [...node.attributes]){
+        for (const attr of [...node.attributes]) {
             const name = attr.name.toLowerCase();
-            if(!['colspan', 'rowspan'].includes(name)) node.removeAttribute(attr.name);
+            const value = String(attr.value || '');
+            if (!['colspan', 'rowspan'].includes(name) || !/^\d{1,2}$/.test(value)) node.removeAttribute(attr.name);
         }
     }
     return tpl.innerHTML;
 }
-
-function renderElements(els){
-    if(!els || !els.length) return '<div class="text-gray-400">추출된 요소가 없습니다.</div>';
-    const out = [];
-    for(const e of els){
-        const t = e.type || 'text';
-        const c = e.content || '';
-        if(t === 'heading_1') out.push(`<h2 class="el text-lg font-bold text-gray-900 mt-5 mb-1 border-b pb-1">${escapeHtml(c)}</h2>`);
-        else if(t === 'heading_2') out.push(`<h3 class="el text-base font-semibold text-gray-800 mt-4 mb-1 ml-2">${escapeHtml(c)}</h3>`);
-        else if(t === 'heading_3') out.push(`<h4 class="el text-sm font-semibold text-gray-700 mt-3 mb-1 ml-4">${escapeHtml(c)}</h4>`);
-        else if(t === 'toc_entry') out.push(`<div class="el text-xs text-gray-500 ml-2">· ${escapeHtml(c)}</div>`);
-        else if(t === 'table') out.push(`<div class="el my-2 overflow-x-auto">${e.caption?`<div class="text-xs font-medium text-gray-500 mb-1">▤ ${escapeHtml(e.caption)}</div>`:''}${sanitizeTableHtml(c)}</div>`);
-        else if(t === 'figure') out.push(`<div class="el my-3 p-3 rounded-lg bg-amber-50 border border-amber-200">
-                <div class="text-xs font-semibold text-amber-700">🖼️ figure${e.caption?` · ${escapeHtml(e.caption)}`:''}</div>
-                ${e.description?`<div class="text-sm text-gray-700 mt-1">${escapeHtml(e.description)}</div>`:''}
-                ${c?`<div class="text-xs text-gray-500 mt-1 whitespace-pre-wrap">${escapeHtml(c)}</div>`:''}</div>`);
-        else if(t === 'footnote') out.push(`<div class="el text-xs text-gray-400 mt-2">※ ${escapeHtml(c)}</div>`);
-        else out.push(`<p class="el my-2 text-gray-700 whitespace-pre-wrap">${mdBold(c)}</p>`);
+function renderDocList() {
+    $('#docCount').textContent = `${state.docs.length}개 문서`;
+    $('#docList').innerHTML = state.docs.map(d => {
+        const ps = d.provenance_summary || {};
+        const issues = countValues(ps.issues);
+        const low = (d.low_confidence_pages || []).length;
+        const failed = (d.vlm_failed_pages || []).length;
+        const active = state.doc && state.doc.name === d.name;
+        return `
+            <button data-doc="${escapeHtml(d.name)}" class="doc-btn w-full text-left rounded border px-3 py-2.5 transition ${active ? 'bg-gray-900 text-white border-gray-900' : 'bg-white hover:bg-gray-50 border-gray-200'}">
+                <div class="font-medium text-sm truncate">${escapeHtml(d.title || d.name)}</div>
+                <div class="${active ? 'text-gray-300' : 'text-gray-500'} text-xs truncate mt-0.5">${escapeHtml(d.source_file || d.name)}</div>
+                <div class="flex gap-1 mt-2 text-[11px] flex-wrap">
+                    ${chip(`${d.pages}p`, active ? 'slate' : 'gray')}
+                    ${failed ? chip(`fail ${failed}`, 'red') : ''}
+                    ${low ? chip(`low ${low}`, 'amber') : ''}
+                    ${issues ? chip(`issue ${issues}`, 'amber') : ''}
+                </div>
+            </button>`;
+    }).join('');
+    document.querySelectorAll('.doc-btn').forEach(btn => btn.onclick = () => loadDoc(btn.dataset.doc));
+}
+function renderSummary() {
+    const doc = state.doc;
+    if (!doc) return;
+    const meta = doc.metadata || {};
+    const ps = meta.provenance_summary || {};
+    const sources = ps.sources || {};
+    const issues = ps.issues || {};
+    const chunks = (doc.chunks || []).map(c => `${c.strategy}${c.count == null ? '' : ` ${c.count}`}`);
+    const parts = [
+        chip(`pages ${doc.pages.length}`, 'gray'),
+        chip(`VLM ${meta.vlm_pages_analyzed ?? '-'} / ${meta.vlm_pages_total ?? '-'}`, 'blue'),
+        (meta.vlm_failed_pages || []).length ? chip(`fail ${(meta.vlm_failed_pages || []).join(', ')}`, 'red') : chip('fail 0', 'green'),
+        (meta.low_confidence_pages || []).length ? chip(`low ${(meta.low_confidence_pages || []).join(', ')}`, 'amber') : chip('low 0', 'green')
+    ];
+    for (const [k, v] of Object.entries(sources).slice(0, 8)) parts.push(chip(`${k} ${v}`, 'slate'));
+    for (const [k, v] of Object.entries(issues).slice(0, 8)) parts.push(chip(`${k} ${v}`, 'amber'));
+    if (chunks.length) parts.push(chip(`chunks ${chunks.join(' · ')}`, 'blue'));
+    $('#summaryBar').innerHTML = parts.join('');
+}
+function renderPageStrip() {
+    const pages = state.doc?.pages || [];
+    const visible = new Set(visiblePages().map(p => p.page));
+    $('#pageStrip').innerHTML = pages.map((p, i) => {
+        const active = i === state.idx;
+        const hidden = !visible.has(p.page);
+        let cls = active ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50';
+        if (!active && (p.failed || p.low_confidence)) cls = 'bg-red-50 text-red-700 border-red-300';
+        else if (!active && (p.has_issues || (p.warnings || []).length || !p.image)) cls = 'bg-amber-50 text-amber-800 border-amber-300';
+        else if (!active && p.has_table) cls = 'bg-blue-50 text-blue-700 border-blue-200';
+        return `<button data-page-idx="${i}" class="page-chip flex-shrink-0 rounded border text-xs tabular-nums ${cls} ${hidden ? 'opacity-25' : ''}">${p.page}</button>`;
+    }).join('');
+    document.querySelectorAll('[data-page-idx]').forEach(btn => btn.onclick = () => { state.idx = Number(btn.dataset.pageIdx); render(); });
+}
+function renderPageBadges(page) {
+    if (!page) { $('#pageBadges').innerHTML = ''; return; }
+    const s = page.summary || {};
+    const badges = [
+        chip(`${s.elements || 0} elements`, 'gray'),
+        s.avg_confidence == null ? '' : chip(`avg ${s.avg_confidence}`, Number(s.avg_confidence) < 0.75 ? 'amber' : 'green'),
+        s.min_confidence == null ? '' : chip(`min ${s.min_confidence}`, Number(s.min_confidence) < 0.7 ? 'amber' : 'gray'),
+        page.has_table ? chip(`table ${s.types?.table || 0}`, 'blue') : '',
+        s.types?.figure ? chip(`figure ${s.types.figure}`, 'blue') : '',
+        page.low_confidence ? chip('low confidence', 'red') : '',
+        page.failed ? chip('failed', 'red') : '',
+        !page.image ? chip('no image', 'amber') : ''
+    ].filter(Boolean);
+    for (const [k, v] of Object.entries(s.issues || {})) badges.push(chip(`${k} ${v}`, 'amber'));
+    for (const warning of page.warnings || []) badges.push(chip(warning, 'amber'));
+    $('#pageBadges').innerHTML = badges.join('');
+}
+function renderElement(el, i) {
+    if (!el || typeof el !== 'object') {
+        return `<div class="element-block border-b border-gray-100 py-3 text-sm text-gray-500">${highlight(el)}</div>`;
     }
-    return out.join('');
+    const type = el.type || 'text';
+    const source = el._source || 'unknown';
+    const conf = el._confidence;
+    const issues = el._issues || [];
+    const meta = [
+        chip(`#${i + 1}`, 'gray'),
+        chip(type, type === 'table' ? 'blue' : type === 'figure' ? 'amber' : 'gray'),
+        chip(source, source.includes('repaired') ? 'amber' : 'slate'),
+        conf == null ? '' : chip(`conf ${conf}`, Number(conf) < 0.7 ? 'red' : Number(conf) < 0.82 ? 'amber' : 'green'),
+        ...issues.map(x => chip(x, 'amber'))
+    ].filter(Boolean).join('');
+    let body = '';
+    if (type === 'heading_1') body = `<h2 class="text-lg font-bold mt-1">${highlight(el.content)}</h2>`;
+    else if (type === 'heading_2') body = `<h3 class="text-base font-semibold mt-1">${highlight(el.content)}</h3>`;
+    else if (type === 'heading_3') body = `<h4 class="text-sm font-semibold mt-1">${highlight(el.content)}</h4>`;
+    else if (type === 'table') body = `<div class="overflow-x-auto mt-2">${el.caption ? `<div class="text-xs text-gray-500 mb-1">${highlight(el.caption)}</div>` : ''}${sanitizeTableHtml(el.content)}</div>`;
+    else if (type === 'figure') body = `<div class="mt-2 border border-amber-200 bg-amber-50 rounded p-3">
+            ${el.caption ? `<div class="text-xs font-semibold text-amber-800 mb-1">${highlight(el.caption)}</div>` : ''}
+            ${el.description ? `<div class="text-sm text-gray-800 whitespace-pre-wrap">${highlight(el.description)}</div>` : ''}
+            ${el.content ? `<div class="text-xs text-gray-600 whitespace-pre-wrap mt-1">${highlight(el.content)}</div>` : ''}
+        </div>`;
+    else if (type === 'footnote') body = `<div class="text-xs text-gray-500 mt-1 whitespace-pre-wrap">${highlight(el.content)}</div>`;
+    else body = `<p class="text-sm text-gray-800 mt-1 whitespace-pre-wrap">${highlight(el.content)}</p>`;
+    return `<article class="element-block border-b border-gray-100 py-3">
+        <div class="flex gap-1 flex-wrap text-[11px]">${meta}</div>
+        ${body}
+    </article>`;
 }
-
-function render(){
-    if(!DOC || !DOC.pages.length) return;
-    idx = Math.max(0, Math.min(idx, DOC.pages.length-1));
-    const p = DOC.pages[idx];
-    // 좌: 원본
-    const img = $('#pageImg'), noImg = $('#noImg');
-    if(p.image){ img.src = p.image; img.classList.remove('hidden'); noImg.classList.add('hidden'); }
-    else { img.classList.add('hidden'); noImg.classList.remove('hidden'); }
-    // 우: 파싱
-    $('#parsed').innerHTML = renderElements(p.elements);
-    const raw = JSON.stringify(p.elements, null, 2);
-    const code = $('#rawJson code'); code.textContent = raw; code.removeAttribute('data-highlighted'); hljs.highlightElement(code);
-    // 페이지 정보
-    $('#pageInfo').textContent = `${idx+1} / ${DOC.pages.length} (p.${p.page})`;
-    $('#prevBtn').disabled = idx===0; $('#nextBtn').disabled = idx===DOC.pages.length-1;
+function renderElements(page) {
+    const elements = page?.elements || [];
+    const q = state.search.trim().toLowerCase();
+    const filtered = q ? elements.filter(el => [el.type, el.content, el.caption, el.description].filter(Boolean).join(' ').toLowerCase().includes(q)) : elements;
+    $('#parsed').innerHTML = filtered.length
+        ? filtered.map((el, i) => renderElement(el, i)).join('')
+        : '<div class="h-full flex items-center justify-center text-sm text-gray-500">표시할 요소가 없습니다.</div>';
 }
-
-async function loadDoc(name){
-    const r = await fetch(`/api/doc/${encodeURIComponent(name)}`);
-    DOC = await r.json(); idx = 0;
-    const m = DOC.metadata || {};
-    const bits = [];
-    if(m.doc_title) bits.push(`📌 ${escapeHtml(m.doc_title)}`);
-    if(m.organization) bits.push(escapeHtml(m.organization));
-    if(m.date) bits.push(escapeHtml(m.date));
-    if(DOC.chunks && DOC.chunks.length) bits.push(`청크: ${DOC.chunks.join(', ')}`);
-    const mb = $('#metaBar');
-    if(bits.length){ mb.innerHTML = bits.join(' &nbsp;·&nbsp; '); mb.classList.remove('hidden'); } else mb.classList.add('hidden');
+function renderRaw(page) {
+    const code = $('#rawJson code');
+    code.textContent = JSON.stringify(page?.raw ?? page?.elements ?? [], null, 2);
+    code.removeAttribute('data-highlighted');
+    hljs.highlightElement(code);
+}
+function renderImage(page) {
+    const img = $('#pageImg');
+    const noImg = $('#noImg');
+    if (page?.image) {
+        img.src = page.image;
+        img.style.width = `${state.zoom}%`;
+        img.classList.remove('hidden');
+        noImg.classList.add('hidden');
+        $('#openImageBtn').href = page.image;
+        $('#openImageBtn').classList.remove('pointer-events-none', 'opacity-40');
+    } else {
+        img.classList.add('hidden');
+        noImg.classList.remove('hidden');
+        $('#openImageBtn').href = '#';
+        $('#openImageBtn').classList.add('pointer-events-none', 'opacity-40');
+    }
+    $('#zoomRange').value = state.zoom;
+    $('#zoomLabel').textContent = `${state.zoom}%`;
+}
+function renderMode() {
+    const rawOn = state.mode === 'json';
+    $('#parsed').classList.toggle('hidden', rawOn);
+    $('#rawJson').classList.toggle('hidden', !rawOn);
+    $('#renderBtn').className = rawOn ? 'px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap' : 'px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap';
+    $('#jsonBtn').className = rawOn ? 'px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap' : 'px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap';
+}
+function render() {
+    const doc = state.doc;
+    if (!doc) return;
+    state.idx = Math.max(0, Math.min(state.idx, doc.pages.length - 1));
+    const page = currentPage();
+    $('#docTitle').textContent = doc.metadata?.doc_title || doc.name;
+    $('#docMeta').textContent = [doc.metadata?.source_file, doc.metadata?.organization, doc.metadata?.date].filter(Boolean).join(' · ');
+    $('#pageInput').value = page?.page || '';
+    $('#pageTotal').textContent = `/ ${doc.pages.length}`;
+    $('#prevBtn').disabled = state.idx <= 0;
+    $('#nextBtn').disabled = state.idx >= doc.pages.length - 1;
+    renderDocList();
+    renderSummary();
+    renderPageStrip();
+    renderPageBadges(page);
+    renderImage(page);
+    renderElements(page);
+    renderRaw(page);
+    renderMode();
+}
+async function loadDoc(name) {
+    const res = await fetch(`/api/doc/${encodeURIComponent(name)}`);
+    state.doc = await res.json();
+    state.idx = 0;
     render();
 }
-
-function applyJsonToggle(){
-    const on = $('#jsonToggle').checked;
-    $('#parsed').classList.toggle('hidden', on);
-    $('#rawJson').classList.toggle('hidden', !on);
-}
-
-async function init(){
-    const docs = await (await fetch('/api/docs')).json();
-    const sel = $('#docSelect');
-    if(!docs.length){
-        $('section').classList.add('hidden'); $('header').classList.add('hidden'); $('#empty').classList.remove('hidden');
+async function init() {
+    state.docs = await (await fetch('/api/docs')).json();
+    if (!state.docs.length) {
+        $('#docList').classList.add('hidden');
+        $('#emptyDocs').classList.remove('hidden');
+        $('#emptyDocs').classList.add('flex');
+        $('#docCount').textContent = '0개 문서';
         return;
     }
-    sel.innerHTML = docs.map(d => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.title)} (${d.pages}쪽)</option>`).join('');
-    sel.onchange = () => loadDoc(sel.value);
-    $('#prevBtn').onclick = () => { idx--; render(); };
-    $('#nextBtn').onclick = () => { idx++; render(); };
-    $('#jsonToggle').onchange = applyJsonToggle;
-    document.addEventListener('keydown', e => {
-        if(e.key === 'ArrowLeft' && idx>0){ idx--; render(); }
-        if(e.key === 'ArrowRight' && DOC && idx<DOC.pages.length-1){ idx++; render(); }
-    });
-    await loadDoc(docs[0].name);
+    await loadDoc(state.docs[0].name);
 }
+$('#prevBtn').onclick = () => { state.idx--; render(); };
+$('#nextBtn').onclick = () => { state.idx++; render(); };
+$('#pageInput').onchange = () => {
+    const target = Number($('#pageInput').value);
+    const i = (state.doc?.pages || []).findIndex(p => Number(p.page) === target);
+    if (i >= 0) { state.idx = i; render(); }
+};
+$('#pageFilter').onchange = () => { state.filter = $('#pageFilter').value; renderPageStrip(); };
+$('#searchBox').oninput = () => { state.search = $('#searchBox').value; renderPageStrip(); renderElements(currentPage()); };
+$('#zoomRange').oninput = () => { state.zoom = Number($('#zoomRange').value); renderImage(currentPage()); };
+$('#fitBtn').onclick = () => { state.zoom = 100; renderImage(currentPage()); };
+$('#renderBtn').onclick = () => { state.mode = 'rendered'; renderMode(); };
+$('#jsonBtn').onclick = () => { state.mode = 'json'; renderMode(); };
+$('#copyJsonBtn').onclick = async () => {
+    const page = currentPage();
+    if (!page) return;
+    await navigator.clipboard.writeText(JSON.stringify(page.raw ?? page.elements ?? [], null, 2));
+};
+document.addEventListener('keydown', e => {
+    if (e.target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    if (e.key === 'ArrowLeft' && state.idx > 0) { state.idx--; render(); }
+    if (e.key === 'ArrowRight' && state.doc && state.idx < state.doc.pages.length - 1) { state.idx++; render(); }
+});
 init();
 </script>
 </body>

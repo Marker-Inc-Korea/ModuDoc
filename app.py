@@ -8,12 +8,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 import re
 from datetime import datetime
+from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, abort
 from utils import DocumentProcessor
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = './documents'
-app.config['OUTPUT_FOLDER'] = './processed'
+app.config['UPLOAD_FOLDER'] = os.environ.get("UPLOAD_FOLDER", './documents')
+app.config['OUTPUT_FOLDER'] = os.environ.get("OUTPUT_FOLDER", './processed')
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("MAX_UPLOAD_MB", "512")) * 1024 * 1024
 HISTORY_FILE = 'history.json'
 ALLOWED_FORMATS = {"json", "xml", "markdown"}
@@ -280,6 +281,78 @@ def _page_no(fname):
     m = re.search(r'(\d+)', fname)
     return int(m.group(1)) if m else 0
 
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+def _load_json_file(path, default=None):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _structured_payload(data, fallback_page):
+    """Return a stable page payload for both legacy list JSON and newer object JSON."""
+    if isinstance(data, dict):
+        elements = data.get('elements', [])
+        page_no = data.get('page_number') or fallback_page
+        warnings = _as_list(data.get('warnings')) + _as_list(data.get('warning'))
+        low_confidence = bool(data.get('low_confidence'))
+        raw = data
+    elif isinstance(data, list):
+        elements = data
+        page_no = fallback_page
+        warnings = []
+        low_confidence = False
+        raw = data
+    else:
+        elements = []
+        page_no = fallback_page
+        warnings = ["구조화 JSON 형식을 읽을 수 없습니다."]
+        low_confidence = True
+        raw = data
+    return {
+        "elements": elements if isinstance(elements, list) else [],
+        "page": page_no,
+        "warnings": [str(w) for w in warnings if w],
+        "low_confidence": low_confidence,
+        "raw": raw,
+    }
+
+def _count_items(items):
+    counts = {}
+    for item in items:
+        key = str(item or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+def _element_summary(elements):
+    types, sources, issues, confidences = [], [], [], []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        types.append(el.get("type") or "text")
+        sources.append(el.get("_source") or "unknown")
+        issues.extend(_as_list(el.get("_issues")))
+        try:
+            confidences.append(float(el.get("_confidence")))
+        except (TypeError, ValueError):
+            pass
+    low_elements = len([c for c in confidences if c < 0.7])
+    return {
+        "elements": len(elements),
+        "types": _count_items(types),
+        "sources": _count_items(sources),
+        "issues": _count_items(issues),
+        "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
+        "min_confidence": round(min(confidences), 3) if confidences else None,
+        "low_confidence_elements": low_elements,
+    }
+
 @app.route('/compare')
 def compare_page():
     return render_template('compare.html')
@@ -294,49 +367,76 @@ def api_docs():
             d = os.path.join(root, name)
             if not os.path.isdir(d):
                 continue
-            n_pages = len([f for f in os.listdir(d) if f.endswith('_structured.json')])
+            structured_files = [f for f in os.listdir(d) if f.endswith('_structured.json')]
+            n_pages = len(structured_files)
             if not n_pages:
                 continue
             title = name
+            meta = {}
             mp = os.path.join(d, 'metadata.json')
             if os.path.exists(mp):
-                try:
-                    with open(mp, encoding='utf-8') as f:
-                        title = (json.load(f) or {}).get('doc_title') or name
-                except Exception:
-                    pass
-            docs.append({"name": name, "title": title, "pages": n_pages})
+                meta = _load_json_file(mp, {}) or {}
+                title = meta.get('doc_title') or name
+            stat = os.stat(d)
+            docs.append({
+                "name": name,
+                "title": title,
+                "pages": n_pages,
+                "source_file": meta.get("source_file"),
+                "updated_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "vlm_failed_pages": meta.get("vlm_failed_pages") or [],
+                "low_confidence_pages": meta.get("low_confidence_pages") or [],
+                "vlm_pages_total": meta.get("vlm_pages_total"),
+                "vlm_pages_analyzed": meta.get("vlm_pages_analyzed"),
+                "provenance_summary": meta.get("provenance_summary") or {},
+            })
     return jsonify(docs)
 
 @app.route('/api/doc/<name>')
 def api_doc(name):
     """한 문서의 페이지별 [원본 이미지 URL + 파싱 요소]."""
     d = _doc_dir(name)
-    meta = {}
     mp = os.path.join(d, 'metadata.json')
-    if os.path.exists(mp):
-        try:
-            with open(mp, encoding='utf-8') as f:
-                meta = json.load(f) or {}
-        except Exception:
-            meta = {}
+    meta = _load_json_file(mp, {}) if os.path.exists(mp) else {}
+    meta = meta or {}
+    low_pages = set(int(p) for p in (meta.get("low_confidence_pages") or []) if str(p).isdigit())
+    failed_pages = set(int(p) for p in (meta.get("vlm_failed_pages") or []) if str(p).isdigit())
     pages = []
     structured = sorted((x for x in os.listdir(d) if x.endswith('_structured.json')), key=_page_no)
     for fname in structured:
         stem = fname[:-len('_structured.json')]
-        try:
-            with open(os.path.join(d, fname), encoding='utf-8') as fh:
-                data = json.load(fh)
-        except Exception:
-            data = {}
-        elements = data.get('elements', []) if isinstance(data, dict) else (data or [])
+        data = _load_json_file(os.path.join(d, fname), {})
+        payload = _structured_payload(data, _page_no(fname))
+        elements = payload["elements"]
         img = None
         for ext in ('.png', '.jpg', '.jpeg'):
             if os.path.exists(os.path.join(d, stem + ext)):
-                img = f"/api/file/{name}/{stem}{ext}"
+                img = f"/api/file/{quote(name, safe='')}/{quote(stem + ext, safe='')}"
                 break
-        pages.append({"page": _page_no(fname), "image": img, "elements": elements})
-    chunks = [s for s in ("toc", "tree", "page") if os.path.exists(os.path.join(d, f"split_{s}.json"))]
+        page_no = int(payload["page"] or _page_no(fname))
+        summary = _element_summary(elements)
+        pages.append({
+            "page": page_no,
+            "image": img,
+            "elements": elements,
+            "raw": payload["raw"],
+            "warnings": payload["warnings"],
+            "low_confidence": payload["low_confidence"] or page_no in low_pages,
+            "failed": page_no in failed_pages,
+            "summary": summary,
+            "has_table": bool(summary["types"].get("table")),
+            "has_issues": bool(summary["issues"]),
+            "json_file": fname,
+        })
+    chunks = []
+    for strategy in ("toc", "tree", "page"):
+        path = os.path.join(d, f"split_{strategy}.json")
+        if os.path.exists(path):
+            split_data = _load_json_file(path, [])
+            chunks.append({
+                "strategy": strategy,
+                "count": len(split_data) if isinstance(split_data, list) else None,
+            })
     return jsonify({"name": name, "metadata": meta, "pages": pages, "chunks": chunks})
 
 @app.route('/api/file/<name>/<path:filename>')
