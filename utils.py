@@ -14,6 +14,7 @@ import time
 import zipfile
 import unicodedata
 import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 
 _VLM_SEMAPHORE = threading.Semaphore(int(os.environ.get("VLM_CONCURRENCY", "5")))
 _SOFFICE_LOCK = threading.Lock()
@@ -23,8 +24,11 @@ RENDER_DPI = int(os.environ.get("RENDER_DPI", "300"))
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "300"))                   # 구조추출 VLM 호출 타임아웃(초)
 VLM_MAX_ATTEMPTS = max(1, int(os.environ.get("VLM_MAX_ATTEMPTS", "3")))   # 한 페이지 추출의 최대 시도 수
 VLM_MAX_TOKENS = max(512, int(os.environ.get("VLM_MAX_TOKENS", "16384"))) # 한 페이지 구조추출 응답 토큰 상한
-VLM_STREAM_ABORT = os.environ.get("VLM_STREAM_ABORT", "0") == "1"         # 스트리밍 중 반복 생성 조기 중단(검증/운영 선택)
+VLM_STREAM_ABORT = os.environ.get("VLM_STREAM_ABORT", "1") == "1"         # 스트리밍 중 반복·과다 생성 조기 중단(0으로 비활성화)
 VLM_STREAM_ABORT_MIN_CHARS = max(2048, int(os.environ.get("VLM_STREAM_ABORT_MIN_CHARS", "4096")))
+VLM_STREAM_ABORT_INPUT_MIN_CHARS = max(128, int(os.environ.get("VLM_STREAM_ABORT_INPUT_MIN_CHARS", "256")))
+VLM_STREAM_ABORT_BASE_CHARS = max(4096, int(os.environ.get("VLM_STREAM_ABORT_BASE_CHARS", "8000")))
+VLM_STREAM_ABORT_INPUT_RATIO = max(2.0, float(os.environ.get("VLM_STREAM_ABORT_INPUT_RATIO", "8")))
 VLM_COVERAGE_VERIFY = os.environ.get("VLM_COVERAGE_VERIFY", "1") == "1"   # 낮은 coverage 페이지를 이미지 기준 VLM 판정으로 재검증
 VLM_COVERAGE_VERIFY_TIMEOUT = int(os.environ.get("VLM_COVERAGE_VERIFY_TIMEOUT", "180"))
 VLM_COVERAGE_VERIFY_MAX_TOKENS = max(256, int(os.environ.get("VLM_COVERAGE_VERIFY_MAX_TOKENS", "768")))
@@ -46,6 +50,8 @@ VLM_IMG_MAXW_FALLBACK = max(512, int(os.environ.get("VLM_IMG_MAXW_FALLBACK", "10
 # repetition_penalty(기본/강).
 VLM_REP_PENALTY = float(os.environ.get("VLM_REP_PENALTY", "1.05"))
 VLM_REP_PENALTY_HI = float(os.environ.get("VLM_REP_PENALTY_HI", "1.18"))
+VLM_METADATA_TIMEOUT = max(30, int(os.environ.get("VLM_METADATA_TIMEOUT", "120")))
+VLM_METADATA_ATTEMPTS = max(1, int(os.environ.get("VLM_METADATA_ATTEMPTS", "2")))
 # PII 마스킹(사용자 지정). 콤마목록으로 켤 타입 지정. 기본 빈값=마스킹 안 함(충실 추출).
 # 지원 타입: rrn(주민번호) bizno(사업자등록번호) email(이메일) phone(전화) account(계좌) card(카드)
 PII_MASK_TYPES = {t.strip().lower() for t in os.environ.get("PII_MASK", "").split(",") if t.strip()}
@@ -146,6 +152,29 @@ def _korean_ratio(text):
     return (kr / tot) if tot else 0.0
 
 
+def _semantic_text_length(text):
+    """Count content while excluding JSON and HTML serialization overhead."""
+    value = re.sub(r"<[^>]*>", "", text or "")
+    value = re.sub(
+        r'"(?:page_number|elements|type|content|caption|description)"\s*:',
+        "",
+        value,
+    )
+    return sum(ch.isalnum() for ch in value)
+
+
+def _stream_output_excessive(generated, source_text):
+    """Detect non-repeating overgeneration when a useful text layer exists."""
+    source_chars = _semantic_text_length(source_text)
+    if source_chars < VLM_STREAM_ABORT_INPUT_MIN_CHARS:
+        return False
+    limit = max(
+        VLM_STREAM_ABORT_BASE_CHARS,
+        int(source_chars * VLM_STREAM_ABORT_INPUT_RATIO),
+    )
+    return _semantic_text_length(generated) > limit
+
+
 def _collapse_compound_repeat_text(text):
     """Collapse short adjacent duplicate runs such as '참고참고1717' -> '참고17'."""
     if not isinstance(text, str):
@@ -209,6 +238,275 @@ def _dedupe_exact_text_elements(elements):
                 continue
             seen_text.add(content)
         result.append(element)
+    return result
+
+
+def _element_visible_text(element):
+    """Return user-visible element text without serialization markup."""
+    if not isinstance(element, dict):
+        return ""
+    content = str(element.get("content") or "")
+    if element.get("type") == "table":
+        try:
+            return BeautifulSoup(content, "html.parser").get_text(" ", strip=True)
+        except Exception:
+            return re.sub(r"<[^>]+>", " ", content)
+    return content
+
+
+def _compact_visible_text(text):
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(char for char in value if char.isalnum())
+
+
+def _dedupe_comparison_text(text):
+    """Normalize formatting while retaining address and URL identity."""
+    return _compact_visible_text(text)
+
+
+def _compact_text_with_offsets(text):
+    """Normalize prose while retaining offsets into the original string."""
+    chars = []
+    offsets = []
+    for index, char in enumerate(str(text or "")):
+        normalized = unicodedata.normalize("NFKC", char).casefold()
+        for normalized_char in normalized:
+            if normalized_char.isalnum():
+                chars.append(normalized_char)
+                offsets.append(index)
+    return "".join(chars), offsets
+
+
+def _resolve_flattened_table_duplicates(elements):
+    """Split a page-wide prose duplicate around exact structured table blocks.
+
+    Some VLM responses contain the whole page once as flat prose and then emit
+    the same table and trailing blocks structurally. Reconstruct reading order
+    only when a complete, substantial table is an exact normalized substring;
+    shorter phrase overlap alone is never enough to trigger this transform.
+    """
+    source = list(elements or [])
+    consumed = set()
+    result = []
+
+    for index, element in enumerate(source):
+        if index in consumed:
+            continue
+        if not isinstance(element, dict) or element.get("type", "text") != "text":
+            result.append(element)
+            continue
+
+        raw = str(element.get("content") or "")
+        container, offsets = _compact_text_with_offsets(raw)
+        if len(container) < 160:
+            result.append(element)
+            continue
+
+        candidates = []
+        for child_index in range(index + 1, len(source)):
+            child = source[child_index]
+            if child_index in consumed or not isinstance(child, dict):
+                continue
+            child_type = child.get("type", "text")
+            if child_type not in {
+                "table", "text", "footnote", "heading_1", "heading_2", "heading_3"
+            }:
+                continue
+            child_text = _compact_visible_text(_element_visible_text(child))
+            minimum = 32 if child_type == "table" else 12
+            if len(child_text) < minimum:
+                continue
+            start = container.find(child_text)
+            while start >= 0:
+                candidates.append(
+                    {
+                        "index": child_index,
+                        "type": child_type,
+                        "start": start,
+                        "end": start + len(child_text),
+                        "length": len(child_text),
+                    }
+                )
+                start = container.find(child_text, start + 1)
+
+        table_candidates = [item for item in candidates if item["type"] == "table"]
+        if not table_candidates:
+            result.append(element)
+            continue
+
+        exact_children = {item["index"] for item in candidates}
+        for child_index in range(index + 1, len(source)):
+            if child_index in exact_children or child_index in consumed:
+                continue
+            child = source[child_index]
+            if not isinstance(child, dict) or child.get("type", "text") not in {
+                "text", "footnote", "heading_1", "heading_2", "heading_3"
+            }:
+                continue
+            child_text = _compact_visible_text(_element_visible_text(child))
+            if len(child_text) < 12:
+                continue
+            matcher = SequenceMatcher(None, container, child_text, autojunk=False)
+            blocks = [block for block in matcher.get_matching_blocks() if block.size]
+            if not blocks:
+                continue
+            first, last = blocks[0], blocks[-1]
+            start = max(0, first.a - first.b)
+            end = min(
+                len(container),
+                last.a + last.size + len(child_text) - (last.b + last.size),
+            )
+            span_length = end - start
+            if not (len(child_text) * 0.75 <= span_length <= len(child_text) * 1.35):
+                continue
+            window_matcher = SequenceMatcher(
+                None, container[start:end], child_text, autojunk=False
+            )
+            matched_chars = sum(block.size for block in window_matcher.get_matching_blocks())
+            if (
+                window_matcher.ratio() >= 0.90
+                and matched_chars / len(child_text) >= 0.85
+            ):
+                candidates.append(
+                    {
+                        "index": child_index,
+                        "type": child.get("type", "text"),
+                        "start": start,
+                        "end": end,
+                        "length": len(child_text),
+                    }
+                )
+
+        # Assign each structured child once. Tables win overlapping spans, then
+        # longer exact blocks win over their own short labels.
+        selected = []
+        used_children = set()
+        for item in sorted(
+            candidates,
+            key=lambda value: (
+                value["type"] != "table",
+                -value["length"],
+                value["start"],
+            ),
+        ):
+            if item["index"] in used_children:
+                continue
+            if any(
+                item["start"] < chosen["end"] and chosen["start"] < item["end"]
+                for chosen in selected
+            ):
+                continue
+            selected.append(item)
+            used_children.add(item["index"])
+
+        selected.sort(key=lambda value: value["start"])
+        if not any(item["type"] == "table" for item in selected):
+            result.append(element)
+            continue
+
+        unmatched_text = []
+        for child_index in range(index + 1, len(source)):
+            if child_index in used_children or child_index in consumed:
+                continue
+            child = source[child_index]
+            if not isinstance(child, dict) or child.get("type", "text") not in {"text", "footnote"}:
+                continue
+            value = _compact_visible_text(child.get("content"))
+            if len(value) >= 12:
+                unmatched_text.append(value)
+
+        def _append_residual(start, end):
+            if start >= end or not offsets:
+                return
+            raw_start = 0 if start == 0 else offsets[start - 1] + 1
+            raw_end = len(raw) if end >= len(offsets) else offsets[end]
+            fragment = raw[raw_start:raw_end].strip()
+            normalized = _compact_visible_text(fragment)
+            if len(normalized) < 2:
+                return
+            # Prefer an already separated block when the residual is merely an
+            # OCR/VLM spelling variant of it.
+            for other in unmatched_text:
+                if max(len(normalized), len(other)) > min(len(normalized), len(other)) * 1.25:
+                    continue
+                matcher = SequenceMatcher(None, normalized, other)
+                if matcher.ratio() >= 0.94 and matcher.find_longest_match().size >= 12:
+                    return
+            residual = dict(element)
+            residual["content"] = fragment
+            result.append(residual)
+
+        cursor = 0
+        for item in selected:
+            _append_residual(cursor, item["start"])
+            result.append(source[item["index"]])
+            consumed.add(item["index"])
+            cursor = item["end"]
+        _append_residual(cursor, len(container))
+
+    return result
+
+
+def _drop_prose_duplicated_by_nearby_tables(elements):
+    """Drop nearby prose that exactly repeats a visible table cell/value."""
+    source = list(elements or [])
+    tables = []
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        content = str(element.get("content") or "")
+        try:
+            soup = BeautifulSoup(content, "html.parser")
+            cells = {
+                _compact_visible_text(cell.get_text(" ", strip=True))
+                for cell in soup.find_all(["td", "th"])
+            }
+            visible = _compact_visible_text(soup.get_text(" ", strip=True))
+        except Exception:
+            cells = set()
+            visible = _compact_visible_text(re.sub(r"<[^>]+>", " ", content))
+        tables.append((index, visible, {value for value in cells if value}))
+
+    cleaned = []
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type", "text") != "text":
+            cleaned.append(element)
+            continue
+        value = _compact_visible_text(element.get("content"))
+        duplicate = False
+        if len(value) >= 4:
+            for table_index, table_text, cells in tables:
+                if abs(index - table_index) > 3:
+                    continue
+                if value in cells or (len(value) >= 12 and value in table_text):
+                    duplicate = True
+                    break
+        if not duplicate:
+            cleaned.append(element)
+    return cleaned
+
+
+def _drop_trailing_duplicate_heading_cluster(elements):
+    """Drop a heading-only tail when every heading already appeared on the page."""
+    result = list(elements or [])
+    start = len(result)
+    while start > 0:
+        element = result[start - 1]
+        if not isinstance(element, dict) or not str(element.get("type") or "").startswith("heading_"):
+            break
+        start -= 1
+    if len(result) - start < 2:
+        return result
+
+    prior = {
+        _compact_visible_text(element.get("content"))
+        for element in result[:start]
+        if isinstance(element, dict)
+        and str(element.get("type") or "").startswith("heading_")
+    }
+    tail = [_compact_visible_text(element.get("content")) for element in result[start:]]
+    if tail and all(value and value in prior for value in tail):
+        return result[:start]
     return result
 
 
@@ -587,11 +885,6 @@ class HWPTextExtractor:
         if not text: return ""
         special_chars = re.sub(r'[가-힣a-zA-Z0-9\s]', '', text)
         if len(text) > 0 and (len(special_chars) / len(text)) >= threshold: return ""
-        
-        url_pattern = r"https?://\S+|www\.\S+"
-        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        text = re.sub(url_pattern, " ", text)
-        text = re.sub(email_pattern, " ", text)
         
         text = unicodedata.normalize("NFC", text)
         text = re.sub(r'[\uE000-\uF8FF]', "", text)
@@ -1028,6 +1321,8 @@ class VLMProcessor:
             except Exception:
                 class _APITimeout(Exception):
                     pass
+            class _StreamDeadline(Exception):
+                pass
             base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
             client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=VLM_TIMEOUT, max_retries=0)
         except Exception as e:
@@ -1070,6 +1365,7 @@ Rules for XML:
 4. [TABLE — CRITICAL] Any grid of data with rows and columns MUST be output as HTML table. Rules:
    a. Use ONLY <table>, <tr>, <td> tags (and <br> only inside a cell). NEVER use <th>. You MAY use colspan/rowspan (e.g. <td colspan="2">Header</td>).
    b. Always use the layout IMAGE to detect tables visually — raw text extraction often loses column alignment and merges cells.
+   b-1. Equations, formulas, and variable-definition lists without visible cell borders are text, NOT tables.
    c. Include ALL rows: header rows, subheader rows, data rows, and any title row that spans all columns.
    d. Each row must have the same number of cells (accounting for colspan/rowspan). Empty cells must be included as empty <td></td>.
    e. If a table has a multi-row header (e.g. a "Training Datasets" row spanning 6 columns, then "Instruction / Alignment" row spanning 3 each), reproduce all those rows with correct colspan.
@@ -1078,7 +1374,7 @@ Rules for XML:
    - heading_1/2/3: For actual section titles and prominent standalone headings. Use for: section titles in body text (e.g. "Introduction", "1.1 Methods"); on slide/presentation pages, EACH visually prominent section label and numbered step title MUST be a SEPARATE heading element — do NOT merge section labels with their body text (e.g. "Our Purpose" → heading_2, "Making AI Beneficial" → text; "01 - Find Resources" → heading_2, description → text); section labels that introduce a data block on a report/survey page (e.g. "Education Level", "Profession"). Do NOT use for: TOC entries; run-in paragraph starters — if a "heading" would contain a period in the MIDDLE followed by more text (e.g. "Business characteristics. Business size was determined by...", "Ablation on the SFT base models. We compare...", "Filtered task names. We present task names..."), it is a paragraph, NOT a heading — output as text with the opening label in **bold**; bold short labels ending with a period followed by body text (e.g. "Base model.", "Depthwise scaling." — use text element); lettered sub-items (a., b., c., d.) that introduce paragraphs.
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading content exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items on a Table of Contents page. Format content as "title::page_number".
-   - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image from top-left to bottom-right and output EVERY visible number, label, and text exactly as it appears into the element body — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and any annotations. List each item on its own line in visual reading order (top-to-bottom, left-to-right). For photographs or decorative images with no data, leave the element body empty. The description MUST be written in the document body language (Korean for a Korean document) EVEN IF the figure's labels are in another language; for screenshots/UI captures put on-screen text in the body but still write the description — NEVER leave description empty for a figure. Match detail to type: charts → chart type + concrete trend shape (계단식/선형/급증·급락) + peak position + series comparison; diagrams → main nodes and their flow/relationships; photos/maps/renderings → key subject in 1–2 sentences; screenshots → one sentence on purpose (do not repeat the body data). ANTI-HALLUCINATION: if no numbers are printed on the axes/legend, do NOT invent them — state "축에 수치 미표기" and describe only the qualitative shape.
+   - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image and transcribe the legible title, legend entries, axis labels, major endpoint/tick values, explicitly printed data labels, and annotations needed to interpret it. Do NOT enumerate unlabeled plotted samples, infer intermediate values, or repeat dense micro-labels. List retained items once in visual reading order. A screenshot dominated by readable forms, messages, Q&A cards, or document text is structured as separate text/table elements for its visible regions; do not duplicate that text in a figure element. For photographs or decorative images with no data, leave the element body empty. The description MUST be written in the document body language (Korean for a Korean document) EVEN IF the figure's labels are in another language; for other screenshots/UI captures put non-structured on-screen text in the body but still write the description — NEVER leave description empty for a figure. Match detail to type: charts → chart type + concrete trend shape (계단식/선형/급증·급락) + peak position + series comparison; diagrams → main nodes and their flow/relationships; photos/maps/renderings → key subject in 1–2 sentences; screenshots → one sentence on purpose (do not repeat the body data). ANTI-HALLUCINATION: if no numbers are printed on the axes/legend, do NOT invent them — state "축에 수치 미표기" and describe only the qualitative shape.
    - footnote: ONLY for superscript-style reference notes at the very bottom margin (e.g. *, ①, ※ markers). Do NOT use for regular body paragraphs.
    - table caption: Put the table title in the caption attribute, NOT as a separate heading element.
 6. CRITICAL — NO DUPLICATION: Each piece of content must appear exactly ONCE. Never output the same text in multiple elements."""
@@ -1110,8 +1406,8 @@ Rules for JSON:
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading "content" exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items listed on a Table of Contents page. Set content to "title::page_number".
    - text: General body paragraphs, including lists, bullet points, and any text content that is NOT a heading. Use **bold** for bold text within paragraphs.
-   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> (and <br> only inside a cell) — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be <td></td>. NEVER output table data as flat text. Put table title in "caption".
-   - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart from top-left to bottom-right and output EVERY visible number, label, and text into "content" — including Y-axis values (top to bottom), X-axis labels, bar/line data labels, legend entries, percentage labels, and annotations. List each item on its own line in visual reading order. For photographs or decorative images with no data, leave "content" empty. ALWAYS fill "description" with a detailed visual description, written in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) EVEN IF the figure's own labels/axes/legend are in another language — transcribe the foreign labels verbatim into "content", but NARRATE "description" in the document language. Write "description" with detail matched to the figure TYPE:
+   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> (and <br> only inside a cell) — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be included as empty <td></td>. NEVER output table data as flat text. Put table title in "caption". Equations, formulas, and variable-definition lists without visible cell borders are text, NOT tables.
+   - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart and put the legible title, legend entries, axis labels, major endpoint/tick values, explicitly printed data labels, and annotations needed to interpret it into "content". Do NOT enumerate unlabeled plotted samples, infer intermediate values, or repeat dense micro-labels. List retained items once in visual reading order. A screenshot dominated by readable forms, messages, Q&A cards, or document text MUST be structured as separate text/table elements for its visible regions; do not duplicate that text in a figure element. For photographs or decorative images with no data, leave "content" empty. ALWAYS fill "description" with a detailed visual description, written in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) EVEN IF the figure's own labels/axes/legend are in another language — transcribe the foreign labels verbatim into "content", but NARRATE "description" in the document language. Write "description" with detail matched to the figure TYPE:
      • Chart/graph: name the chart type (막대/선/원), then the CONCRETE shape of the trend (계단식/선형/급증·급락/평탄), WHERE the peak/trough sits, and compare the series/legend entries by name. Include printed numbers (peaks, totals, legend values) ONLY if they are actually printed on the figure.
      • Diagram/flowchart/structure: enumerate the main nodes/components and the relationships, flow direction, or contract/transaction names connecting them.
      • Photograph/aerial/map/rendering: 1–2 sentences on the key subject and composition, then STOP. Describe only what is in the frame; if you read a place-name, sign, or caption in the photo, do NOT append background facts, history, or guesses about it.
@@ -1406,9 +1702,14 @@ Rules:
             finish = None
             char_count = 0
             last_check = 0
+            started_at = time.monotonic()
             try:
                 stream = client.chat.completions.create(**req, stream=True)
                 for chunk in stream:
+                    if time.monotonic() - started_at > VLM_TIMEOUT:
+                        raise _StreamDeadline(
+                            f"stream exceeded total timeout of {VLM_TIMEOUT}s"
+                        )
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
                         continue
@@ -1426,6 +1727,11 @@ Rules:
                                 if hasattr(stream, "close"):
                                     stream.close()
                                 return current, "stream_runaway"
+                            if _stream_output_excessive(current, extracted_text):
+                                logger.warning("원문 길이 대비 비정상 출력 감지 — 응답 조기 중단")
+                                if hasattr(stream, "close"):
+                                    stream.close()
+                                return current, "stream_excessive"
                     fr = getattr(choice, "finish_reason", None)
                     if fr:
                         finish = fr
@@ -1448,12 +1754,19 @@ Rules:
                 result = _strip_fences(result or "")
 
                 # 반복 생성 차단: 1회 escalated 탈출 후에도 반복이면 폐기.
-                if finish == "stream_runaway" or (result and _is_runaway_repeat(result)):
-                    logger.warning(f"반복 생성 감지 (시도 {attempt+1}/{N}, finish={finish}) — 토큰 런어웨이 차단")
+                if finish in {"stream_runaway", "stream_excessive"} or (result and _is_runaway_repeat(result)):
+                    logger.warning(f"비정상 출력 감지 (시도 {attempt+1}/{N}, finish={finish}) — 토큰 런어웨이 차단")
                     if not escalated and not last:
                         escalated = True
                         time.sleep(2)
                         continue
+                    compact, compact_reason = _compact_visual_retry(
+                        f"abnormal streaming output ({finish})"
+                    )
+                    if compact:
+                        logger.info(f"비정상 스트리밍 출력 — compact visual retry 통과: {compact_reason}")
+                        return compact, True
+                    logger.warning(f"비정상 스트리밍 출력 — compact visual retry 실패: {compact_reason}")
                     return None, False
 
                 truncated = (finish == "length")   # max_tokens 도달 = 미완(반복이거나 초대형 페이지)
@@ -1544,7 +1857,7 @@ Rules:
                         logger.warning(f"출력 미완/부족 (최종 시도, finish={finish}) — 구조추출 실패로 폴백 처리")
                         return None, True
                     return result, True
-            except _APITimeout as e:
+            except (_APITimeout, _StreamDeadline) as e:
                 # 타임아웃: 일시적 오류와 분리해 1회만 고온 재시도 후 중단
                 logger.warning(f"VLM 타임아웃 (시도 {attempt+1}/{N}): {e} — 반복 생성 의심")
                 if escalated:
@@ -1605,7 +1918,12 @@ Rules:
         try:
             from openai import OpenAI
             base_url = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
-            client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", timeout=60, max_retries=0)
+            client = OpenAI(
+                base_url=base_url,
+                api_key=api_key or "EMPTY",
+                timeout=VLM_METADATA_TIMEOUT,
+                max_retries=0,
+            )
         except Exception as e:
             logger.error(f"VLM 클라이언트 초기화 오류: {e}")
             return {}
@@ -1643,23 +1961,28 @@ If a field cannot be found, use null.
                     "image_url": {"url": f"data:image/png;base64,{cls.encode_image(ip)}"}
                 })
 
-        try:
-            with _VLM_SEMAPHORE:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
-                    temperature=0.0,
-                    max_tokens=512,
-                    timeout=60
+        for attempt in range(VLM_METADATA_ATTEMPTS):
+            try:
+                with _VLM_SEMAPHORE:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
+                        temperature=0.0,
+                        max_tokens=512,
+                        timeout=VLM_METADATA_TIMEOUT,
+                    )
+                raw = (response.choices[0].message.content or "").strip()
+                if raw.startswith("```"): raw = raw.split("\n", 1)[-1]
+                if raw.endswith("```"): raw = raw.rsplit("```", 1)[0]
+                parsed = json.loads(raw.strip())
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception as e:
+                logger.warning(
+                    f"메타데이터 추출 실패 (시도 {attempt + 1}/{VLM_METADATA_ATTEMPTS}): {e}"
                 )
-            raw = (response.choices[0].message.content or "").strip()
-            if raw.startswith("```"): raw = raw.split("\n", 1)[-1]
-            if raw.endswith("```"): raw = raw.rsplit("```", 1)[0]
-            parsed = json.loads(raw.strip())
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception as e:
-            logger.error(f"메타데이터 추출 실패: {e}")
-            return {}
+                if attempt + 1 < VLM_METADATA_ATTEMPTS:
+                    time.sleep(min(3, attempt + 1))
+        return {}
 
 
 def _xlsx_sheet_tables(path, batch_chars=3000):
@@ -2435,7 +2758,10 @@ class DocumentProcessor:
                         logger.info(f"EML 첨부 이미지 로고로 판별 → 스킵: {fname}")
                         continue
                 _say(f"EML 첨부 이미지 편입: {fname}", 12)
-                _emit_image(im, hint=f"[첨부 이미지: {fname or ''}] {desc}".strip())
+                # The description is useful only for logo filtering. It is generated
+                # text, not an OCR layer, so feeding it back as source text can turn
+                # paraphrases into extraction errors.
+                _emit_image(im, hint=f"[첨부 이미지: {fname or ''}]".strip())
                 continue
 
             if aext in (".hwp", ".hwpx"):
@@ -2867,6 +3193,7 @@ class DocumentProcessor:
                     # 중복 제거(완전일치 + substring 포함). 본문성(text/footnote)만 대상.
                     _SUBSTR_DROPPABLE = {"text", "footnote"}
                     elems = [e for e in parsed.get("elements", []) if isinstance(e, dict)]
+                    elems = _resolve_flattened_table_duplicates(elems)
                     norm = [re.sub(r"\s+", " ", (e.get("content") or "")).strip() for e in elems]
                     drop = [False] * len(elems)
                     for i in range(len(elems)):
@@ -2880,13 +3207,9 @@ class DocumentProcessor:
                             # j 가 i 에 포함되고 i 가 더 길면(또는 동일·앞선 블록) j 를 중복으로 제거
                             if norm[j] in norm[i] and (len(norm[j]) < len(norm[i]) or j > i):
                                 drop[j] = True
-                    # 근접중복 제거: 정규화(이메일·꺾쇠·기호 제거) 후 일치/포함이면 긴 쪽만 유지.
-                    def _nrm(s):
-                        s = re.sub(r"<[^>]*>", " ", s)                 # <이메일>·꺾쇠 토큰 제거
-                        s = re.sub(r"[\w.%+\-]+@[\w.\-]+", " ", s)      # 남은 이메일
-                        s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)         # 공백·문장부호 제거
-                        return s.lower()
-                    nnorm = [_nrm(n) for n in norm]
+                    # 근접중복 제거: 서식 문자는 무시하되 주소·URL의 영숫자
+                    # 정체성은 보존해 서로 다른 연락처를 합치지 않는다.
+                    nnorm = [_dedupe_comparison_text(n) for n in norm]
                     for i in range(len(elems)):
                         if drop[i] or elems[i].get("type", "text") not in _SUBSTR_DROPPABLE or len(nnorm[i]) < 16:
                             continue
@@ -2903,6 +3226,7 @@ class DocumentProcessor:
                     deduped = _dedupe_exact_text_elements(
                         [e for k, e in enumerate(elems) if not drop[k]]
                     )
+                    deduped = _drop_trailing_duplicate_heading_cluster(deduped)
                     # TOC sanity cleanup: VLM sometimes assigns the first child page number to a parent/group
                     # label ("I. ...::7") even when no page number is printed on that line. Keep only page
                     # numbers supported by the text-layer leader/page pattern; demote unsupported group labels.
@@ -3019,7 +3343,8 @@ class DocumentProcessor:
                                     rebuilt.append(m)
                             else:
                                 rebuilt.append(e)
-                        deduped = rebuilt
+                        deduped = _drop_prose_duplicated_by_nearby_tables(rebuilt)
+                        deduped = _dedupe_exact_text_elements(deduped)
                     except Exception as te:
                         logger.warning(f"표 검증 실패({stem}): {te}")
                     # figure description 폴백(결정적): 빈 description 으로 RAG 앵커가 사라지지 않게 보정.

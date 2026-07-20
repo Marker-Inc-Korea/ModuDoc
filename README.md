@@ -139,9 +139,12 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `RENDER_DPI` | `300` | 페이지 렌더 해상도(**PDF 포함 전 포맷**). 높을수록 나란히 붙은 표·조밀한 표를 정확히 분리하나 VLM 토큰/시간이 늘어남 |
 | `VLM_IMG_MAXW` | `2464` | VLM 입력 이미지 최대 폭(px, 28의 배수). `RENDER_DPI` 와 짝 — 이 값이 렌더 폭보다 작으면 다운스케일돼 표 분리 효과가 줄어듦 |
 | `VLM_IMG_MAXW_FALLBACK` | `1024` | 반복 폭주/타임아웃 재시도 시 낮추는 폴백 폭 |
+| `VLM_STREAM_ABORT` | `1` | 스트리밍 응답의 반복·입력 대비 과다 생성·전체 시간 초과를 조기에 중단. 호환되지 않는 엔드포인트는 `0`으로 비활성화 |
 | `VLM_COMPACT_RETRY` | `1` | 반복 생성/타임아웃 페이지를 차트·그림 간결 모드로 1회 재추출. 차트 축값 전체 전사 대신 figure 요약+본문 추출로 런어웨이를 회피 |
 | `VLM_COMPACT_RETRY_MAX_TOKENS` | `2048` | compact retry 응답 토큰 상한 |
 | `VLM_COMPACT_RETRY_TIMEOUT` | `240` | compact retry 호출 타임아웃(초) |
+| `VLM_METADATA_TIMEOUT` | `120` | 문서 메타데이터 추출 호출 타임아웃(초) |
+| `VLM_METADATA_ATTEMPTS` | `2` | 일시적인 메타데이터 추출 실패의 총 시도 횟수 |
 | `ZOOM_RASTER_TABLES` | `1` | HWP/HWPX 임베디드 raster 표를 확대 재추출해 오구조를 수리(`0` 으로 끄기). VLM 심판이 승인할 때만 교체 |
 | `ZOOM_VLM_MAX_TOKENS` | `4096` | raster 표 zoom-pass 재추출 응답 토큰 상한. 큰 값을 쓰면 복잡한 표를 더 잘 살릴 수 있지만 장시간 생성 위험이 커짐 |
 | `ZOOM_VLM_TIMEOUT` | `180` | raster 표 zoom-pass 재추출 VLM 호출 타임아웃(초) |
@@ -151,9 +154,11 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `ZOOM_DOC_BUDGET_SEC` | `900` | 문서당 zoom-pass 전체 시간 예산(초). 예산 초과 시 남은 후보를 건너뜀, `0`이면 제한 없음 |
 | `TABLE_QUALITY_REPAIR` | `1` | ragged/그룹 헤더 붕괴 등 객관적 표 구조 오류 페이지만 이미지 기준으로 재추출 |
 | `TABLE_QUALITY_REPAIR_MAX_PAGES` | `8` | 문서당 표 품질 재추출 페이지 상한(`0`이면 제한 없음) |
+| `TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS` | `2` | 구조 불량 표 전용 재추출 최대 시도 횟수(첫 무손실 후보 수용 시 즉시 중단, 최대 `3`) |
 | `TABLE_QUALITY_REPAIR_MAX_TOKENS` | `16384` | 표 품질 재추출 응답 토큰 상한 |
 | `TABLE_QUALITY_REPAIR_TIMEOUT` | `600` | 표 품질 재추출 호출 타임아웃(초) |
 | `TABLE_QUALITY_REPAIR_IMG_MAXW` | `2464` | 표 품질 재추출 이미지 최대 너비 |
+| `TABLE_QUALITY_REPAIR_TRIM_WHITESPACE` | `1` | 표 재추출 전에 큰 빈 여백을 자동 제거해 실제 표 해상도를 확보 (`0`으로 비활성화) |
 | `TABLE_QUALITY_REPAIR_MIN_COVERAGE` | `0.75` | 재추출 후보가 보존해야 하는 기존 구조화 내용의 최소 비율 |
 
 > 💡 **표 구조 정확도 ↔ 비용**: 기본값 `300`DPI/`2464`px 는 서로 붙어 있는 표(예: 좌측 평가표 + 우측 등급표)를 **각각 별도 `<table>` 로 분리**합니다. 속도·토큰을 아끼려면 `RENDER_DPI=200 VLM_IMG_MAXW=1568` 로 낮출 수 있습니다(페이지 수·내용은 동일하나 나란히 표의 분리 정확도는 하락).

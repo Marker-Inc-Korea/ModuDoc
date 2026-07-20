@@ -105,10 +105,6 @@ def _span_int(cell, attr, default=1):
         return default
 
 
-def _direct_row_width(row):
-    return sum(_span_int(cell, "colspan") for cell in _direct_cells(row))
-
-
 def _rowspan_crosses(rows, seam):
     for row_index, row in enumerate(rows[:seam]):
         for cell in _direct_cells(row):
@@ -147,58 +143,17 @@ def _split_stacked_tables(rows, row_width, caption=None):
     ]
 
 
-def _split_nested_tables(html, caption=None):
-    """Promote nested grids to separate table elements without changing text."""
-    soup = BeautifulSoup(html or "", "html.parser")
-    outer = soup.find("table")
-    if outer is None or not outer.find("table"):
-        return None
+def _nested_tables_are_rectangular(table):
+    nested = [item for item in table.find_all("table") if item.find_parent("table") is table]
+    if not nested:
+        return True
+    for item in nested:
+        rows = _rows_of(item)
+        _, widths, _, cols = _build_grid(rows)
+        if not rows or cols < 1 or len(set(widths)) > 1:
+            return False
+    return True
 
-    rows = _rows_of(outer)
-    plain_widths = [
-        _direct_row_width(row)
-        for row in rows
-        if not row.find("table") and _direct_row_width(row) > 0
-    ]
-    try:
-        outer_width = statistics.mode(plain_widths) if plain_widths else None
-    except statistics.StatisticsError:
-        outer_width = None
-
-    nested_records = []
-    for nested in list(outer.find_all("table")):
-        if nested.find_parent("table") is not outer:
-            continue
-        parent_cell = nested.find_parent(["td", "th"])
-        row = parent_cell.find_parent("tr") if parent_cell else None
-        labels = []
-        if row is not None and parent_cell is not None:
-            for cell in _direct_cells(row):
-                if cell is parent_cell:
-                    break
-                text = cell.get_text(" ", strip=True)
-                if text:
-                    labels.append(text)
-        nested_records.append(
-            {"content": str(nested), "caption": " / ".join(labels) or caption}
-        )
-        nested.decompose()
-
-        if row is None or parent_cell is None or not outer_width:
-            continue
-        cells = _direct_cells(row)
-        used = sum(
-            _span_int(cell, "colspan") for cell in cells if cell is not parent_cell
-        )
-        desired = max(1, outer_width - used)
-        if desired > 1:
-            parent_cell["colspan"] = str(desired)
-        elif parent_cell.has_attr("colspan"):
-            del parent_cell["colspan"]
-
-    if not nested_records:
-        return None
-    return [{"content": str(outer), "caption": caption}, *nested_records]
 
 def validate_and_repair_table(html, caption=None):
     """반환 (elements:list[{'content':html,'caption':...}], needs_retry:bool, issues:list).
@@ -210,10 +165,20 @@ def validate_and_repair_table(html, caption=None):
             return [{"content": html, "caption": caption}], False, []
         top = tables[0]
         if top.find("table"):
-            split = _split_nested_tables(html, caption)
-            if split:
-                return split, False, ["nested_table_split"]
-            return [{"content": html, "caption": caption}], False, ["nested_table"]
+            rows = _rows_of(top)
+            _, row_width, _, _ = _build_grid(rows)
+            issues = []
+            if len(set(row_width)) > 1:
+                issues.append("ragged_rows")
+            if _nested_tables_are_rectangular(top):
+                issues.append("nested_table_kept")
+            else:
+                issues.append("nested_table")
+            return (
+                [{"content": html, "caption": caption}],
+                bool(set(issues) & {"ragged_rows", "nested_table"}),
+                issues,
+            )
         rows = _rows_of(top)
         if len(rows) < 2:
             return [{"content": html, "caption": caption}], False, []
@@ -249,14 +214,14 @@ def validate_and_repair_table(html, caption=None):
                 right_has = any(_norm(grid[r].get(c + 1, "")) for r in range(R))
                 if col_all_empty and left_has and right_has:
                     if not _has_colspan_crossing(grid, c):
-                        split_at = ("gutter", c, c + 1); issues.append(("gutter", c, 0)); break
+                        split_at = ("gutter", c, c + 1); break
             # (4b) tiled header: 헤더행 좌반복==우반복
             if split_at is None and R >= 2:
                 hdr = [_norm(grid[0].get(c, "")) for c in range(C)]
                 for k in range(2, C // 2 + 1):
                     if hdr[0:k] == hdr[k:2 * k] and any(hdr[0:k]):
                         if 2 * k == C and not _has_colspan_crossing(grid, k):
-                            split_at = ("tiled", k, k); issues.append(("tiled_header", k, 0)); break
+                            split_at = ("tiled", k, k); break
 
         if split_at:
             kind, lo_hi, rstart = split_at
@@ -270,8 +235,20 @@ def validate_and_repair_table(html, caption=None):
             def _ok(h):
                 g, rw, r2, c2 = _build_grid(_rows_of(BeautifulSoup(h, "html.parser").find("table")))
                 nonempty = sum(1 for gr in g if any(_norm(v) for v in gr.values()))
-                return c2 >= 2 and nonempty >= 2
+                # A blank column inside one continuous score/data matrix is not
+                # proof of two side-by-side tables. Require independent textual
+                # labels on both halves before severing row associations.
+                labels = sum(
+                    1 for gr in g for value in gr.values()
+                    if value != _CONT
+                    and sum(char.isalpha() for char in str(value or "")) >= 2
+                )
+                return c2 >= 2 and nonempty >= 2 and labels >= 2
             if _ok(left) and _ok(right):
+                issues.append(
+                    ("gutter", lo_hi, 0) if kind == "gutter"
+                    else ("tiled_header", lo_hi, 0)
+                )
                 return ([{"content": left, "caption": caption},
                          {"content": right, "caption": (caption + " (우)") if caption else None}],
                         False, issues)
@@ -318,7 +295,11 @@ def assess_table_quality(html, caption=None, allow_nested=False):
             out["confidence"] = 0.0
             out["issues"].append("no_table")
             return out
-        if table.find("table") is not None and not allow_nested:
+        if (
+            table.find("table") is not None
+            and not allow_nested
+            and not _nested_tables_are_rectangular(table)
+        ):
             out["issues"].append("nested_table")
             out["confidence"] = min(out["confidence"], 0.65)
         rows = _rows_of(table)
