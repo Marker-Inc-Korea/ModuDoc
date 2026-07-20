@@ -834,23 +834,27 @@ def _drop_prose_duplicated_by_nearby_figures(elements, source_text):
         if visible:
             figures.append((index, visible))
 
-    cleaned = []
+    matches_by_figure = {}
     for index, element in enumerate(source):
         if not isinstance(element, dict) or element.get("type", "text") != "text":
-            cleaned.append(element)
             continue
         value = _compact_visible_text(element.get("content"))
-        duplicate = bool(
-            len(value) >= 16
-            and normalized_source.count(value) <= 1
-            and any(
-                abs(index - figure_index) <= 8 and value in figure_text
-                for figure_index, figure_text in figures
-            )
-        )
-        if not duplicate:
-            cleaned.append(element)
-    return cleaned
+        if len(value) < 16 or normalized_source.count(value) > 1:
+            continue
+        matching_figures = [
+            figure_index
+            for figure_index, figure_text in figures
+            if abs(index - figure_index) <= 8 and value in figure_text
+        ]
+        if len(matching_figures) == 1:
+            matches_by_figure.setdefault(matching_figures[0], []).append(index)
+
+    remove = {
+        text_indices[0]
+        for text_indices in matches_by_figure.values()
+        if len(text_indices) == 1
+    }
+    return [element for index, element in enumerate(source) if index not in remove]
 
 
 def _mark_element(e, source=None, confidence=None, issues=None):

@@ -343,6 +343,28 @@ class VLMResilienceTests(unittest.TestCase):
 
         self.assertEqual(cleaned, [{"type": "heading_2", "content": "Registration"}, figure])
 
+    def test_multiple_structured_instructions_are_not_folded_into_one_figure(self):
+        first = {
+            "type": "text",
+            "content": "Choose the pending request from the filtered results list.",
+        }
+        second = {
+            "type": "text",
+            "content": "Confirm the selected request in the approval dialog.",
+        }
+        figure = {
+            "type": "figure",
+            "content": first["content"] + "\n" + second["content"],
+            "caption": "Approval screen",
+            "description": "A screen showing the request approval workflow.",
+        }
+
+        cleaned = utils._drop_prose_duplicated_by_nearby_figures(
+            [first, second, figure], first["content"] + "\n" + second["content"]
+        )
+
+        self.assertEqual(cleaned, [first, second, figure])
+
     def test_matching_attached_page_counter_is_removed_from_edge_heading(self):
         elements = [
             {"type": "heading_1", "content": "Appendix transaction report - 1 8 -"},
