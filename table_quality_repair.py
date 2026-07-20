@@ -33,6 +33,9 @@ TABLE_QUALITY_REPAIR_IMG_MAXW = max(1024, int(os.environ.get("TABLE_QUALITY_REPA
 TABLE_QUALITY_REPAIR_TRIM_WHITESPACE = (
     os.environ.get("TABLE_QUALITY_REPAIR_TRIM_WHITESPACE", "1") == "1"
 )
+TABLE_QUALITY_REPAIR_CROPS = (
+    os.environ.get("TABLE_QUALITY_REPAIR_CROPS", "1") == "1"
+)
 TABLE_QUALITY_REPAIR_MIN_COVERAGE = min(
     1.0, max(0.5, float(os.environ.get("TABLE_QUALITY_REPAIR_MIN_COVERAGE", "0.75")))
 )
@@ -47,6 +50,7 @@ HARD_ISSUES = {
 REVIEW_ISSUES = {
     "possible_cross_row_bleed",
     "possible_internal_duplicate_text",
+    "possible_nested_layout_mismatch",
 }
 
 SYSTEM_PROMPT = """You are repairing a document page whose previous table extraction failed structural QA.
@@ -89,6 +93,8 @@ Rules:
 - Count the visible top-level cell regions in each row before assigning spans, then expand every row mentally and ensure it resolves to the same column count.
 - Keep every blank cell bounded by visible grid lines, including leading and trailing blank header cells. Never absorb such a cell into a neighboring colspan.
 - Preserve merged headers and genuinely nested grids with correct colspan/rowspan.
+- A full-width section band is its own row with colspan covering every outer column;
+  never attach it to one data column or split the data row below it.
 - Separate visually separate grids. Never add an all-empty padding column.
 - If the supplied reference is not a real bordered grid in the image, return an empty elements array.
 - Output no markdown fences or commentary."""
@@ -127,12 +133,21 @@ def _problem_tables(data: dict) -> list[dict]:
     for index, element in enumerate(data.get("elements") or []):
         if not isinstance(element, dict) or element.get("type") != "table":
             continue
-        allow_nested = element.get("_source") == "native_table"
+        metadata_issues = set(element.get("_issues") or [])
+        allow_nested = (
+            element.get("_source") == "native_table"
+            or "nested_table_kept" in metadata_issues
+        )
         quality = table_validate.assess_table_quality(
             element.get("content"), element.get("caption"), allow_nested=allow_nested
         )
         quality_issues = set(quality.get("issues") or [])
         issues = quality_issues & (HARD_ISSUES | REVIEW_ISSUES)
+        if (
+            "nested_table_kept" in metadata_issues
+            and element.get("_source") not in (None, "native_table")
+        ):
+            issues.add("possible_nested_layout_mismatch")
         if issues or float(quality.get("confidence") or 0.0) < 0.75:
             problems.append({"index": index, "issues": sorted(issues), "quality": quality})
     return problems
@@ -144,13 +159,18 @@ def _preview_tables(data: dict) -> dict:
         if not isinstance(element, dict) or element.get("type") != "table" or not element.get("content"):
             preview["elements"].append(element)
             continue
-        repaired, _, _ = table_validate.validate_and_repair_table(
+        repaired, _, repair_issues = table_validate.validate_and_repair_table(
             element.get("content"), element.get("caption")
         )
         for item in repaired:
             candidate = {**element, "content": item.get("content")}
             if item.get("caption") is not None:
                 candidate["caption"] = item.get("caption")
+            if "nested_table_kept" in set(repair_issues or []):
+                existing = list(candidate.get("_issues") or [])
+                if "nested_table_kept" not in existing:
+                    existing.append("nested_table_kept")
+                candidate["_issues"] = existing
             preview["elements"].append(candidate)
     return preview
 
@@ -241,8 +261,9 @@ def _table_match_metrics(original: dict, candidate: dict) -> dict:
         SequenceMatcher(None, old_caption, new_caption).ratio()
         if old_caption and new_caption else 0.0
     )
+    allow_nested = "nested_table_kept" in set(candidate.get("_issues") or [])
     quality = table_validate.assess_table_quality(
-        candidate.get("content"), candidate.get("caption")
+        candidate.get("content"), candidate.get("caption"), allow_nested=allow_nested
     )
     hard_issues = sorted(set(quality.get("issues") or []) & HARD_ISSUES)
     char_recall = shared_chars / max(1, len(old_text))
@@ -475,20 +496,52 @@ def _crop_content_bbox(image):
     return image.crop(expanded)
 
 
+def _encode_pil_image(image) -> str:
+    from PIL import Image
+
+    image = image.convert("RGB")
+    if image.width > TABLE_QUALITY_REPAIR_IMG_MAXW:
+        ratio = TABLE_QUALITY_REPAIR_IMG_MAXW / image.width
+        image = image.resize(
+            (TABLE_QUALITY_REPAIR_IMG_MAXW, max(1, int(image.height * ratio))),
+            Image.LANCZOS,
+        )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def _encode_image(path: Path) -> str:
     from PIL import Image
 
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        image = _crop_content_bbox(image)
-        if image.width > TABLE_QUALITY_REPAIR_IMG_MAXW:
-            ratio = TABLE_QUALITY_REPAIR_IMG_MAXW / image.width
-            image = image.resize(
-                (TABLE_QUALITY_REPAIR_IMG_MAXW, int(image.height * ratio)), Image.LANCZOS
+    with Image.open(path) as source:
+        image = _crop_content_bbox(source.convert("RGB"))
+        return _encode_pil_image(image)
+
+
+def _encode_table_images(path: Path) -> list[str]:
+    """Return a page overview plus enlarged overlapping vertical bands."""
+    from PIL import Image
+
+    with Image.open(path) as source:
+        image = _crop_content_bbox(source.convert("RGB"))
+        variants = [image.copy()]
+        if TABLE_QUALITY_REPAIR_CROPS and image.height > image.width * 1.15:
+            band_height = max(1, round(image.height * 0.62))
+            variants.extend(
+                [
+                    image.crop((0, 0, image.width, band_height)),
+                    image.crop(
+                        (
+                            0,
+                            max(0, image.height - band_height),
+                            image.width,
+                            image.height,
+                        )
+                    ),
+                ]
             )
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+    return [_encode_pil_image(variant) for variant in variants[:3]]
 
 
 def _first_json(text: str) -> dict | None:
@@ -1039,8 +1092,10 @@ def _request_table_candidate(
     user_text = (
         "Broken table references:\n"
         f"<broken_tables>{json.dumps(references, ensure_ascii=False)}</broken_tables>\n\n"
-        "Return only the corresponding corrected table grid(s) from the image."
+        "The images are the same page: first an overview, then enlarged overlapping vertical bands when present. "
+        "Return only the corresponding corrected table grid(s)."
     )
+    images = _encode_table_images(image_path)
     request = {
         "model": model,
         "messages": [
@@ -1050,10 +1105,10 @@ def _request_table_candidate(
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{_encode_image(image_path)}"},
-                    },
-                    {"type": "text", "text": user_text},
-                ],
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    }
+                    for encoded in images
+                ] + [{"type": "text", "text": user_text}],
             },
         ],
         "temperature": 0,
@@ -1061,7 +1116,19 @@ def _request_table_candidate(
         "timeout": TABLE_QUALITY_REPAIR_TIMEOUT,
         "extra_body": {"repetition_penalty": 1.08, "no_repeat_ngram_size": 24},
     }
-    return _request_json(client, request)
+    try:
+        return _request_json(client, request)
+    except Exception:
+        if len(images) <= 1:
+            raise
+        request["messages"][1]["content"] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{images[0]}"},
+            },
+            {"type": "text", "text": user_text},
+        ]
+        return _request_json(client, request)
 
 
 def _apply_geometry_correction(candidate: dict, correction: dict | None) -> dict | None:
@@ -1426,6 +1493,126 @@ def _raster_evidenced_header_rebuild(
     return candidate, [change]
 
 
+def _normalize_grouped_stub_rowspans(data: dict) -> tuple[dict | None, list[dict]]:
+    """Restore repeated row groups whose left stub spans a fixed number of rows."""
+    candidate = copy.deepcopy(data)
+    changes = []
+    for element_index, element in enumerate(data.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        if len(rows) < 7:
+            continue
+        header = rows[0].find_all(["td", "th"], recursive=False)
+        body = [row.find_all(["td", "th"], recursive=False) for row in rows[1:]]
+        if (
+            len(header) < 3
+            or not all(cell.name == "th" for cell in header)
+            or any(
+                table_validate._span_int(cell, "colspan") != 1
+                or table_validate._span_int(cell, "rowspan") != 1
+                for row_cells in [header] + body
+                for cell in row_cells
+            )
+        ):
+            continue
+        target_width = len(header) + 1
+        starts = [
+            index
+            for index, cells in enumerate(body)
+            if len(cells) == target_width
+            and cells[0].find("br") is not None
+            and cells[0].get_text(" ", strip=True)
+            and cells[1].get_text(" ", strip=True)
+        ]
+        if len(starts) < 2:
+            continue
+        group_sizes = [right - left for left, right in zip(starts, starts[1:])]
+        if not group_sizes or len(set(group_sizes)) != 1:
+            continue
+        group_size = group_sizes[0]
+        groups_end = starts[-1] + group_size
+        if (
+            starts[0] != 0
+            or group_size < 3
+            or groups_end != len(body) - 1
+        ):
+            continue
+
+        valid = True
+        for start in starts:
+            group = body[start:start + group_size]
+            if len(group) != group_size or not any(
+                len(cells) == target_width - 1 for cells in group[1:]
+            ):
+                valid = False
+                break
+            if any(len(cells) not in {target_width - 1, target_width} for cells in group[1:]):
+                valid = False
+                break
+            for cells in group[1:]:
+                if len(cells) == target_width and not any(
+                    not cell.get_text(" ", strip=True) and cell.find("table") is None
+                    for cell in cells[1:]
+                ):
+                    valid = False
+                    break
+            if not valid:
+                break
+        summary = body[-1]
+        if (
+            not valid
+            or len(summary) != target_width
+            or summary[0].find("br") is not None
+            or not summary[0].get_text(" ", strip=True)
+            or sum(not cell.get_text(" ", strip=True) for cell in summary[1:]) < 2
+        ):
+            continue
+
+        def remove_redundant_empty(cells):
+            for cell in cells[1:]:
+                if not cell.get_text(" ", strip=True) and cell.find("table") is None:
+                    cell.extract()
+                    return True
+            return False
+
+        header[0]["colspan"] = "2"
+        for start in starts:
+            group = body[start:start + group_size]
+            group[0][0]["rowspan"] = str(group_size)
+            for cells in group[1:]:
+                if len(cells) == target_width and not remove_redundant_empty(cells):
+                    valid = False
+                    break
+            if not valid:
+                break
+        if not valid:
+            continue
+        summary[0]["colspan"] = "2"
+        if not remove_redundant_empty(summary):
+            continue
+        patched_element = candidate["elements"][element_index]
+        patched_element["content"] = str(table)
+        for key in ("_source", "_confidence", "_issues", "_native"):
+            patched_element.pop(key, None)
+        widths = _table_geometry(patched_element).get("expanded_row_widths") or []
+        if not widths or any(width != target_width for width in widths):
+            continue
+        changes.append(
+            {
+                "element_index": element_index,
+                "strategy": "grouped_stub_rowspans_restored",
+                "groups": len(starts),
+                "group_size": group_size,
+            }
+        )
+    return (candidate, changes) if changes else (None, [])
+
+
 def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[dict]]:
     """Build a text-lossless geometry candidate for common VLM row artifacts."""
     candidate = copy.deepcopy(data)
@@ -1530,7 +1717,9 @@ def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[d
 def _validated_deterministic_geometry_repair(
     image_path: Path, original: dict
 ) -> tuple[dict | None, list[dict], dict | None]:
-    corrected, changes = _raster_evidenced_header_rebuild(image_path, original)
+    corrected, changes = _normalize_grouped_stub_rowspans(original)
+    if corrected is None:
+        corrected, changes = _raster_evidenced_header_rebuild(image_path, original)
     if corrected is None:
         normalized, changes = _normalize_sparse_continuation_rows(original)
         if normalized is None:

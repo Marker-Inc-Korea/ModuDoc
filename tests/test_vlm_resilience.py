@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -244,6 +245,27 @@ class VLMResilienceTests(unittest.TestCase):
 
         self.assertEqual(cleaned, [heading, figure])
 
+    def test_duplicate_figure_uses_source_order_when_heading_labels_differ(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Service endpoint</td>"
+                "<td>Processing queue</td></tr></table>"
+            ),
+            "caption": "System overview",
+            "description": "A diagram showing two connected processing areas.",
+        }
+        heading = {"type": "heading_2", "content": "2. Operational sequence"}
+        text_layer = (
+            "2. Operational sequence Service endpoint Processing queue"
+        )
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            [figure, heading, figure.copy()], text_layer
+        )
+
+        self.assertEqual(cleaned, [heading, figure])
+
     def test_visibly_repeated_figure_is_preserved_when_text_repeats(self):
         figure = {
             "type": "figure",
@@ -265,6 +287,70 @@ class VLMResilienceTests(unittest.TestCase):
         )
 
         self.assertEqual(cleaned, elements)
+
+    def test_plain_text_pagination_is_deterministic_and_lossless(self):
+        source = (
+            "Header value\n\n"
+            + "A deliberately long line with stable words and digits 12345. " * 12
+            + "\nFinal line"
+        )
+
+        first = utils._paginate_plain_text(source, width=36, lines_per_page=10)
+        second = utils._paginate_plain_text(source, width=36, lines_per_page=10)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first)
+        self.assertTrue(all(page.strip() for page in first))
+        self.assertEqual(
+            utils._compact_visible_text("".join(first)),
+            utils._compact_visible_text(source),
+        )
+
+    def test_eml_body_render_is_direct_and_node_independent(self):
+        message = EmailMessage()
+        message["From"] = "sender@example.org"
+        message["To"] = "recipient@example.org"
+        message["Subject"] = "Deterministic rendering check"
+        message.set_content("First paragraph.\n\nSecond paragraph with 12345.")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eml_path = root / "message.eml"
+            output_dir = root / "output"
+            temp_dir = root / "temp"
+            output_dir.mkdir()
+            eml_path.write_bytes(message.as_bytes())
+            with patch.object(
+                utils.DocumentProcessor,
+                "convert_to_pdf",
+                side_effect=AssertionError("EML body must not invoke LibreOffice"),
+            ):
+                pages = utils.DocumentProcessor._render_eml(
+                    str(eml_path),
+                    str(output_dir),
+                    str(temp_dir),
+                    "",
+                    "unused-model",
+                )
+
+            self.assertEqual(pages, 1)
+            structured = json.loads(
+                (output_dir / "page_0001_structured.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(structured["elements"])
+            self.assertTrue(
+                all(
+                    element.get("_source") == "eml_text"
+                    and element.get("_confidence") == 1.0
+                    for element in structured["elements"]
+                )
+            )
+            from PIL import Image
+
+            with Image.open(output_dir / "page_0001.png") as rendered:
+                self.assertNotEqual(rendered.convert("L").getextrema(), (255, 255))
 
     def test_nonlocal_identical_figures_are_not_deduplicated(self):
         figure = {
@@ -305,6 +391,29 @@ class VLMResilienceTests(unittest.TestCase):
             figure.copy(),
         ]
         text_layer = "Regional summary Regional performance indicator"
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, elements)
+
+    def test_heading_after_the_source_figure_does_not_relocate_it(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary",
+            "description": "A summary panel containing the regional values.",
+        }
+        heading = {"type": "heading_2", "content": "Independent appendix"}
+        elements = [figure, heading, figure.copy()]
+        text_layer = (
+            "Regional performance indicator Current reporting value "
+            "Independent appendix"
+        )
 
         cleaned = utils._dedupe_figures_supported_by_text_layer(
             elements, text_layer

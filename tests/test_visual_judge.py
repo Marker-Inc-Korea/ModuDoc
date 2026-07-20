@@ -1,9 +1,32 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools import visual_judge_pages
 
 
 class VisualJudgeTests(unittest.TestCase):
+    def test_compact_structured_includes_authoritative_element_indexes(self):
+        payload = {
+            "page_number": 3,
+            "elements": [
+                {"type": "heading_2", "content": "First section"},
+                {"type": "text", "content": "Body"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "page.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            compact = json.loads(
+                visual_judge_pages.compact_structured(str(path), 10000)
+            )
+
+        self.assertEqual(
+            [element["index"] for element in compact["elements"]], [0, 1]
+        )
+
     def test_objective_quality_metadata_cannot_be_overturned(self):
         data = {
             "elements": [

@@ -66,8 +66,14 @@ order left-to-right and keep each card's title and bullets together.
 For tables, exact HTML tags may differ, but cells/rows/headers and merged-cell
 meaning must be preserved. Before claiming that the candidate split or merged
 tables, count its actual top-level table elements and <table> tags and cite the
-relevant element index. For figures/screenshots/charts, visible labels/data and
-a reasonable description must be present.
+relevant element index. A full-width section or phase row inside one continuous,
+aligned outer grid does not split that grid into multiple tables; it is valid as
+one colspan row followed by the next section's rows. For figures/screenshots/
+charts, visible labels/data and a reasonable description must be present.
+
+Each candidate element includes an explicit zero-based "index". That index is
+the authoritative JSON sequence. Quote the relevant indexes before reporting
+wrong_order; do not infer candidate order from coordinates in the page image.
 
 Evidence is mandatory for a failure:
 - Every wrong_text claim needs an image_text/candidate_text pair. Never cite
@@ -121,6 +127,10 @@ unnumbered heading between two numbered sections can belong to the earlier
 section even at the top of the next column. For bounded peer cards or tiles,
 expect row order left-to-right and verify that each card's body remains attached
 to its own title.
+Each candidate element includes an explicit zero-based "index" that defines its
+sequence. Cite those indexes before confirming wrong_order. A full-width section
+or phase row inside one continuous, aligned outer grid is valid as a colspan row
+within one table and does not by itself prove that separate tables were merged.
 Whitespace and punctuation-style variants are not wrong_text. Page counters,
 repeated headers, and repeated footers are not missing_text.
 When evidence is ambiguous, set confirmed_failure=false rather than guessing."""
@@ -695,16 +705,18 @@ def compact_structured(path: str, limit: int) -> str:
             if data.get(key) not in (None, "", False)
         }
         compact["elements"] = []
-        for element in data.get("elements") or []:
+        for index, element in enumerate(data.get("elements") or []):
             if not isinstance(element, dict):
                 continue
-            compact["elements"].append(
+            compact_element = {"index": index}
+            compact_element.update(
                 {
                     key: element.get(key)
                     for key in ("type", "content", "caption", "description")
                     if element.get(key) not in (None, "")
                 }
             )
+            compact["elements"].append(compact_element)
         text = json.dumps(compact, ensure_ascii=False)
     except Exception:
         text = Path(path).read_text(encoding="utf-8", errors="replace")

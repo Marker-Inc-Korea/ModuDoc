@@ -9,6 +9,7 @@ import logging
 import platform
 import subprocess
 import tempfile
+import textwrap
 import threading
 import time
 import zipfile
@@ -296,6 +297,38 @@ def _element_visible_text(element):
 def _compact_visible_text(text):
     value = unicodedata.normalize("NFKC", str(text or "")).casefold()
     return "".join(char for char in value if char.isalnum())
+
+
+def _paginate_plain_text(text, width=84, lines_per_page=88):
+    """Wrap trusted plain text into deterministic, non-empty display pages."""
+    wrapped = []
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    for raw_line in normalized.split("\n"):
+        if not raw_line.strip():
+            if wrapped and wrapped[-1] != "":
+                wrapped.append("")
+            continue
+        wrapped.extend(
+            textwrap.wrap(
+                raw_line,
+                width=max(20, int(width)),
+                break_long_words=True,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=True,
+            )
+            or [raw_line]
+        )
+    while wrapped and not wrapped[-1]:
+        wrapped.pop()
+    if not wrapped:
+        return []
+    page_size = max(10, int(lines_per_page))
+    return [
+        "\n".join(wrapped[start:start + page_size]).strip()
+        for start in range(0, len(wrapped), page_size)
+        if any(line.strip() for line in wrapped[start:start + page_size])
+    ]
 
 
 def _dedupe_comparison_text(text):
@@ -630,8 +663,37 @@ def _dedupe_figures_supported_by_text_layer(elements, source_text):
             for anchor in normalized_anchors
             if (count := normalized_source.count(anchor)) > 0
         ]
-        if len(occurrence_evidence) < 2 and not any(
-            len(anchor) >= 24 for anchor, _ in occurrence_evidence
+
+        def immediate_heading_source_order(index):
+            if index <= 0:
+                return False
+            previous = source[index - 1]
+            if not isinstance(previous, dict) or not str(
+                previous.get("type") or ""
+            ).startswith("heading_"):
+                return False
+            heading = _compact_visible_text(previous.get("content"))
+            heading_position = normalized_source.find(heading)
+            return bool(
+                len(heading) >= 4
+                and heading_position >= 0
+                and any(
+                    normalized_source.find(anchor, heading_position + len(heading))
+                    >= 0
+                    for anchor in normalized_anchors
+                )
+            )
+
+        strong_occurrence_evidence = (
+            len(occurrence_evidence) >= 2
+            or any(len(anchor) >= 24 for anchor, _ in occurrence_evidence)
+        )
+        ordered_heading_evidence = any(
+            immediate_heading_source_order(index) for index in indices
+        )
+        if not strong_occurrence_evidence and not (
+            ordered_heading_evidence
+            and any(len(anchor) >= 12 for anchor, _ in occurrence_evidence)
         ):
             continue
         supported_copies = min(count for _, count in occurrence_evidence)
@@ -641,7 +703,7 @@ def _dedupe_figures_supported_by_text_layer(elements, source_text):
         caption = _compact_visible_text(figure.get("caption"))
 
         def context_score(index):
-            score = 0
+            score = 1 if immediate_heading_source_order(index) else 0
             for distance in (1, 2):
                 previous_index = index - distance
                 if previous_index < 0:
@@ -674,6 +736,10 @@ def _dedupe_figures_supported_by_text_layer(elements, source_text):
         ranked = sorted(
             indices, key=lambda index: (-context_scores[index], index)
         )
+        if intervening and keep_count < len(ranked):
+            cutoff = context_scores[ranked[keep_count - 1]]
+            if context_scores[ranked[keep_count]] == cutoff:
+                continue
         keep = set(ranked[:keep_count])
         remove.update(index for index in indices if index not in keep)
 
@@ -2033,6 +2099,7 @@ Use the following exact XML template:
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading content exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items on a Table of Contents page. Format content as "title::page_number".
    - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image and transcribe the legible title, legend entries, axis labels, major endpoint/tick values, explicitly printed data labels, and annotations needed to interpret it. Do NOT enumerate unlabeled plotted samples, infer intermediate values, or repeat dense micro-labels. List retained items once in visual reading order. A screenshot dominated by readable forms, messages, Q&A cards, or document text is structured as separate text/table elements for its visible regions; do not duplicate that text in a figure element. For photographs or decorative images with no data, leave the element body empty. The description MUST be written in the document body language (Korean for a Korean document) EVEN IF the figure's labels are in another language; for other screenshots/UI captures put non-structured on-screen text in the body but still write the description — NEVER leave description empty for a figure. Match detail to type: charts → chart type + concrete trend shape (계단식/선형/급증·급락) + peak position + series comparison; diagrams → main nodes and their flow/relationships; photos/maps/renderings → key subject in 1–2 sentences; screenshots → one sentence on purpose (do not repeat the body data). ANTI-HALLUCINATION: if no numbers are printed on the axes/legend, do NOT invent them — state "축에 수치 미표기" and describe only the qualitative shape.
+   - A flowchart or architecture diagram made of boxes, arrows, actors, and free-positioned labels is a figure, NOT a table unless a genuine rectangular cell grid is visible. Emit one figure per visually distinct diagram, transcribe each node and connector label once in figure content, and do not repeat those labels in separate text elements.
    - footnote: ONLY for superscript-style reference notes at the very bottom margin (e.g. *, ①, ※ markers). Do NOT use for regular body paragraphs.
    - table caption: Put the table title in the caption attribute, NOT as a separate heading element.
  6. CRITICAL — NO DUPLICATION: Each piece of content must appear exactly ONCE. Never output the same text in multiple elements. Emit an identical figure element twice only when two distinct visual instances are actually present on the page."""
@@ -2072,6 +2139,7 @@ Use the following JSON schema:
      • Photograph/aerial/map/rendering: 1–2 sentences on the key subject and composition, then STOP. Describe only what is in the frame; if you read a place-name, sign, or caption in the photo, do NOT append background facts, history, or guesses about it.
      • Screenshot/UI capture: ONE sentence on the screen's purpose — the on-screen data already goes in "content", so do NOT repeat it in the description.
      ANTI-HALLUCINATION: if the axes/legend/data-labels carry NO printed numbers, do NOT invent any — state "축에 수치 미표기" and describe only the qualitative shape. NEVER leave "description" empty for a figure. (한국어 차트 예: "분기별 매출 막대그래프. 9~12월 계단식 상승, 12월 1.2억으로 정점, A계열이 B계열을 상회.")
+   - A flowchart or architecture diagram made of boxes, arrows, actors, and free-positioned labels is a figure, NOT a table unless a genuine rectangular cell grid is visible. Emit one figure per visually distinct diagram, transcribe each node and connector label once in figure content, and do not repeat those labels in separate text elements.
    - footnote: ONLY for superscript-style reference notes (e.g., *, ①, ※ markers at the very bottom margin of the page). Do NOT use for regular body text that happens to appear at the bottom.
  3. CRITICAL — NO DUPLICATION: Each piece of text content must appear exactly ONCE in the elements array. Never output the same content in multiple elements. Emit an identical figure element twice only when two distinct visual instances are actually present on the page.
 4. If the page is empty, return an empty "elements" array."""
@@ -2106,6 +2174,7 @@ Your task is to convert the provided document text (and layout image if availabl
      Worked example — every row resolves to exactly 7 columns:
      <table><tr><th rowspan="2">항목</th><th colspan="2">2024년</th><th colspan="2">2025년</th><th rowspan="2">증감</th><th rowspan="2">비고</th></tr><tr><th>상반기</th><th>하반기</th><th>상반기</th><th>하반기</th></tr><tr><td>매출</td><td>10</td><td>12</td><td>13</td><td>15</td><td>+2</td><td>-</td></tr></table>
      (header row-1 = 1+2+2+1+1 = 7; row-2 fills only the 4 sub-columns under the two colspan groups while 항목·증감·비고 carry down by rowspan; body = 7. All rows = 7. No blank padding column.)
+  (8-1) A full-width section band inside a table is its OWN row with one cell whose colspan covers every outer column. Never attach that band to one data column or model it by splitting the following data row. A nested grid remains inside its actual parent cell below the section band.
   (9) MULTI-LINE CELL: when content is stacked on several lines INSIDE one bordered cell (e.g. a name with its phone number beneath it in the SAME cell, or a value with its unit below), transcribe EVERY line of that cell joined by <br> — never keep only the first line. This applies ONLY to lines within one cell's borders; genuinely separate rows stay separate <tr>.
 - TABLE CAPTION + NOTES: put the FULL table title in "caption" INCLUDING any trailing parenthetical unit/as-of suffix exactly as printed (e.g. "현황(억원)", "생산량(단위:천톤)", "(’25.6.23 기준)"). A footnote or source line printed OUTSIDE the table border beneath it ("주) …", "* 출처: …", "* 주:") → emit as its OWN text element (type text, not footnote); do NOT drop it and do NOT duplicate an in-table note row.
 
@@ -3164,7 +3233,7 @@ class DocumentProcessor:
                     output_format="json"):
         """EML → page_NNNN.png/.txt 연속 시퀀스.
 
-        1) 헤더(보낸/받는/제목/일시) + 디코딩된 본문을 한 페이지로 렌더.
+        1) 헤더와 디코딩된 본문을 결정적 텍스트 페이지로 렌더.
         2) 첨부를 종류별로 재귀 렌더해 같은 페이지 시퀀스에 이어붙임
            (HWP/HWPX→rhwp, PDF/DOCX/XLSX 등→PDF 변환, 이미지→PNG 1페이지).
         반환: 생성된 총 페이지 수.
@@ -3316,11 +3385,7 @@ class DocumentProcessor:
             except Exception:
                 return False
 
-        # --- 1) 헤더 + 본문 → HTML → PDF → 페이지 ---
-        def _hdr(name):
-            v = msg.get(name)
-            return _html.escape(str(v)) if v else ""
-
+        # --- 1) 헤더 + 본문 → 결정적 텍스트 페이지 ---
         body_text = ""
         try:
             body_obj = msg.get_body(preferencelist=("plain", "html"))
@@ -3340,33 +3405,52 @@ class DocumentProcessor:
         body_text = re.sub(r"[ \t]+\n", "\n", (body_text or "").strip())
         # 더블스페이싱 제거 → 단일 간격.
         body_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", body_text)
-        body_html = _html.escape(body_text).replace("\n", "<br>")
-
-        # 표 대신 시맨틱 태그로 커버 구성.
-        def _row(label, name):
-            v = _hdr(name)
-            return f"<p style='margin:1px 0'><b>{label}:</b> {v}</p>" if v else ""
-        cover_html = (
-            "<html><head><meta charset='utf-8'></head>"
-            "<body style=\"font-family:'NanumGothic','Malgun Gothic',sans-serif;font-size:10pt\">"
-            + _row("보낸사람", "From") + _row("받는사람", "To") + _row("참조", "Cc")
-            + _row("제목", "Subject") + _row("일시", "Date")
-            + f"<hr><div style='font-size:10pt'>{body_html}</div>"
-            + "</body></html>"
-        )
         _say("EML 본문 렌더 중...", 8)
-        cover_html_path = os.path.join(temp_pdf_dir, f"_eml_body_{uuid.uuid4().hex}.html")
-        with open(cover_html_path, "w", encoding="utf-8") as fh:
-            fh.write(cover_html)
-        body_pdf = cls.convert_to_pdf(cover_html_path, temp_pdf_dir)
-        if body_pdf and os.path.exists(body_pdf):
-            _emit_pdf(body_pdf, direct_structured=True)
-            try: os.remove(body_pdf)
-            except OSError: pass
-        else:
-            logger.warning("EML 본문 HTML→PDF 변환 실패 — 본문 페이지 없이 첨부만 진행")
-        try: os.remove(cover_html_path)
-        except OSError: pass
+        header_lines = []
+        for label, field in (
+            ("From", "From"),
+            ("To", "To"),
+            ("Cc", "Cc"),
+            ("Subject", "Subject"),
+            ("Date", "Date"),
+        ):
+            value = msg.get(field)
+            if value:
+                header_lines.append(f"{label}: {value}")
+        cover_text = "\n".join(header_lines)
+        if body_text:
+            cover_text += ("\n\n" if cover_text else "") + body_text
+
+        plain_pages = _paginate_plain_text(cover_text)
+        if plain_pages:
+            from PIL import (
+                Image as _PILImage,
+                ImageDraw as _ImageDraw,
+                ImageFont as _ImageFont,
+            )
+
+            def _load_text_font(size):
+                for candidate in (
+                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                ):
+                    try:
+                        return _ImageFont.truetype(candidate, size)
+                    except OSError:
+                        continue
+                return _ImageFont.load_default()
+
+            width, height = int(8.27 * RENDER_DPI), int(11.69 * RENDER_DPI)
+            font = _load_text_font(26)
+            for page_text in plain_pages:
+                image = _PILImage.new("RGB", (width, height), "white")
+                draw = _ImageDraw.Draw(image)
+                y = 100
+                for line in page_text.splitlines():
+                    draw.text((100, y), line, font=font, fill=(25, 25, 25))
+                    y += 36
+                _emit_image(image, hint=page_text, direct_structured=True)
 
         # --- 2) 첨부 재귀 처리 ---
         IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}

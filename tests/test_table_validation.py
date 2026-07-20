@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw
@@ -14,6 +15,124 @@ def _visible_text(html):
 
 
 class GenericTableRepairTests(unittest.TestCase):
+    @staticmethod
+    def _grouped_stub_table():
+        def row(cells, tag="td"):
+            return "<tr>" + "".join(
+                f"<{tag}>{value}</{tag}>" for value in cells
+            ) + "</tr>"
+
+        header = row(
+            ["Category", "Measure", "A", "B", "C", "D", "Result"],
+            "th",
+        )
+        body = []
+        for group in ("North<br>Zone", "South<br>Zone"):
+            body.extend(
+                [
+                    row([group, "Metric one", "1", "2", "3", "4", "5", "6"]),
+                    row(["Metric two", "7", "8", "9", "10", "11", "12"]),
+                    row(["Metric three", "", "13", "14", "15", "16", "17", "18"]),
+                    row(["Metric four", "19", "20", "21", "22", "23", "24"]),
+                ]
+            )
+        summary = row(["Grand total", "", "25", "26", "27", "28", "29", ""])
+        return "<table>" + header + "".join(body) + summary + "</table>"
+
+    def test_grouped_stub_rowspans_are_restored_without_text_changes(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": self._grouped_stub_table(),
+                    "_source": "vlm",
+                    "_confidence": 0.6,
+                    "_issues": ["ragged_rows"],
+                }
+            ],
+        }
+
+        repaired, changes = table_quality_repair._normalize_grouped_stub_rowspans(
+            original
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(changes[0]["strategy"], "grouped_stub_rowspans_restored")
+        repaired_table = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(repaired_table)[
+                "expanded_row_widths"
+            ],
+            [8] * 10,
+        )
+        soup = BeautifulSoup(repaired_table["content"], "html.parser")
+        self.assertEqual(soup.find("th").get("colspan"), "2")
+        self.assertEqual(
+            [cell.get("rowspan") for cell in soup.find_all("td") if cell.get("rowspan")],
+            ["4", "4"],
+        )
+        self.assertEqual(
+            table_quality_repair._page_visible_text(original),
+            table_quality_repair._page_visible_text(repaired),
+        )
+        self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+
+    def test_grouped_stub_repair_rejects_irregular_group_boundaries(self):
+        html = self._grouped_stub_table().replace(
+            "South<br/>Zone", "South Zone", 1
+        ).replace("South<br>Zone", "South Zone", 1)
+        original = {"elements": [{"type": "table", "content": html}]}
+
+        repaired, changes = table_quality_repair._normalize_grouped_stub_rowspans(
+            original
+        )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
+
+    def test_nested_vlm_table_is_selected_for_visual_review(self):
+        html = (
+            "<table><tr><td colspan='2'>Phase</td></tr>"
+            "<tr><td>Plan</td><td><table><tr><td>A</td><td>B</td></tr>"
+            "<tr><td>1</td><td>2</td></tr></table></td></tr></table>"
+        )
+        source = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": html,
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept"],
+                }
+            ]
+        }
+
+        problems = table_quality_repair._problem_tables(source)
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("possible_nested_layout_mismatch", problems[0]["issues"])
+
+        preview = table_quality_repair._preview_tables(
+            {"elements": [{"type": "table", "content": html}]}
+        )
+        self.assertEqual(table_quality_repair._problem_tables(preview), [])
+
+    def test_tall_table_encoding_adds_overlapping_detail_bands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            portrait = Path(directory) / "portrait.png"
+            landscape = Path(directory) / "landscape.png"
+            Image.new("RGB", (600, 1200), "white").save(portrait)
+            Image.new("RGB", (1200, 600), "white").save(landscape)
+
+            with patch.object(table_quality_repair, "TABLE_QUALITY_REPAIR_CROPS", True):
+                portrait_images = table_quality_repair._encode_table_images(portrait)
+                landscape_images = table_quality_repair._encode_table_images(landscape)
+
+        self.assertEqual(len(portrait_images), 3)
+        self.assertEqual(len(set(portrait_images)), 2)
+        self.assertEqual(len(landscape_images), 1)
+
     def test_table_repair_image_trims_only_large_blank_margins(self):
         image = Image.new("RGB", (1000, 1400), "white")
         draw = ImageDraw.Draw(image)
