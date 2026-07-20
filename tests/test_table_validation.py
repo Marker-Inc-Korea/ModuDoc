@@ -130,6 +130,83 @@ class GenericTableRepairTests(unittest.TestCase):
             )
         )
 
+    def test_table_topology_signature_ignores_text_and_header_tags(self):
+        first = {
+            "content": (
+                "<table><tr><th colspan='2'>Header</th></tr>"
+                "<tr><td>Left</td><td>Right</td></tr></table>"
+            )
+        }
+        second = {
+            "content": (
+                "<table><tr><td colspan='2'>Different</td></tr>"
+                "<tr><td>One</td><td>Two</td></tr></table>"
+            )
+        }
+
+        self.assertEqual(
+            table_quality_repair._table_topology_signature(first),
+            table_quality_repair._table_topology_signature(second),
+        )
+
+    def test_metadata_only_nested_repair_is_not_an_improvement(self):
+        html = (
+            "<table><tr><td>Area</td><td>Detail</td></tr>"
+            "<tr><td>First</td><td><table><tr><td>A</td></tr>"
+            "</table></td></tr></table>"
+        )
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": html,
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept"],
+                }
+            ]
+        }
+        metadata_stripped = {
+            "elements": [{"type": "table", "content": html}]
+        }
+
+        accepted, metrics = table_quality_repair.candidate_improvement(
+            original, metadata_stripped, min_table_sequence_similarity=0.50
+        )
+
+        self.assertFalse(accepted)
+        self.assertFalse(metrics["nested_layout_topology_changed"])
+
+    def test_nested_parent_cell_move_changes_topology(self):
+        inner = "<table><tr><td>A</td></tr></table>"
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>Group</td><td>Detail</td>"
+                        f"<td>{inner}</td></tr></table>"
+                    ),
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept"],
+                }
+            ]
+        }
+        moved = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        f"<table><tr><td>Group</td><td>{inner}</td>"
+                        "<td>Detail</td></tr></table>"
+                    ),
+                }
+            ]
+        }
+
+        self.assertTrue(
+            table_quality_repair._nested_layout_topology_changed(original, moved)
+        )
+
     def test_nested_layout_review_uses_all_image_bands_and_full_budget(self):
         candidate = {
             "page_number": 1,

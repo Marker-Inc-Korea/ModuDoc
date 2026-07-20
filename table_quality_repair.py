@@ -468,6 +468,9 @@ def candidate_improvement(
     table_sequence_preserved = _problem_table_sequence_preserved(
         original, candidate, min_table_sequence_similarity
     )
+    nested_layout_topology_changed = _nested_layout_topology_changed(
+        original, candidate
+    )
     metrics = {
         "old_problem_tables": len(old_problems),
         "new_problem_tables": len(new_problems),
@@ -479,6 +482,7 @@ def candidate_improvement(
         "new_orphan_headings": new_orphans,
         "order_similarity": round(order_similarity, 4),
         "table_sequence_preserved": table_sequence_preserved,
+        "nested_layout_topology_changed": nested_layout_topology_changed,
     }
     accepted = bool(
         old_problems
@@ -488,6 +492,7 @@ def candidate_improvement(
         and char_ratio >= TABLE_QUALITY_REPAIR_MIN_COVERAGE
         and order_similarity >= 0.80
         and table_sequence_preserved
+        and nested_layout_topology_changed
         and (old_orphans == 0 or new_orphans < old_orphans)
     )
     return accepted, metrics
@@ -622,6 +627,62 @@ def _table_geometry(element: dict) -> dict:
         }
     except Exception:
         return {}
+
+
+def _table_topology_signature(element: dict) -> tuple:
+    """Describe row/cell/span/nesting geometry without using document text."""
+    try:
+        root = BeautifulSoup(
+            element.get("content") or "", "html.parser"
+        ).find("table")
+        if root is None:
+            return ()
+
+        def table_signature(table):
+            return tuple(
+                tuple(
+                    (
+                        table_validate._span_int(cell, "colspan"),
+                        table_validate._span_int(cell, "rowspan"),
+                        tuple(
+                            table_signature(nested)
+                            for nested in cell.find_all("table", recursive=False)
+                        ),
+                    )
+                    for cell in row.find_all(["td", "th"], recursive=False)
+                )
+                for row in table_validate._rows_of(table)
+            )
+
+        return table_signature(root)
+    except Exception:
+        return ()
+
+
+def _nested_layout_topology_changed(original: dict, candidate: dict) -> bool:
+    nested_problem_indices = [
+        problem["index"]
+        for problem in _problem_tables(original)
+        if "possible_nested_layout_mismatch" in set(problem.get("issues") or [])
+    ]
+    if not nested_problem_indices:
+        return True
+    original_elements = original.get("elements") or []
+    old_signatures = [
+        _table_topology_signature(original_elements[index])
+        for index in nested_problem_indices
+        if 0 <= index < len(original_elements)
+    ]
+    new_signatures = {
+        signature
+        for element in candidate.get("elements") or []
+        if isinstance(element, dict) and element.get("type") == "table"
+        if (signature := _table_topology_signature(element))
+    }
+    return bool(old_signatures) and all(
+        signature and signature not in new_signatures
+        for signature in old_signatures
+    )
 
 
 def _table_text_reference(element: dict) -> dict:
@@ -2012,6 +2073,7 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                 continue
 
             table_candidate["page_number"] = record["page"]
+            layout_review_passed = False
             if nested_layout_review:
                 try:
                     layout_review = _request_nested_layout_review(
@@ -2022,7 +2084,7 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                     record.setdefault("layout_review_errors", []).append(
                         {"attempt": attempt, "error": f"{type(exc).__name__}: {exc}"}
                     )
-                review_passed = bool(
+                layout_review_passed = bool(
                     isinstance(layout_review, dict)
                     and layout_review.get("pass") is True
                 )
@@ -2034,7 +2096,7 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                 record.setdefault("nested_layout_reviews", []).append(
                     {
                         "attempt": attempt,
-                        "pass": review_passed,
+                        "pass": layout_review_passed,
                         "outer_columns": (
                             layout_review.get("outer_columns")
                             if isinstance(layout_review, dict)
@@ -2048,7 +2110,7 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                         "reason": review_reason[:2000],
                     }
                 )
-                if not review_passed:
+                if not layout_review_passed:
                     reviewer_feedback = review_reason or (
                         "The outer grid or nested parent-cell placement did not match the image."
                     )
@@ -2094,9 +2156,14 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
 
             for targeted_strategy, targeted_candidate in targeted_variants:
                 minimum_sequence = (
-                    0.80
-                    if targeted_strategy == "grid_corrected_table_graft" or review_only
-                    else 0.98
+                    0.50
+                    if layout_review_passed
+                    else (
+                        0.80
+                        if targeted_strategy == "grid_corrected_table_graft"
+                        or review_only
+                        else 0.98
+                    )
                 )
                 grafted, grafts = graft_improved_tables(
                     original,
@@ -2166,14 +2233,73 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
         candidate["page_number"] = record["page"]
         candidate["quality_repair"] = True
         candidate = _preview_tables(candidate)
-        grafted, grafts = graft_improved_tables(original, candidate)
+        fallback_sequence = 0.98
+        if nested_layout_review:
+            try:
+                fallback_review = _request_nested_layout_review(
+                    client, model, image_path, candidate
+                )
+            except Exception as exc:
+                fallback_review = None
+                record.setdefault("layout_review_errors", []).append(
+                    {"stage": "full_page", "error": f"{type(exc).__name__}: {exc}"}
+                )
+            fallback_review_passed = bool(
+                isinstance(fallback_review, dict)
+                and fallback_review.get("pass") is True
+            )
+            fallback_reason = (
+                str(fallback_review.get("reason") or "")
+                if isinstance(fallback_review, dict)
+                else "nested layout review returned no valid verdict"
+            )
+            record.setdefault("nested_layout_reviews", []).append(
+                {
+                    "stage": "full_page",
+                    "pass": fallback_review_passed,
+                    "outer_columns": (
+                        fallback_review.get("outer_columns")
+                        if isinstance(fallback_review, dict)
+                        else None
+                    ),
+                    "outer_rows": (
+                        fallback_review.get("outer_rows")
+                        if isinstance(fallback_review, dict)
+                        else None
+                    ),
+                    "reason": fallback_reason[:2000],
+                }
+            )
+            if not fallback_review_passed:
+                record["candidate_options"].append(
+                    {
+                        "strategy": "full_page",
+                        "accepted": False,
+                        "error": "independent nested-layout review rejected candidate",
+                        "grafts": [],
+                    }
+                )
+                record["error"] = "all nested-layout-reviewed candidates were rejected"
+                results.append(record)
+                continue
+            fallback_sequence = 0.50
+
+        grafted, grafts = graft_improved_tables(
+            original,
+            candidate,
+            min_sequence_similarity=fallback_sequence,
+        )
         options = [("full_page", candidate, [])]
         if grafts:
             options.append(("table_graft", grafted, grafts))
 
         evaluated = []
         for strategy, option, option_grafts in options:
-            accepted, metrics = candidate_improvement(original, option)
+            accepted, metrics = candidate_improvement(
+                original,
+                option,
+                min_table_sequence_similarity=fallback_sequence,
+            )
             evaluated.append(
                 {
                     "strategy": strategy,
