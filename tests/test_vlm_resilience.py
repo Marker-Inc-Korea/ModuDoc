@@ -339,6 +339,146 @@ class VLMResilienceTests(unittest.TestCase):
 
         self.assertEqual(cleaned, elements[1:])
 
+    def test_duplicate_table_uses_source_heading_order_when_labels_differ(self):
+        table = {
+            "type": "table",
+            "caption": "Credential checklist",
+            "content": (
+                "<table><tr><td>Required material</td><td>Preparation status</td></tr>"
+                "<tr><td>Signing credential</td><td>Stored on the approved device</td></tr>"
+                "<tr><td>Validity check</td><td>Confirmed before registration</td></tr></table>"
+            ),
+        }
+        elements = [
+            {"type": "heading_2", "content": "3. Before you begin"},
+            {"type": "text", "content": "Complete the prerequisite review first."},
+            table,
+            {"type": "heading_2", "content": "4. Create an account"},
+            table.copy(),
+        ]
+        text_layer = (
+            "3. Before you begin Complete the prerequisite review first "
+            "Required material Preparation status Signing credential "
+            "Stored on the approved device Validity check Confirmed before registration "
+            "4. Create an account"
+        )
+
+        cleaned = utils._dedupe_tables_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, elements[:-1])
+
+    def test_table_copy_support_requires_stable_text_anchors(self):
+        table = {
+            "type": "table",
+            "caption": "Credential checklist",
+            "content": (
+                "<table><tr><td>Required material</td><td>Preparation status</td></tr>"
+                "<tr><td>Signing credential</td><td>Stored on the approved device</td></tr>"
+                "</table>"
+            ),
+        }
+        one_copy = (
+            "Required material Preparation status Signing credential "
+            "Stored on the approved device"
+        )
+
+        self.assertEqual(
+            utils._table_text_layer_copy_support(table, one_copy), 1
+        )
+        self.assertEqual(
+            utils._table_text_layer_copy_support(table, one_copy * 2), 2
+        )
+        self.assertIsNone(
+            utils._table_text_layer_copy_support(table, "Sparse page text")
+        )
+
+    def test_source_anchors_restore_blocks_misplaced_after_the_page_body(self):
+        upper_table = {
+            "type": "table",
+            "content": (
+                "<table><tr><td>Earlier metric category</td><td>Earlier reporting value</td></tr>"
+                "<tr><td>Opening balance amount</td><td>125</td></tr></table>"
+            ),
+        }
+        lower_table = {
+            "type": "table",
+            "content": (
+                "<table><tr><td>Later metric category</td><td>Later reporting value</td></tr>"
+                "<tr><td>Remaining capacity amount</td><td>450</td></tr></table>"
+            ),
+        }
+        leading_text = {
+            "type": "text",
+            "content": "This paragraph continues from the preceding page and belongs at the top.",
+        }
+        elements = [
+            {"type": "heading_2", "content": "9. Calculation period"},
+            {"type": "text", "content": "The numbered section starts after the opening material."},
+            lower_table,
+            leading_text,
+            upper_table,
+        ]
+        text_layer = (
+            "This paragraph continues from the preceding page and belongs at the top. "
+            "Earlier metric category Earlier reporting value Opening balance amount 125 "
+            "9. Calculation period The numbered section starts after the opening material. "
+            "Later metric category Later reporting value Remaining capacity amount 450"
+        )
+
+        restored = utils._restore_leading_source_blocks(elements, text_layer)
+
+        self.assertEqual(restored[:2], [leading_text, upper_table])
+        self.assertEqual(restored[2:], elements[:3])
+
+    def test_multicolumn_merge_places_a_lowercase_carry_over_before_footnotes(self):
+        continuation = {
+            "type": "text",
+            "content": "continues at the top of the next column and completes the sentence.",
+        }
+        footnote = {"type": "footnote", "content": "1 Reference material"}
+        columns = [
+            [
+                {"type": "heading_1", "content": "Previous topic"},
+                {"type": "text", "content": "The final paragraph remains open"},
+                footnote,
+            ],
+            [
+                {"type": "heading_1", "content": "Next topic"},
+                {"type": "text", "content": "A complete paragraph follows."},
+                {"type": "heading_1", "content": "IV. Materials"},
+                {"type": "heading_1", "content": "Processing methods"},
+                continuation,
+            ],
+        ]
+
+        merged = utils._merge_multicolumn_elements(columns)
+
+        self.assertEqual(merged[2], continuation)
+        self.assertEqual(merged[3], footnote)
+        processing = next(
+            item for item in merged if item.get("content") == "Processing methods"
+        )
+        self.assertEqual(processing["type"], "heading_2")
+
+    def test_multicolumn_merge_keeps_lowercase_text_when_left_sentence_is_complete(self):
+        continuation = {
+            "type": "text",
+            "content": "lowercase body text intentionally follows its heading.",
+        }
+        columns = [
+            [{"type": "text", "content": "The left column is complete."}],
+            [
+                {"type": "heading_1", "content": "Right topic"},
+                continuation,
+            ],
+        ]
+
+        merged = utils._merge_multicolumn_elements(columns)
+
+        self.assertEqual(merged, columns[0] + columns[1])
+
     def test_duplicate_heading_keeps_the_one_attached_to_its_content(self):
         elements = [
             {"type": "heading_2", "content": "3. Access preparation"},

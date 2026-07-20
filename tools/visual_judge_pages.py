@@ -382,14 +382,28 @@ def structured_plain_text(path: str) -> str:
 def objective_quality_failures(data: dict) -> list[str]:
     """Return parser-emitted hard quality signals that a VLM cannot overturn."""
     failures = []
-    if data.get("low_confidence"):
+    elements = [
+        element
+        for element in data.get("elements") or []
+        if isinstance(element, dict)
+    ]
+    notice_only = bool(elements) and all(
+        element.get("_source") == "eml_notice"
+        and str(element.get("content") or "").strip()
+        for element in elements
+    )
+    if data.get("low_confidence") and not notice_only:
         failures.append("page_low_confidence")
-    for index, element in enumerate(data.get("elements") or []):
+    for index, element in enumerate(elements):
         if not isinstance(element, dict):
             continue
         confidence = element.get("_confidence")
         try:
-            if confidence is not None and float(confidence) < 0.75:
+            if (
+                confidence is not None
+                and float(confidence) < 0.75
+                and element.get("_source") != "eml_notice"
+            ):
                 failures.append(f"element_{index}_low_confidence")
         except (TypeError, ValueError):
             failures.append(f"element_{index}_invalid_confidence")
@@ -807,7 +821,7 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
                 ],
                 temperature=0,
                 max_tokens=(
-                    args.max_tokens if not attempt else max(args.max_tokens, 4096)
+                    args.max_tokens if not attempt else max(args.max_tokens, 16384)
                 ),
                 timeout=args.timeout,
                 response_format={"type": "json_object"},

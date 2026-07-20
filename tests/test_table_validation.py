@@ -263,6 +263,91 @@ class GenericTableRepairTests(unittest.TestCase):
             [11] * 8,
         )
 
+    def test_raster_evidenced_repair_rebuilds_a_shifted_two_row_header(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "caption": "Summary grid",
+                    "content": (
+                        "<table>"
+                        "<tr><td rowspan='2'>Code</td><td rowspan='2'>Subject</td>"
+                        "<td colspan='3'>RATING GROUP</td>"
+                        "<td rowspan='2'>Effect</td><td rowspan='2'>PHASE GROUP</td></tr>"
+                        "<tr><td>Space</td><td>Time</td><td>Cumulative</td>"
+                        "<td>Build</td><td>Operate</td></tr>"
+                        "<tr><td>1</td><td>First item</td><td>L</td><td>ST</td>"
+                        "<td></td><td>-1</td><td>0</td></tr>"
+                        "<tr><td>2</td><td>Second item</td><td>L</td><td>LT</td>"
+                        "<td></td><td>-2</td><td>0</td></tr>"
+                        "<tr><td>3</td><td>Third item</td><td>L</td><td>ST</td>"
+                        "<td></td><td>0</td><td>-1</td></tr>"
+                        "</table>"
+                    ),
+                }
+            ],
+        }
+        image = Image.new("RGB", (900, 680), "white")
+        draw = ImageDraw.Draw(image)
+        x_lines = [50 + 110 * index for index in range(8)]
+        y_lines = [50 + 110 * index for index in range(6)]
+        for y in y_lines:
+            draw.line((x_lines[0], y, x_lines[-1], y), fill="black", width=3)
+        for row_index, (upper, lower) in enumerate(zip(y_lines, y_lines[1:])):
+            visible_x = (
+                [x_lines[index] for index in (0, 1, 2, 3, 5, 6, 7)]
+                if row_index == 0
+                else x_lines
+            )
+            for x in visible_x:
+                draw.line((x, upper, x, lower), fill="black", width=3)
+        for start, end in ((3, 5), (6, 7)):
+            draw.rectangle(
+                (x_lines[start] + 20, y_lines[0] + 35, x_lines[end] - 20, y_lines[0] + 50),
+                fill="black",
+            )
+        for column in range(7):
+            draw.rectangle(
+                (
+                    x_lines[column] + 20,
+                    y_lines[1] + 35,
+                    x_lines[column] + 45,
+                    y_lines[1] + 50,
+                ),
+                fill="black",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            image.save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(changes[0]["strategy"], "raster_header_cells_rebuilt")
+        self.assertTrue(metrics["text_inventory_preserved"])
+        table = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(table)["expanded_row_widths"],
+            [7] * 5,
+        )
+        soup = BeautifulSoup(table["content"], "html.parser")
+        rows = table_validate._rows_of(soup.find("table"))
+        first = rows[0].find_all(["td", "th"], recursive=False)
+        second = rows[1].find_all(["td", "th"], recursive=False)
+        self.assertEqual(
+            [cell.get_text(" ", strip=True) for cell in first],
+            ["", "", "", "RATING GROUP", "", "PHASE GROUP"],
+        )
+        self.assertEqual(
+            [cell.get_text(" ", strip=True) for cell in second],
+            ["Code", "Subject", "Space", "Time", "Cumulative Effect", "Build", "Operate"],
+        )
+
     def test_borderless_formula_definitions_are_demoted_losslessly(self):
         original = {
             "page_number": 1,
@@ -307,6 +392,41 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertEqual(metrics["old_problem_tables"], 1)
         self.assertEqual(metrics["new_problem_tables"], 0)
 
+    def test_rectangular_formula_definitions_are_still_demoted(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>x<sub>i</sub></td><td>: item index</td></tr>"
+                        "<tr><td>D<sub>i</sub></td><td>: item value</td></tr>"
+                        "<tr><td>T = ΣD<sub>i</sub></td><td>: total amount</td></tr>"
+                        "</table>"
+                    ),
+                    "caption": "Formula definitions",
+                }
+            ],
+        }
+        image = Image.new("RGB", (600, 400), "white")
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "formula.png"
+            image.save(image_path)
+            demoted, records, metrics = (
+                table_quality_repair._validated_borderless_definition_demotion(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(demoted)
+        self.assertEqual(records, [{"index": 0, "rows": 3}])
+        self.assertEqual(demoted["elements"][0]["type"], "text")
+        self.assertEqual(metrics["old_problem_tables"], 0)
+        self.assertEqual(metrics["new_problem_tables"], 0)
+        self.assertEqual(metrics["old_table_count"], 1)
+        self.assertEqual(metrics["new_table_count"], 0)
+
     def test_cross_row_label_bleed_is_sent_for_image_review(self):
         html = (
             "<table><tr><td>Category</td><td>Detail</td><td>Action</td></tr>"
@@ -324,6 +444,24 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIn("possible_cross_row_bleed", quality["issues"])
         self.assertGreaterEqual(quality["confidence"], 0.75)
         self.assertEqual(problems[0]["issues"], ["possible_cross_row_bleed"])
+
+    def test_near_duplicate_lines_inside_a_cell_are_sent_for_image_review(self):
+        html = (
+            "<table><tr><td>Category</td><td>Coverage</td></tr>"
+            "<tr><td>Third party</td><td>Coverage for bodily injury and property and damage"
+            "<br>Coverage for bodily injury and property damage</td></tr></table>"
+        )
+
+        quality = table_validate.assess_table_quality(html)
+        problems = table_quality_repair._problem_tables(
+            {"elements": [{"type": "table", "content": html}]}
+        )
+
+        self.assertIn("possible_internal_duplicate_text", quality["issues"])
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(
+            problems[0]["issues"], ["possible_internal_duplicate_text"]
+        )
 
     def test_non_trailing_category_mention_is_not_a_bleed_signal(self):
         html = (

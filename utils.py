@@ -691,6 +691,168 @@ def _labels_relate(left, right):
     return matcher.ratio() >= 0.65 and matcher.find_longest_match().size >= 6
 
 
+def _element_source_bounds(element, normalized_source, allow_short=False):
+    """Locate an element from unique text-layer anchors without trusting its order."""
+    if not isinstance(element, dict) or not normalized_source:
+        return None
+    element_type = str(element.get("type") or "")
+    anchors = []
+    if element_type == "table":
+        try:
+            soup = BeautifulSoup(element.get("content") or "", "html.parser")
+            anchors.extend(
+                _compact_visible_text(cell.get_text(" ", strip=True))
+                for cell in soup.find_all(["td", "th"])
+            )
+        except Exception:
+            pass
+    else:
+        content = _compact_visible_text(element.get("content"))
+        if content:
+            anchors.append(content)
+            if len(content) >= 48:
+                anchors.extend((content[:40], content[-40:]))
+    caption = _compact_visible_text(element.get("caption"))
+    if caption:
+        anchors.append(caption)
+    minimum = 4 if allow_short else 10
+    matches = [
+        (position, position + len(anchor), len(anchor))
+        for anchor in dict.fromkeys(anchors)
+        if len(anchor) >= minimum
+        and normalized_source.count(anchor) == 1
+        and (position := normalized_source.find(anchor)) >= 0
+    ]
+    if not matches:
+        return None
+    if not allow_short and len(matches) < 2 and max(item[2] for item in matches) < 24:
+        return None
+    return min(item[0] for item in matches), max(item[1] for item in matches)
+
+
+def _restore_leading_source_blocks(elements, source_text):
+    """Move a short misplaced suffix back before a leading heading when proven."""
+    source = list(elements or [])
+    if not source or not str(source[0].get("type") or "").startswith("heading_"):
+        return source
+    normalized_source = _compact_visible_text(source_text)
+    heading_bounds = _element_source_bounds(
+        source[0], normalized_source, allow_short=True
+    )
+    if heading_bounds is None:
+        return source
+    suffix_start = len(source)
+    bounds = []
+    while suffix_start > 1 and len(source) - suffix_start < 4:
+        candidate = source[suffix_start - 1]
+        if str(candidate.get("type") or "") not in {"text", "footnote", "table"}:
+            break
+        candidate_bounds = _element_source_bounds(candidate, normalized_source)
+        if candidate_bounds is None or candidate_bounds[1] > heading_bounds[0]:
+            break
+        suffix_start -= 1
+        bounds.append(candidate_bounds)
+    if suffix_start == len(source):
+        return source
+    bounds.reverse()
+    if any(left[0] >= right[0] for left, right in zip(bounds, bounds[1:])):
+        return source
+    return source[suffix_start:] + source[:suffix_start]
+
+
+def _starts_with_lowercase_fragment(element):
+    if not isinstance(element, dict) or element.get("type") != "text":
+        return False
+    value = str(element.get("content") or "").lstrip(" \t\r\n\"'“‘([{")
+    return bool(value and "a" <= value[0] <= "z" and len(value) <= 500)
+
+
+def _ends_without_sentence_boundary(element):
+    if not isinstance(element, dict) or element.get("type") != "text":
+        return False
+    value = str(element.get("content") or "").rstrip()
+    while value and value[-1] in "\"'”’)]}":
+        value = value[:-1].rstrip()
+    return bool(value and value[-1] not in ".!?。！？:")
+
+
+def _normalize_roman_section_subheadings(elements):
+    result = []
+    within_roman_section = False
+    major = re.compile(r"^(?:[IVXLCDM]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+)[.)]\s+", re.I)
+    for element in elements or []:
+        current = element
+        if isinstance(element, dict) and str(element.get("type") or "").startswith(
+            "heading_"
+        ):
+            content = str(element.get("content") or "").strip()
+            if major.match(content):
+                within_roman_section = True
+            elif within_roman_section and element.get("type") == "heading_1":
+                current = {**element, "type": "heading_2"}
+        result.append(current)
+    return result
+
+
+def _merge_multicolumn_elements(columns):
+    """Merge independently extracted columns and repair a proven carry-over line."""
+    if len(columns or []) != 2:
+        return [element for column in columns or [] for element in column]
+    left, right = (list(column or []) for column in columns)
+    footer_start = len(left)
+    while footer_start and left[footer_start - 1].get("type") == "footnote":
+        footer_start -= 1
+    left_body = left[:footer_start]
+    candidates = [
+        index
+        for index, element in enumerate(right)
+        if _starts_with_lowercase_fragment(element)
+        and any(
+            str(previous.get("type") or "").startswith("heading_")
+            for previous in right[:index]
+            if isinstance(previous, dict)
+        )
+    ]
+    if (
+        len(candidates) == 1
+        and left_body
+        and _ends_without_sentence_boundary(left_body[-1])
+    ):
+        continuation = right.pop(candidates[0])
+        merged = left_body + [continuation] + left[footer_start:] + right
+    else:
+        merged = left + right
+    return _normalize_roman_section_subheadings(merged)
+
+
+def _table_text_layer_copy_support(element, source_text):
+    """Return the copy count supported by stable table anchors, or ``None``."""
+    normalized_source = _compact_visible_text(source_text)
+    if not normalized_source or not isinstance(element, dict):
+        return None
+    try:
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        anchors = [
+            _compact_visible_text(cell.get_text(" ", strip=True))
+            for cell in soup.find_all(["td", "th"])
+        ]
+    except Exception:
+        anchors = []
+    anchors.append(_compact_visible_text(element.get("caption")))
+    evidence = [
+        (anchor, count)
+        for anchor in sorted(
+            {anchor for anchor in anchors if len(anchor) >= 10},
+            key=len,
+            reverse=True,
+        )[:8]
+        if (count := normalized_source.count(anchor)) > 0
+    ]
+    if len(evidence) < 2 and not any(len(anchor) >= 24 for anchor, _ in evidence):
+        return None
+    return min(count for _, count in evidence)
+
+
 def _dedupe_tables_supported_by_text_layer(elements, source_text):
     """Drop a repeated table only when source anchors support fewer copies."""
     source = list(elements or [])
@@ -700,6 +862,7 @@ def _dedupe_tables_supported_by_text_layer(elements, source_text):
 
     groups = {}
     table_anchors = {}
+    table_context_labels = {}
     for index, element in enumerate(source):
         if not isinstance(element, dict) or element.get("type") != "table":
             continue
@@ -723,6 +886,11 @@ def _dedupe_tables_supported_by_text_layer(elements, source_text):
             key=len,
             reverse=True,
         )[:8]
+        table_context_labels[index] = [
+            label
+            for label in dict.fromkeys(anchors + [caption])
+            if 4 <= len(label) <= 80
+        ][:32]
 
     remove = set()
     for (_, caption), indices in groups.items():
@@ -750,6 +918,43 @@ def _dedupe_tables_supported_by_text_layer(elements, source_text):
         if supported_copies >= len(indices):
             continue
 
+        unique_anchor_ranges = [
+            (position, position + len(anchor))
+            for anchor, count in evidence
+            if anchor != caption
+            and count == 1
+            and (position := normalized_source.find(anchor)) >= 0
+        ]
+        if not unique_anchor_ranges:
+            unique_anchor_ranges = [
+                (position, position + len(anchor))
+                for anchor, count in evidence
+                if count == 1
+                and (position := normalized_source.find(anchor)) >= 0
+            ]
+        anchor_start = (
+            min(start for start, _ in unique_anchor_ranges)
+            if unique_anchor_ranges
+            else None
+        )
+        anchor_end = (
+            max(end for _, end in unique_anchor_ranges)
+            if unique_anchor_ranges
+            else None
+        )
+
+        def nearby_heading(index, direction):
+            for distance in range(1, 4):
+                candidate_index = index + direction * distance
+                if not (0 <= candidate_index < len(source)):
+                    break
+                candidate = source[candidate_index]
+                if isinstance(candidate, dict) and str(
+                    candidate.get("type") or ""
+                ).startswith("heading_"):
+                    return candidate
+            return None
+
         def context_score(index):
             score = 0
             for distance in (1, 2):
@@ -760,9 +965,41 @@ def _dedupe_tables_supported_by_text_layer(elements, source_text):
                 if (
                     isinstance(previous, dict)
                     and str(previous.get("type") or "").startswith("heading_")
-                    and _labels_relate(previous.get("content"), caption)
+                    and any(
+                        _labels_relate(previous.get("content"), label)
+                        for label in table_context_labels.get(indices[0], [])
+                    )
                 ):
-                    score = max(score, 3 - distance)
+                    score = max(score, 4 - distance)
+            if anchor_start is None or anchor_end is None:
+                return score
+            previous = nearby_heading(index, -1)
+            following = nearby_heading(index, 1)
+            previous_before = False
+            following_after = False
+            if previous is not None:
+                heading = _compact_visible_text(previous.get("content"))
+                positions = [
+                    match.start()
+                    for match in re.finditer(re.escape(heading), normalized_source)
+                ] if heading else []
+                if positions:
+                    previous_before = any(
+                        position + len(heading) <= anchor_start
+                        for position in positions
+                    )
+                    score += 1 if previous_before else -2
+            if following is not None:
+                heading = _compact_visible_text(following.get("content"))
+                positions = [
+                    match.start()
+                    for match in re.finditer(re.escape(heading), normalized_source)
+                ] if heading else []
+                if positions:
+                    following_after = any(position >= anchor_end for position in positions)
+                    score += 1 if following_after else -1
+            if previous_before and following_after:
+                score += 4
             return score
 
         scores = {index: context_score(index) for index in indices}
@@ -770,6 +1007,10 @@ def _dedupe_tables_supported_by_text_layer(elements, source_text):
             continue
         keep_count = max(1, supported_copies)
         ranked = sorted(indices, key=lambda index: (-scores[index], index))
+        if intervening and keep_count < len(ranked):
+            cutoff = scores[ranked[keep_count - 1]]
+            if scores[ranked[keep_count]] == cutoff:
+                continue
         keep = set(ranked[:keep_count])
         remove.update(index for index in indices if index not in keep)
 
@@ -3621,6 +3862,9 @@ class DocumentProcessor:
                             source_text_layer = text_layer_file.read()
                     except OSError:
                         source_text_layer = ""
+                    elems = _restore_leading_source_blocks(
+                        elems, source_text_layer
+                    )
                     elems = _dedupe_tables_supported_by_text_layer(
                         elems, source_text_layer
                     )
@@ -3882,7 +4126,7 @@ class DocumentProcessor:
                     W, H = im.size
                     gx = int(W * frac); pad = int(W * 0.012)
                     crops = [im.crop((0, 0, min(gx + pad, W), H)), im.crop((max(gx - pad, 0), 0, W, H))]
-                merged = []
+                columns = []
                 for ci, crop in enumerate(crops):
                     tmp = os.path.join(doc_output_dir, f".{stem}_col{ci}_{uuid.uuid4().hex}.png")
                     crop.save(tmp, "PNG")
@@ -3896,7 +4140,10 @@ class DocumentProcessor:
                     if not sd:
                         return None
                     pj = json.loads(sd)
-                    merged.extend(pj if isinstance(pj, list) else pj.get("elements", []))
+                    columns.append(
+                        pj if isinstance(pj, list) else pj.get("elements", [])
+                    )
+                merged = _merge_multicolumn_elements(columns)
                 if not merged:
                     return None
                 pn = int(stem.split("_")[1]) if "_" in stem else 0
@@ -4113,6 +4360,34 @@ class DocumentProcessor:
                     logger.warning(f"표 품질 재추출 보류(무손실 게이트 미통과): {rejected_repairs}")
             except Exception as e:
                 logger.warning(f"표 품질 재추출 실패: {e}")
+
+        # Dense card/panel pages can preserve every character while assigning a
+        # bullet to the wrong visual block. Review only a small raster-selected
+        # subset and accept inventory-preserving text reassignment exclusively.
+        if api_key and output_format.lower() in ("json", "markdown"):
+            try:
+                from layout_consistency_repair import repair_layout_consistency
+
+                layout_repairs = repair_layout_consistency(
+                    doc_output_dir, api_key, model_name, _persist_page
+                )
+                accepted_layout = [
+                    item["page"] for item in layout_repairs if item.get("accepted")
+                ]
+                rejected_layout = [
+                    item["page"]
+                    for item in layout_repairs
+                    if (item.get("review") or {}).get("pass") is False
+                    and not item.get("accepted")
+                ]
+                if accepted_layout:
+                    logger.info(f"패널 텍스트 재배치 적용: {accepted_layout}")
+                if rejected_layout:
+                    logger.warning(
+                        f"패널 텍스트 재배치 보류(보존 게이트 미통과): {rejected_layout}"
+                    )
+            except Exception as e:
+                logger.warning(f"패널 레이아웃 재검증 실패: {e}")
 
         if output_format.lower() in ("json", "markdown"):
             toc_entries = []

@@ -135,6 +135,29 @@ def _has_possible_cross_row_bleed(rows):
     return False
 
 
+def _has_internal_near_duplicate(rows):
+    """Flag near-identical substantial lines repeated inside one cell."""
+    for row in rows:
+        for cell in _direct_cells(row):
+            values = []
+            for fragment in cell.stripped_strings:
+                normalized = "".join(
+                    char.casefold() for char in str(fragment) if char.isalnum()
+                )
+                if len(normalized) >= 16:
+                    values.append(normalized)
+            for left_index, left in enumerate(values):
+                for right in values[left_index + 1:]:
+                    matcher = SequenceMatcher(None, left, right, autojunk=False)
+                    if (
+                        matcher.ratio() >= 0.86
+                        and matcher.find_longest_match().size
+                        >= int(min(len(left), len(right)) * 0.70)
+                    ):
+                        return True
+    return False
+
+
 def _span_int(cell, attr, default=1):
     try:
         return max(1, int(cell.get(attr, default) or default))
@@ -354,6 +377,8 @@ def assess_table_quality(html, caption=None, allow_nested=False):
             out["confidence"] = min(out["confidence"], 0.90)
         if _has_possible_cross_row_bleed(rows):
             out["issues"].append("possible_cross_row_bleed")
+        if _has_internal_near_duplicate(rows):
+            out["issues"].append("possible_internal_duplicate_text")
 
         return out
     except Exception:

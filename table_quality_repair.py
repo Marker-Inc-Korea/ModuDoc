@@ -46,6 +46,7 @@ HARD_ISSUES = {
 }
 REVIEW_ISSUES = {
     "possible_cross_row_bleed",
+    "possible_internal_duplicate_text",
 }
 
 SYSTEM_PROMPT = """You are repairing a document page whose previous table extraction failed structural QA.
@@ -623,17 +624,9 @@ def _demote_borderless_definition_tables(
     candidate = copy.deepcopy(original)
     elements = candidate.get("elements") or []
     demotions = []
-    for problem in _problem_tables(original):
-        index = problem.get("index")
-        issues = set(problem.get("issues") or [])
-        if (
-            type(index) is not int
-            or not (0 <= index < len(elements))
-            or not issues
-            or not issues.issubset({"ragged_rows"})
-        ):
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "table":
             continue
-        element = elements[index]
         text = _borderless_definition_text(element)
         if not text:
             continue
@@ -680,13 +673,27 @@ def _validated_borderless_definition_demotion(
     visible_text_preserved = _page_visible_text(original) == _page_visible_text(demoted)
     old_problem_count = len(_problem_tables(original))
     new_problem_count = len(_problem_tables(demoted))
-    if not visible_text_preserved or new_problem_count >= old_problem_count:
+    old_table_count = sum(
+        isinstance(element, dict) and element.get("type") == "table"
+        for element in original.get("elements") or []
+    )
+    new_table_count = sum(
+        isinstance(element, dict) and element.get("type") == "table"
+        for element in demoted.get("elements") or []
+    )
+    if (
+        not visible_text_preserved
+        or new_problem_count > old_problem_count
+        or old_table_count - new_table_count != len(demotions)
+    ):
         return None, [], None
     metrics = {
         "old_problem_tables": old_problem_count,
         "new_problem_tables": new_problem_count,
         "visible_text_preserved": True,
         "demoted_tables": len(demotions),
+        "old_table_count": old_table_count,
+        "new_table_count": new_table_count,
     }
     return demoted, demotions, metrics
 
@@ -1148,6 +1155,277 @@ def _apply_geometry_correction(candidate: dict, correction: dict | None) -> dict
     return corrected if changed else None
 
 
+def _short_alpha_header(text: object, maximum: int) -> bool:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    letters = [char for char in value if char.isalpha()]
+    return (
+        2 <= len(value) <= maximum
+        and len(letters) >= 2
+        and all(char.isalpha() or char in " '-" for char in value)
+        and not value.isupper()
+    )
+
+
+def _cell_has_contrasting_ink(image, left: int, right: int, top: int, bottom: int) -> bool:
+    margin_x = max(3, min(8, (right - left) // 12))
+    margin_y = max(3, min(8, (bottom - top) // 12))
+    if right - left <= margin_x * 2 or bottom - top <= margin_y * 2:
+        return False
+    values = image.crop(
+        (left + margin_x, top + margin_y, right - margin_x, bottom - margin_y)
+    ).tobytes()
+    if not values:
+        return False
+    ordered = sorted(values)
+    background = ordered[len(ordered) // 2]
+    contrasting = sum(abs(value - background) >= 40 for value in values)
+    fraction = contrasting / len(values)
+    return contrasting >= max(16, int(len(values) * 0.0015)) and fraction < 0.40
+
+
+def _raster_evidenced_header_rebuild(
+    image_path: Path, data: dict
+) -> tuple[dict | None, list[dict]]:
+    """Rebuild a malformed two-row header only when raster cells prove its layout."""
+    from PIL import Image
+
+    candidates = []
+    table_number = -1
+    for element_index, element in enumerate(data.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        table_number += 1
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        geometry = _table_geometry(element)
+        widths = geometry.get("expanded_row_widths") or []
+        target_width = geometry.get("most_frequent_width") or 0
+        if (
+            len(rows) < 4
+            or target_width < 4
+            or len(widths) != len(rows)
+            or widths.count(target_width) * 2 <= len(widths)
+            or len(set(widths)) < 2
+        ):
+            continue
+        first_cells = rows[0].find_all(["td", "th"], recursive=False)
+        second_cells = rows[1].find_all(["td", "th"], recursive=False)
+        missing = target_width - len(second_cells)
+        if (
+            not (1 <= missing <= 3)
+            or any(
+                int(cell.get("colspan", 1) or 1) != 1
+                or int(cell.get("rowspan", 1) or 1) != 1
+                for cell in second_cells
+            )
+            or any(
+                int(cell.get("rowspan", 1) or 1) != 1
+                for row in rows[2:]
+                for cell in row.find_all(["td", "th"], recursive=False)
+            )
+        ):
+            continue
+
+        starts = []
+        column = 0
+        valid_spans = True
+        for cell in first_cells:
+            try:
+                colspan = max(1, int(cell.get("colspan", 1) or 1))
+                rowspan = max(1, int(cell.get("rowspan", 1) or 1))
+            except (TypeError, ValueError):
+                valid_spans = False
+                break
+            starts.append((column, colspan, rowspan, cell))
+            column += colspan
+        if not valid_spans:
+            continue
+        movers = starts[:missing]
+        if (
+            [start for start, _, _, _ in movers] != list(range(missing))
+            or any(
+                colspan != 1
+                or rowspan != 2
+                or not cell.get_text(" ", strip=True)
+                for _, colspan, rowspan, cell in movers
+            )
+        ):
+            continue
+        remainder = starts[missing:]
+        continuations = [
+            item
+            for item in remainder
+            if item[1] == 1
+            and item[2] == 2
+            and _short_alpha_header(item[3].get_text(" ", strip=True), 24)
+        ]
+        if len(continuations) != 1:
+            continue
+        continuation = continuations[0]
+        group_cells = [
+            item
+            for item in remainder
+            if item is not continuation and item[3].get_text(" ", strip=True)
+        ]
+        if not group_cells:
+            continue
+
+        try:
+            with Image.open(image_path) as source:
+                image = source.convert("L")
+                horizontal = _table_horizontal_window(image, len(rows))
+                if not horizontal:
+                    continue
+                left = round(sum(line[1] for line in horizontal) / len(horizontal))
+                right = round(sum(line[2] for line in horizontal) / len(horizontal))
+                row_lines = [
+                    _vertical_grid_lines(image, left, right, upper[0], lower[0])
+                    for upper, lower in zip(horizontal, horizontal[1:])
+                ]
+                base_rows = [
+                    lines for lines in row_lines if len(lines) == target_width + 1
+                ]
+                if len(base_rows) < 2:
+                    continue
+                tolerance = max(6, int((right - left) * 0.012))
+                boundaries = [
+                    round(sum(lines[index] for lines in base_rows) / len(base_rows))
+                    for index in range(target_width + 1)
+                ]
+                if any(
+                    abs(lines[index] - boundaries[index]) > tolerance
+                    for lines in base_rows
+                    for index in range(target_width + 1)
+                ):
+                    continue
+                mapped = []
+                for boundary in row_lines[0]:
+                    nearest = min(
+                        range(len(boundaries)),
+                        key=lambda index: abs(boundaries[index] - boundary),
+                    )
+                    if abs(boundaries[nearest] - boundary) > tolerance:
+                        mapped = []
+                        break
+                    if not mapped or mapped[-1] != nearest:
+                        mapped.append(nearest)
+                if not mapped or mapped[0] != 0 or mapped[-1] != target_width:
+                    continue
+                observed = list(zip(mapped, mapped[1:]))
+                if any(end <= start for start, end in observed):
+                    continue
+                top, separator, bottom = (
+                    horizontal[0][0],
+                    horizontal[1][0],
+                    horizontal[2][0],
+                )
+                occupied = [
+                    _cell_has_contrasting_ink(
+                        image,
+                        boundaries[start],
+                        boundaries[end],
+                        top,
+                        separator,
+                    )
+                    for start, end in observed
+                ]
+                if sum(occupied) != len(group_cells):
+                    continue
+
+                def top_occupied_at(column_index):
+                    return any(
+                        present and start <= column_index < end
+                        for (start, end), present in zip(observed, occupied)
+                    )
+
+                moved_columns = [start for start, _, _, _ in movers]
+                continuation_column = continuation[0]
+                lower_target = continuation_column - 1
+                if (
+                    any(top_occupied_at(column_index) for column_index in moved_columns)
+                    or top_occupied_at(continuation_column)
+                    or not (0 <= lower_target < target_width)
+                    or any(
+                        not _cell_has_contrasting_ink(
+                            image,
+                            boundaries[column_index],
+                            boundaries[column_index + 1],
+                            separator,
+                            bottom,
+                        )
+                        for column_index in moved_columns + [lower_target]
+                    )
+                ):
+                    continue
+        except Exception:
+            continue
+
+        rebuilt_second = [copy.copy(item[3]) for item in movers] + [
+            copy.copy(cell) for cell in second_cells
+        ]
+        if len(rebuilt_second) != target_width:
+            continue
+        target_cell = rebuilt_second[lower_target]
+        if not _short_alpha_header(target_cell.get_text(" ", strip=True), 48):
+            continue
+        for cell in rebuilt_second:
+            cell.attrs.pop("colspan", None)
+            cell.attrs.pop("rowspan", None)
+        target_cell.append(soup.new_tag("br"))
+        for child in list(continuation[3].contents):
+            target_cell.append(copy.copy(child))
+
+        rebuilt_first = []
+        group_iterator = iter(group_cells)
+        for (start, end), present in zip(observed, occupied):
+            if present:
+                rebuilt = copy.copy(next(group_iterator)[3])
+                rebuilt.attrs.pop("rowspan", None)
+            else:
+                rebuilt = soup.new_tag("td")
+            span = end - start
+            if span == 1:
+                rebuilt.attrs.pop("colspan", None)
+            else:
+                rebuilt["colspan"] = str(span)
+            rebuilt_first.append(rebuilt)
+
+        rows[0].clear()
+        rows[0].extend(rebuilt_first)
+        rows[1].clear()
+        rows[1].extend(rebuilt_second)
+        patched = copy.deepcopy(data)
+        patched_element = patched["elements"][element_index]
+        patched_element["content"] = str(table)
+        for key in ("_source", "_confidence", "_issues", "_native"):
+            patched_element.pop(key, None)
+        if any(
+            width != target_width
+            for width in _table_geometry(patched_element).get(
+                "expanded_row_widths", []
+            )
+        ):
+            continue
+        candidates.append(
+            (
+                patched,
+                {
+                    "element_index": element_index,
+                    "table_index": table_number,
+                    "strategy": "raster_header_cells_rebuilt",
+                },
+            )
+        )
+
+    if len(candidates) != 1:
+        return None, []
+    candidate, change = candidates[0]
+    return candidate, [change]
+
+
 def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[dict]]:
     """Build a text-lossless geometry candidate for common VLM row artifacts."""
     candidate = copy.deepcopy(data)
@@ -1252,13 +1530,15 @@ def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[d
 def _validated_deterministic_geometry_repair(
     image_path: Path, original: dict
 ) -> tuple[dict | None, list[dict], dict | None]:
-    normalized, changes = _normalize_sparse_continuation_rows(original)
-    if normalized is None:
-        return None, [], None
-    correction = _grid_line_geometry_correction(image_path, normalized)
-    corrected = _apply_geometry_correction(normalized, correction)
+    corrected, changes = _raster_evidenced_header_rebuild(image_path, original)
     if corrected is None:
-        return None, [], None
+        normalized, changes = _normalize_sparse_continuation_rows(original)
+        if normalized is None:
+            return None, [], None
+        correction = _grid_line_geometry_correction(image_path, normalized)
+        corrected = _apply_geometry_correction(normalized, correction)
+        if corrected is None:
+            return None, [], None
     old_problems = _problem_tables(original)
     new_problems = _problem_tables(corrected)
     old_table_count = sum(
@@ -1332,7 +1612,13 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
         except Exception:
             continue
         problems = _problem_tables(data)
-        if problems:
+        has_formula_definition = any(
+            isinstance(element, dict)
+            and element.get("type") == "table"
+            and _borderless_definition_text(element)
+            for element in data.get("elements") or []
+        )
+        if problems or has_formula_definition:
             candidates.append((structured_path, data, problems))
     if TABLE_QUALITY_REPAIR_MAX_PAGES > 0:
         candidates = candidates[:TABLE_QUALITY_REPAIR_MAX_PAGES]
@@ -1470,9 +1756,13 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                     targeted_variants.append(("grid_corrected_table_graft", corrected))
 
             for targeted_strategy, targeted_candidate in targeted_variants:
+                review_only = all(
+                    set(problem.get("issues") or []).issubset(REVIEW_ISSUES)
+                    for problem in problems
+                )
                 minimum_sequence = (
                     0.80
-                    if targeted_strategy == "grid_corrected_table_graft"
+                    if targeted_strategy == "grid_corrected_table_graft" or review_only
                     else 0.98
                 )
                 grafted, grafts = graft_improved_tables(

@@ -36,6 +36,21 @@ class VisualJudgeTests(unittest.TestCase):
 
         self.assertEqual(visual_judge_pages.objective_quality_failures(data), [])
 
+    def test_visible_attachment_notice_is_reviewed_instead_of_hard_failed(self):
+        data = {
+            "low_confidence": True,
+            "elements": [
+                {
+                    "type": "text",
+                    "content": "Protected attachment notice with the source filename.",
+                    "_source": "eml_notice",
+                    "_confidence": 0.35,
+                }
+            ],
+        }
+
+        self.assertEqual(visual_judge_pages.objective_quality_failures(data), [])
+
     def test_page_counter_is_not_treated_as_missing_content(self):
         verdict = {
             "pass": False,

@@ -15,7 +15,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import table_validate  # noqa: E402
-from utils import _drop_page_artifact_elements  # noqa: E402
+from utils import (  # noqa: E402
+    _drop_page_artifact_elements,
+    _table_text_layer_copy_support,
+)
 
 
 HARD_TABLE_ISSUES = {
@@ -54,6 +57,23 @@ def nonempty_json(path: Path) -> bool:
     if isinstance(data, (list, dict)):
         return bool(data)
     return False
+
+
+def distinct_table_contexts(elements: list[dict], indices: list[int]) -> bool:
+    """Check whether repeated tables belong to distinct nearby sections."""
+    contexts = []
+    for position, index in enumerate(indices):
+        lower = indices[position - 1] + 1 if position else max(0, index - 4)
+        heading = ""
+        for candidate_index in range(index - 1, lower - 1, -1):
+            candidate = elements[candidate_index]
+            if str(candidate.get("type") or "").startswith("heading_"):
+                heading = normalized_content(candidate)
+                break
+        if not heading:
+            return False
+        contexts.append(heading)
+    return len(set(contexts)) == len(contexts)
 
 
 class Audit:
@@ -99,18 +119,11 @@ class Audit:
         if len(residual) != len(elements):
             self.hard(where, "residual_page_artifact", len(elements) - len(residual))
 
-        seen: dict[str, int] = {}
+        substantial_groups: dict[str, list[int]] = {}
         for index, element in enumerate(elements):
             content = normalized_content(element)
             if len(content) >= 40:
-                if content in seen:
-                    self.hard(
-                        where,
-                        "duplicate_substantial_element",
-                        {"first": seen[content], "duplicate": index, "text": content[:160]},
-                    )
-                else:
-                    seen[content] = index
+                substantial_groups.setdefault(content, []).append(index)
 
             element_type = str(element.get("type") or "")
             try:
@@ -158,6 +171,35 @@ class Audit:
                 self.hard(where, "table_confidence_below_0.75", {"index": index, "quality": quality})
             if not str(element.get("caption") or "").strip():
                 self.warn(where, "table_missing_caption", index)
+
+        text_path = structured_path.with_name(
+            structured_path.name.replace("_structured.json", ".txt")
+        )
+        try:
+            source_text = text_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            source_text = ""
+        for content, indices in substantial_groups.items():
+            if len(indices) < 2:
+                continue
+            repeated = [elements[index] for index in indices]
+            if all(element.get("type") == "table" for element in repeated):
+                support = _table_text_layer_copy_support(repeated[0], source_text)
+                if support is not None and support >= len(indices):
+                    continue
+                if support is None and distinct_table_contexts(elements, indices):
+                    self.warn(
+                        where,
+                        "repeated_table_without_text_layer_evidence",
+                        {"indices": indices},
+                    )
+                    continue
+            for duplicate in indices[1:]:
+                self.hard(
+                    where,
+                    "duplicate_substantial_element",
+                    {"first": indices[0], "duplicate": duplicate, "text": content[:160]},
+                )
 
     def audit_document(self, doc_dir: Path) -> None:
         metadata_path = doc_dir / "metadata.json"
