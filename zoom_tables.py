@@ -29,7 +29,7 @@ If the image is not primarily a bordered table/grid, output exactly {"page_numbe
 
 [TABLES — STRUCTURE FIDELITY]
 - table content = HTML using ONLY <table>,<tr>,<td> (and <br> only inside a cell) — NEVER <th>. colspan/rowspan allowed. Put the title in "caption".
-(1) ONE <table> = ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE or are separated by a gap/ruled gutter/blank column/different column structure, output EACH as its OWN separate <table> element. NEVER merge side-by-side grids, and never put the right grid's columns into the left grid's row.
+(1) ONE <table> = ONE continuous bordered grid. If grids sit SIDE BY SIDE, or are STACKED TOP/BOTTOM with a separate border/gap and different column structures, output EACH as its OWN separate <table> element. NEVER merge separate grids.
 (2) Fix the column count ONCE from the vertical borders; EVERY <tr> must sum (counting colspan) to exactly that count — pad missing cells with <td></td>, never invent or drop columns.
 (3) NO column-bleed: assign each printed value to EXACTLY ONE cell. Adjacent <td> must not duplicate text unless genuinely printed twice. Empty cell is <td></td>.
 (4) MERGED cells: spanning N columns -> colspan="N"; N rows -> rowspan="N". Reproduce multi-row headers exactly.

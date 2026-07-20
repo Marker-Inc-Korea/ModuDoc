@@ -93,6 +93,113 @@ def _has_colspan_crossing(grid, seam):
                 col += 1
     return False
 
+
+def _direct_cells(row):
+    return row.find_all(["td", "th"], recursive=False)
+
+
+def _span_int(cell, attr, default=1):
+    try:
+        return max(1, int(cell.get(attr, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _direct_row_width(row):
+    return sum(_span_int(cell, "colspan") for cell in _direct_cells(row))
+
+
+def _rowspan_crosses(rows, seam):
+    for row_index, row in enumerate(rows[:seam]):
+        for cell in _direct_cells(row):
+            if row_index + _span_int(cell, "rowspan") > seam:
+                return True
+    return False
+
+
+def _split_stacked_tables(rows, row_width, caption=None):
+    """Split stacked grids when each side has a stable, different width."""
+    if len(rows) < 4 or len(set(row_width)) < 2:
+        return None
+    candidates = []
+    for seam in range(2, len(rows) - 1):
+        upper = row_width[:seam]
+        lower = row_width[seam:]
+        upper_mode = statistics.mode(upper)
+        lower_mode = statistics.mode(lower)
+        if upper_mode < 2 or lower_mode < 2 or upper_mode == lower_mode:
+            continue
+        upper_ratio = upper.count(upper_mode) / len(upper)
+        lower_ratio = lower.count(lower_mode) / len(lower)
+        if upper_ratio < 0.8 or lower_ratio < 0.8 or _rowspan_crosses(rows, seam):
+            continue
+        candidates.append((upper_ratio + lower_ratio, seam))
+    if not candidates:
+        return None
+    _, seam = max(candidates)
+
+    def _table_html(part):
+        return "<table>" + "".join(str(row) for row in part) + "</table>"
+
+    return [
+        {"content": _table_html(rows[:seam]), "caption": caption},
+        {"content": _table_html(rows[seam:]), "caption": caption},
+    ]
+
+
+def _split_nested_tables(html, caption=None):
+    """Promote nested grids to separate table elements without changing text."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    outer = soup.find("table")
+    if outer is None or not outer.find("table"):
+        return None
+
+    rows = _rows_of(outer)
+    plain_widths = [
+        _direct_row_width(row)
+        for row in rows
+        if not row.find("table") and _direct_row_width(row) > 0
+    ]
+    try:
+        outer_width = statistics.mode(plain_widths) if plain_widths else None
+    except statistics.StatisticsError:
+        outer_width = None
+
+    nested_records = []
+    for nested in list(outer.find_all("table")):
+        if nested.find_parent("table") is not outer:
+            continue
+        parent_cell = nested.find_parent(["td", "th"])
+        row = parent_cell.find_parent("tr") if parent_cell else None
+        labels = []
+        if row is not None and parent_cell is not None:
+            for cell in _direct_cells(row):
+                if cell is parent_cell:
+                    break
+                text = cell.get_text(" ", strip=True)
+                if text:
+                    labels.append(text)
+        nested_records.append(
+            {"content": str(nested), "caption": " / ".join(labels) or caption}
+        )
+        nested.decompose()
+
+        if row is None or parent_cell is None or not outer_width:
+            continue
+        cells = _direct_cells(row)
+        used = sum(
+            _span_int(cell, "colspan") for cell in cells if cell is not parent_cell
+        )
+        desired = max(1, outer_width - used)
+        if desired > 1:
+            parent_cell["colspan"] = str(desired)
+        elif parent_cell.has_attr("colspan"):
+            del parent_cell["colspan"]
+
+    if not nested_records:
+        return None
+    return [{"content": str(outer), "caption": caption}, *nested_records]
+
 def validate_and_repair_table(html, caption=None):
     """반환 (elements:list[{'content':html,'caption':...}], needs_retry:bool, issues:list).
     elements 가 2개면 분할 결과."""
@@ -102,7 +209,10 @@ def validate_and_repair_table(html, caption=None):
         if not tables:
             return [{"content": html, "caption": caption}], False, []
         top = tables[0]
-        if top.find("table"):                 # 중첩표는 통과
+        if top.find("table"):
+            split = _split_nested_tables(html, caption)
+            if split:
+                return split, False, ["nested_table_split"]
             return [{"content": html, "caption": caption}], False, ["nested_table"]
         rows = _rows_of(top)
         if len(rows) < 2:
@@ -111,9 +221,13 @@ def validate_and_repair_table(html, caption=None):
         if C < 2:
             return [{"content": html, "caption": caption}], False, []
 
+        stacked = _split_stacked_tables(rows, row_width, caption)
+        if stacked:
+            return stacked, False, ["stacked_tables_split"]
+
         # 병합셀(colspan/rowspan>1) 표는 수리 제외(원본 유지). 무병합 표만 아래 수리.
         has_merge = any(
-            (int(c.get("colspan", 1) or 1) > 1 or int(c.get("rowspan", 1) or 1) > 1)
+            (_span_int(c, "colspan") > 1 or _span_int(c, "rowspan") > 1)
             for c in top.find_all(["td", "th"])
         )
         if has_merge:
@@ -194,7 +308,7 @@ def validate_and_repair_table(html, caption=None):
         return [{"content": html, "caption": caption}], False, ["validator_error"]
 
 
-def assess_table_quality(html, caption=None):
+def assess_table_quality(html, caption=None, allow_nested=False):
     """Return lightweight table quality signals for provenance/confidence metadata."""
     out = {"confidence": 0.95, "issues": [], "rows": 0, "cols": 0}
     try:
@@ -204,6 +318,9 @@ def assess_table_quality(html, caption=None):
             out["confidence"] = 0.0
             out["issues"].append("no_table")
             return out
+        if table.find("table") is not None and not allow_nested:
+            out["issues"].append("nested_table")
+            out["confidence"] = min(out["confidence"], 0.65)
         rows = _rows_of(table)
         grid, row_width, R, C = _build_grid(rows)
         out["rows"], out["cols"] = R, C

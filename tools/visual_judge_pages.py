@@ -17,7 +17,6 @@ import re
 import time
 from pathlib import Path
 
-from openai import OpenAI
 from PIL import Image
 
 
@@ -30,7 +29,9 @@ Return ONLY valid JSON with this schema:
   "severity": "none|minor|major|critical",
   "issue_types": ["missing_text|wrong_text|wrong_order|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
   "missing_visible_text": ["short exact snippets"],
-  "wrong_or_hallucinated_text": ["short snippets"],
+  "text_mismatches": [{"image_text": "exact image text", "candidate_text": "exact candidate text"}],
+  "hallucinated_candidate_text": ["exact candidate-only snippets"],
+  "structure_evidence": ["specific image-vs-candidate fact, e.g. image has 6 columns but candidate has 5"],
   "reason": "short reason"
 }
 
@@ -40,9 +41,21 @@ materially wrong table structure, empty/low-confidence fallback warnings,
 hallucinated content, or wrong reading order.
 Ignore decorative backgrounds, leader dots in a TOC, and tiny repeated
 page headers/footers unless they are the only content.
+Ignore differences limited to whitespace, line wrapping, punctuation style,
+HTML tag choice, or whether a title is a heading versus a caption. These are
+not wrong_text or table_structure failures when content and meaning match.
 For tables, exact HTML tags may differ, but cells/rows/headers and merged-cell
 meaning must be preserved. For figures/screenshots/charts, visible labels/data
-and a reasonable description must be present."""
+and a reasonable description must be present.
+
+Evidence is mandatory for a failure:
+- Every wrong_text claim needs an image_text/candidate_text pair. Never cite
+  candidate text by itself. The normalized pair must actually differ.
+- Every hallucination claim needs an exact candidate-only snippet.
+- Every wrong_order/table_structure/toc_structure claim needs concrete
+  structure_evidence describing both image and candidate.
+- Do not return pass=false with score >= 90 for cosmetic differences. If your
+  reason says the structure/content is accurate, pass must be true."""
 
 
 def encode_image(path: str, max_width: int) -> str:
@@ -127,19 +140,61 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
     verdict = dict(verdict or {})
     issues = list(verdict.get("issue_types") or [])
     missing = list(verdict.get("missing_visible_text") or [])
-    wrong = list(verdict.get("wrong_or_hallucinated_text") or [])
+    mismatches = list(verdict.get("text_mismatches") or [])
+    hallucinated = list(verdict.get("hallucinated_candidate_text") or [])
+    structure_evidence = [
+        str(item).strip() for item in (verdict.get("structure_evidence") or []) if str(item).strip()
+    ]
     nstruct = norm_text(structured_text)
     missing = [item for item in missing if norm_text(item) and norm_text(item) not in nstruct]
-    wrong = [item for item in wrong if norm_text(item) and norm_text(item) not in nstruct]
-    if not missing and not wrong:
-        issues = [item for item in issues if item not in ("wrong_text", "missing_text")]
+    verified_mismatches = []
+    for item in mismatches:
+        if not isinstance(item, dict):
+            continue
+        image_text = str(item.get("image_text") or "").strip()
+        candidate_text = str(item.get("candidate_text") or "").strip()
+        nimage = norm_text(image_text)
+        ncandidate = norm_text(candidate_text)
+        if nimage and ncandidate and nimage != ncandidate and ncandidate in nstruct:
+            verified_mismatches.append(
+                {"image_text": image_text, "candidate_text": candidate_text}
+            )
+    hallucinated = [
+        item for item in hallucinated if norm_text(item) and norm_text(item) in nstruct
+    ]
+    if not missing:
+        issues = [item for item in issues if item != "missing_text"]
+    if not verified_mismatches:
+        issues = [item for item in issues if item != "wrong_text"]
+    if not hallucinated:
+        issues = [item for item in issues if item != "hallucination"]
+    structural_types = {"wrong_order", "table_structure", "toc_structure"}
+    if not structure_evidence:
+        issues = [item for item in issues if item not in structural_types]
     score = int(verdict.get("score", 0) or 0)
-    soft_only = set(issues).issubset({"wrong_order", "other", "figure_description", "table_structure"})
-    if (not missing and not wrong and score >= 85 and soft_only) or (not issues and score >= 80):
+    evidenced_structure = bool(set(issues) & structural_types and structure_evidence)
+    hard_metadata = "empty_or_low_confidence" in issues
+    soft_only = set(issues).issubset({"other", "figure_description"})
+    hard_detected = bool(
+        missing or verified_mismatches or hallucinated or evidenced_structure or hard_metadata
+    )
+    if hard_detected:
+        verdict["pass"] = False
+        if verdict.get("severity") in (None, "none", "minor"):
+            verdict["severity"] = "major"
+    elif (
+        (not missing and not verified_mismatches and not hallucinated and score >= 85 and soft_only)
+        or (not issues and score >= 80)
+    ):
         verdict["pass"] = True
         verdict["severity"] = "minor" if issues else "none"
     verdict["missing_visible_text"] = missing
-    verdict["wrong_or_hallucinated_text"] = wrong
+    verdict["text_mismatches"] = verified_mismatches
+    verdict["hallucinated_candidate_text"] = hallucinated
+    verdict["structure_evidence"] = structure_evidence
+    verdict["wrong_or_hallucinated_text"] = [
+        item["candidate_text"] for item in verified_mismatches
+    ] + hallucinated
     verdict["issue_types"] = issues
     return verdict
 
@@ -147,7 +202,23 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
 def compact_structured(path: str, limit: int) -> str:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        text = json.dumps(data, ensure_ascii=False)
+        compact = {
+            key: data.get(key)
+            for key in ("page_number", "low_confidence", "warning")
+            if data.get(key) not in (None, "", False)
+        }
+        compact["elements"] = []
+        for element in data.get("elements") or []:
+            if not isinstance(element, dict):
+                continue
+            compact["elements"].append(
+                {
+                    key: element.get(key)
+                    for key in ("type", "content", "caption", "description")
+                    if element.get(key) not in (None, "")
+                }
+            )
+        text = json.dumps(compact, ensure_ascii=False)
     except Exception:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     if len(text) <= limit:
@@ -178,7 +249,7 @@ def collect_pages(root: Path) -> list[dict]:
     return pages
 
 
-def judge_one(client: OpenAI, model: str, item: dict, args: argparse.Namespace) -> dict:
+def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
     started = time.time()
     result = {
         "doc": item["doc"],
@@ -190,6 +261,9 @@ def judge_one(client: OpenAI, model: str, item: dict, args: argparse.Namespace) 
         "severity": "critical",
         "issue_types": ["empty_or_low_confidence"],
         "missing_visible_text": [],
+        "text_mismatches": [],
+        "hallucinated_candidate_text": [],
+        "structure_evidence": [],
         "wrong_or_hallucinated_text": [],
         "reason": "structured json missing",
         "seconds": None,
@@ -217,14 +291,15 @@ def judge_one(client: OpenAI, model: str, item: dict, args: argparse.Namespace) 
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": user},
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            {"type": "text", "text": user},
                         ],
                     },
                 ],
                 temperature=0,
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
+                response_format={"type": "json_object"},
                 extra_body={"repetition_penalty": 1.05},
             )
             verdict = first_json_obj(resp.choices[0].message.content)
@@ -238,6 +313,9 @@ def judge_one(client: OpenAI, model: str, item: dict, args: argparse.Namespace) 
                     "severity": verdict.get("severity") or ("none" if verdict.get("pass") else "major"),
                     "issue_types": verdict.get("issue_types") or [],
                     "missing_visible_text": verdict.get("missing_visible_text") or [],
+                    "text_mismatches": verdict.get("text_mismatches") or [],
+                    "hallucinated_candidate_text": verdict.get("hallucinated_candidate_text") or [],
+                    "structure_evidence": verdict.get("structure_evidence") or [],
                     "wrong_or_hallucinated_text": verdict.get("wrong_or_hallucinated_text") or [],
                     "reason": verdict.get("reason") or "",
                 }
@@ -271,6 +349,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from openai import OpenAI
+
     args = parse_args()
     run_dir = Path(args.run_dir)
     out_dir = Path(args.out) if args.out else run_dir / "_visual_judge"
@@ -319,6 +399,8 @@ def main() -> int:
                     "issue_types": item["issue_types"],
                     "reason": item["reason"],
                     "missing_visible_text": item["missing_visible_text"][:8],
+                    "text_mismatches": item["text_mismatches"][:8],
+                    "structure_evidence": item["structure_evidence"][:8],
                     "wrong_or_hallucinated_text": item["wrong_or_hallucinated_text"][:8],
                 }
             )

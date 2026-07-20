@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import hmac
 import uuid
 import threading
 import shutil
@@ -28,9 +29,74 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 VLM_BASE_URL = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
 API_KEY = os.environ.get("VLM_API_KEY", "local-vllm-noauth-key")
+VIEWER_AUTH_USER = os.environ.get("VIEWER_AUTH_USER", "")
+VIEWER_AUTH_PASSWORD = os.environ.get("VIEWER_AUTH_PASSWORD", "")
+VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
+ALLOW_UNAUTHENTICATED_REMOTE = os.environ.get(
+    "ALLOW_UNAUTHENTICATED_REMOTE", ""
+).lower() in {"1", "true", "yes", "on"}
+
+if bool(VIEWER_AUTH_USER) != bool(VIEWER_AUTH_PASSWORD):
+    raise RuntimeError(
+        "VIEWER_AUTH_USER and VIEWER_AUTH_PASSWORD must be configured together"
+    )
 
 tasks_progress = {}
 history_lock = threading.Lock()
+
+
+@app.before_request
+def require_viewer_auth():
+    """Protect every web/API route when viewer credentials are configured."""
+    if not VIEWER_AUTH_USER:
+        return None
+    auth = request.authorization
+    valid = bool(
+        auth
+        and hmac.compare_digest(auth.username or "", VIEWER_AUTH_USER)
+        and hmac.compare_digest(auth.password or "", VIEWER_AUTH_PASSWORD)
+    )
+    if valid:
+        return None
+    response = jsonify({"error": "Authentication required"})
+    response.status_code = 401
+    response.headers["WWW-Authenticate"] = (
+        'Basic realm="ModuDoc Viewer", charset="UTF-8"'
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.after_request
+def disable_document_caching(response):
+    """Parsed documents and page images must not be retained by shared caches."""
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self' data:; object-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    )
+    return response
+
+
+def validate_viewer_exposure(host):
+    normalized = str(host or "").strip().lower().strip("[]")
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    if (
+        normalized not in local_hosts
+        and not VIEWER_AUTH_USER
+        and not ALLOW_UNAUTHENTICATED_REMOTE
+    ):
+        raise RuntimeError(
+            "Refusing an unauthenticated non-loopback bind. Configure "
+            "VIEWER_AUTH_USER and VIEWER_AUTH_PASSWORD, or explicitly set "
+            "ALLOW_UNAUTHENTICATED_REMOTE=1 for a public sample-only instance."
+        )
 
 def get_safe_filename(filename):
     basename = os.path.basename(filename or "")
@@ -273,7 +339,7 @@ def _doc_dir(name):
     """OUTPUT_FOLDER 하위의 안전한 문서 폴더 경로(경로탈출 차단)."""
     safe = os.path.basename(name or "")
     d = os.path.join(app.config['OUTPUT_FOLDER'], safe)
-    if not safe or not os.path.isdir(d):
+    if not safe or safe != name or safe in {".", ".."} or not os.path.isdir(d):
         abort(404)
     return d
 
@@ -451,4 +517,5 @@ def api_file(name, filename):
 if __name__ == '__main__':
     debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
     port = int(os.environ.get("PORT", "5000"))
-    app.run(debug=debug, port=port)
+    validate_viewer_exposure(VIEWER_HOST)
+    app.run(host=VIEWER_HOST, debug=debug, port=port)

@@ -153,26 +153,63 @@ def _collapse_compound_repeat_text(text):
     leading = text[:len(text) - len(text.lstrip())]
     trailing = text[len(text.rstrip()):]
     core = text.strip()
-    if not core or len(core) > 40 or re.search(r"\s", core):
+    if not core or len(core) > 40:
         return text
-    # Whole-string exact repetition: AAAAAA -> A.
-    for n in range(1, min(20, len(core) // 2) + 1):
-        if len(core) % n == 0:
-            unit = core[:n]
-            if unit and unit * (len(core) // n) == core:
-                return leading + unit + trailing
-    # Two adjacent duplicate runs: A A B B -> A B.
-    max_part = min(16, len(core) // 2)
-    for a_len in range(1, max_part + 1):
-        a = core[:a_len]
-        if not core.startswith(a * 2):
-            continue
-        rest = core[a_len * 2:]
-        for b_len in range(1, min(16, len(rest) // 2) + 1):
-            b = rest[:b_len]
-            if b and len(rest) % b_len == 0 and b * (len(rest) // b_len) == rest:
-                return leading + a + b + trailing
+
+    def _collapse_token(token):
+        # Whole-string exact repetition: AAAAAA -> A.
+        for n in range(1, min(20, len(token) // 2) + 1):
+            if len(token) % n == 0:
+                unit = token[:n]
+                if unit and unit * (len(token) // n) == token:
+                    return unit
+        # Two adjacent duplicate runs: A A B B -> A B.
+        max_part = min(16, len(token) // 2)
+        for a_len in range(1, max_part + 1):
+            a = token[:a_len]
+            if not token.startswith(a * 2):
+                continue
+            rest = token[a_len * 2:]
+            for b_len in range(1, min(16, len(rest) // 2) + 1):
+                b = rest[:b_len]
+                if b and len(rest) % b_len == 0 and b * (len(rest) // b_len) == rest:
+                    return a + b
+        return token
+
+    if not re.search(r"\s", core):
+        collapsed = _collapse_token(core)
+        return leading + collapsed + trailing if collapsed != core else text
+
+    # OCR/VLM can insert a space between duplicated runs: "참고참고 1717".
+    # Require at least two changed tokens so ordinary words such as "하하 결과" stay intact.
+    pieces = re.split(r"(\s+)", core)
+    changed = 0
+    for index in range(0, len(pieces), 2):
+        collapsed = _collapse_token(pieces[index])
+        if collapsed != pieces[index]:
+            pieces[index] = collapsed
+            changed += 1
+    if changed >= 2:
+        return leading + "".join(pieces) + trailing
     return text
+
+
+def _dedupe_exact_text_elements(elements):
+    """Drop exact duplicate prose while preserving repeated structural elements."""
+    seen_text = set()
+    result = []
+    for element in elements or []:
+        if not isinstance(element, dict):
+            result.append(element)
+            continue
+        element_type = element.get("type", "text")
+        content = re.sub(r"\s+", " ", (element.get("content") or "")).strip()
+        if element_type in {"text", "footnote"} and content:
+            if content in seen_text:
+                continue
+            seen_text.add(content)
+        result.append(element)
+    return result
 
 
 def _mark_element(e, source=None, confidence=None, issues=None):
@@ -232,6 +269,96 @@ def _collect_provenance_summary(elements):
                 continue
             summary["issues"][issue] = summary["issues"].get(issue, 0) + 1
     return summary
+
+
+def _looks_page_artifact_text(text, page_no=None, index=0, total=0, has_page_marker=False):
+    """Detect repeated page headers/footers that should not enter RAG text."""
+    s = re.sub(r"\s+", " ", (text or "")).strip()
+    if not s:
+        return False
+    edge = index <= 1 or index >= max(0, total - 3)
+    # Report footers such as "- / 51 -", "- / 40 -", "- 18-".
+    if re.fullmatch(r"[-–—]?\s*/\s*\d{1,4}\s*[-–—]?", s):
+        return True
+    if re.fullmatch(r"[-–—]\s*\d{1,4}\s*[-–—]?", s):
+        return True
+    # Standalone small page numbers are ambiguous. Drop them only when they match
+    # the parsed page number or another strong footer marker exists on this page.
+    if edge and re.fullmatch(r"\d{1,3}", s):
+        try:
+            n = int(s)
+            if n <= 200:
+                matches_page = page_no is not None and abs(n - int(page_no)) <= 3
+                if matches_page or (has_page_marker and index >= max(0, total - 3)):
+                    return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _drop_page_artifact_elements(elements, page_no=None):
+    """Remove page-number/header/footer noise from text-like elements only."""
+    if not elements:
+        return elements
+    total = len(elements)
+    has_page_marker = any(
+        isinstance(e, dict)
+        and e.get("type", "text") in {"text", "footnote"}
+        and _looks_page_artifact_text(e.get("content"), None, idx, total)
+        for idx, e in enumerate(elements)
+    )
+    cleaned = []
+    for idx, e in enumerate(elements):
+        if not isinstance(e, dict):
+            cleaned.append(e)
+            continue
+        et = e.get("type", "text")
+        if et in {"text", "footnote"} and _looks_page_artifact_text(
+            e.get("content"), page_no, idx, total, has_page_marker
+        ):
+            continue
+        cleaned.append(e)
+    return cleaned
+
+
+def _backfill_table_captions(elements):
+    """Attach nearby visible section labels to following captionless tables."""
+    if not elements:
+        return elements
+
+    def _candidate_title(e):
+        if not isinstance(e, dict):
+            return ""
+        if not str(e.get("type", "")).startswith(("heading", "text")):
+            return ""
+        s = re.sub(r"\s+", " ", (e.get("content") or "")).strip()
+        if not s or len(s) > 90:
+            return ""
+        if re.fullmatch(r"[-–—]?\s*/?\s*\d{1,4}\s*[-–—]?", s):
+            return ""
+        strong = (
+            str(e.get("type", "")).startswith("heading") or
+            any(k in s for k in ("표", "등급", "현황", "내역", "태도", "산정", "평가", "위험", "요약"))
+        )
+        return s if strong else ""
+
+    last_title = ""
+    for e in elements:
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "table":
+            if not (e.get("caption") or "").strip():
+                if last_title:
+                    e["caption"] = last_title
+            last_title = ""
+            continue
+        title = _candidate_title(e)
+        if title:
+            last_title = title
+        elif e.get("type") not in {"footnote"}:
+            # Only an immediately adjacent visible label may caption a table.
+            last_title = ""
+    return elements
 
 
 def _reposition_figures_by_anchor(elements, anchors):
@@ -1013,7 +1140,7 @@ Your task is to convert the provided document text (and layout image if availabl
   (3) Section/group labels on a TOC page that do NOT have their own visible page number (e.g. "I. 시스템 개요 및 사용자 등록") are headings, not toc_entry. Do NOT copy a child row's page number onto a parent/group label.
   (4) Keep every visible TOC title and page number, including lower-page entries near the bottom. Never summarize the TOC.
 - TABLES — STRUCTURE FIDELITY (critical):
-  (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right) or are separated by any gap, ruled gutter, blank column, or different column structure, output EACH as its OWN separate <table> element. NEVER merge two side-by-side grids into one <table>, and never put the right grid's columns into the same <tr> as the left grid's.
+  (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right), or are STACKED TOP/BOTTOM with a separate border/gap and different column structures, output EACH as its OWN separate <table> element. NEVER merge separate grids into one <table>.
   (2) Count the column count ONCE from the vertical border lines; EVERY <tr> must sum (counting colspan) to exactly that count — pad missing cells with <td></td>, never invent or drop columns.
   (3) NO column-bleed: assign each printed value to EXACTLY ONE cell (the column whose borders bracket it). Two horizontally-adjacent <td> in a row MUST NOT contain identical text unless it is genuinely printed twice. An empty cell is <td></td> — never fill it by copying the neighbour.
   (4) MERGED cells: a cell that visually spans N columns → colspan="N"; spanning N rows → rowspan="N". Reproduce multi-row headers exactly with colspan/rowspan; do not flatten or duplicate the spanned text into each cell.
@@ -2773,16 +2900,9 @@ class DocumentProcessor:
                                 else:
                                     drop[i] = True
                                     break
-                    deduped, seen = [], set()
-                    for k, e in enumerate(elems):
-                        if drop[k]:
-                            continue
-                        c = norm[k]
-                        if c and c in seen:
-                            continue
-                        if c:
-                            seen.add(c)
-                        deduped.append(e)
+                    deduped = _dedupe_exact_text_elements(
+                        [e for k, e in enumerate(elems) if not drop[k]]
+                    )
                     # TOC sanity cleanup: VLM sometimes assigns the first child page number to a parent/group
                     # label ("I. ...::7") even when no page number is printed on that line. Keep only page
                     # numbers supported by the text-layer leader/page pattern; demote unsupported group labels.
@@ -2841,6 +2961,12 @@ class DocumentProcessor:
                                 deduped = cleaned_toc
                     except Exception as te:
                         logger.warning(f"TOC sanity cleanup 실패({stem}): {te}")
+                    try:
+                        _page_no_for_artifacts = parsed.get("page_number")
+                        deduped = _drop_page_artifact_elements(deduped, _page_no_for_artifacts)
+                        deduped = _backfill_table_captions(deduped)
+                    except Exception as ae:
+                        logger.warning(f"페이지 노이즈/표 캡션 보정 실패({stem}): {ae}")
                     # silent-drop 탐지: 이미지엔 잉크가 있는데 추출 본문이 페이지번호/푸터 수준이면 저신뢰 표기.
                     alltext = "".join((e.get("content") or "") + (e.get("caption") or "") +
                                       (e.get("description") or "") for e in deduped)
@@ -2871,7 +2997,9 @@ class DocumentProcessor:
                                 _nh = (table_validate.native_substitute(e["content"], _native_prep)
                                        if _native_prep else None)
                                 if _nh and _nh.strip() and "</table>" in _nh:
-                                    q = table_validate.assess_table_quality(_nh, e.get("caption"))
+                                    q = table_validate.assess_table_quality(
+                                        _nh, e.get("caption"), allow_nested=True
+                                    )
                                     rebuilt.append(_mark_element(
                                         {**e, "content": _nh, "_native": True},
                                         "native_table", min(0.99, q.get("confidence", 0.99)),
@@ -3195,6 +3323,26 @@ class DocumentProcessor:
                 exists = os.path.exists(os.path.join(doc_output_dir, f"{stem}_structured.{output_format.lower()}"))
             if not exists:
                 _write_fallback_page(stem)
+
+        # Objective table failures (ragged/collapsed grouped headers) get one
+        # image-grounded repair pass. Strict coverage and table-count gates in
+        # table_quality_repair prevent a prettier but lossy candidate replacing
+        # the original page.
+        if api_key and output_format.lower() in ("json", "markdown"):
+            try:
+                from table_quality_repair import repair_low_quality_pages
+
+                quality_repairs = repair_low_quality_pages(
+                    doc_output_dir, api_key, model_name, _persist_page
+                )
+                accepted_repairs = [item["page"] for item in quality_repairs if item.get("accepted")]
+                rejected_repairs = [item["page"] for item in quality_repairs if not item.get("accepted")]
+                if accepted_repairs:
+                    logger.info(f"표 품질 재추출 적용: {accepted_repairs}")
+                if rejected_repairs:
+                    logger.warning(f"표 품질 재추출 보류(무손실 게이트 미통과): {rejected_repairs}")
+            except Exception as e:
+                logger.warning(f"표 품질 재추출 실패: {e}")
 
         if output_format.lower() in ("json", "markdown"):
             toc_entries = []

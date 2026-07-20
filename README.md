@@ -149,6 +149,12 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `ZOOM_JUDGE_TIMEOUT` | `60` | zoom-pass A/B 심판 VLM 호출 타임아웃(초) |
 | `ZOOM_MAX_CANDIDATES` | `16` | 문서당 zoom-pass 후보 raster 표 최대 개수. 큰 표부터 처리하며 `0`이면 제한 없음 |
 | `ZOOM_DOC_BUDGET_SEC` | `900` | 문서당 zoom-pass 전체 시간 예산(초). 예산 초과 시 남은 후보를 건너뜀, `0`이면 제한 없음 |
+| `TABLE_QUALITY_REPAIR` | `1` | ragged/그룹 헤더 붕괴 등 객관적 표 구조 오류 페이지만 이미지 기준으로 재추출 |
+| `TABLE_QUALITY_REPAIR_MAX_PAGES` | `8` | 문서당 표 품질 재추출 페이지 상한(`0`이면 제한 없음) |
+| `TABLE_QUALITY_REPAIR_MAX_TOKENS` | `16384` | 표 품질 재추출 응답 토큰 상한 |
+| `TABLE_QUALITY_REPAIR_TIMEOUT` | `600` | 표 품질 재추출 호출 타임아웃(초) |
+| `TABLE_QUALITY_REPAIR_IMG_MAXW` | `2464` | 표 품질 재추출 이미지 최대 너비 |
+| `TABLE_QUALITY_REPAIR_MIN_COVERAGE` | `0.75` | 재추출 후보가 보존해야 하는 기존 구조화 내용의 최소 비율 |
 
 > 💡 **표 구조 정확도 ↔ 비용**: 기본값 `300`DPI/`2464`px 는 서로 붙어 있는 표(예: 좌측 평가표 + 우측 등급표)를 **각각 별도 `<table>` 로 분리**합니다. 속도·토큰을 아끼려면 `RENDER_DPI=200 VLM_IMG_MAXW=1568` 로 낮출 수 있습니다(페이지 수·내용은 동일하나 나란히 표의 분리 정확도는 하락).
 >
@@ -208,6 +214,37 @@ python tools/visual_judge_pages.py /path/to/parser-run --docs "sample" --pages "
 python app.py
 ```
 서버가 `http://localhost:5000`에서 실행되며, 직관적인 Web UI를 통해 즉시 문서를 업로드하고 파싱할 수 있습니다.
+
+원본 페이지와 파싱 결과를 나란히 검토하려면 `/compare`를 엽니다. 비교할
+결과 디렉터리는 `OUTPUT_FOLDER`로 지정할 수 있습니다.
+
+```bash
+OUTPUT_FOLDER=/path/to/parser-output python app.py
+```
+
+기본 바인딩은 `127.0.0.1`이며 문서 데이터는 공개되지 않습니다. 외부 장치에서
+접속할 때는 반드시 HTTPS 프록시 또는 암호화 터널을 사용하고 뷰어 인증을
+설정하세요.
+
+```bash
+export VIEWER_HOST=0.0.0.0
+export VIEWER_AUTH_USER='reviewer'
+export VIEWER_AUTH_PASSWORD='use-a-long-random-password'
+python app.py
+```
+
+인증 없이 비루프백 주소에 바인딩하면 서버가 시작을 거부합니다.
+`ALLOW_UNAUTHENTICATED_REMOTE=1`은 공개 가능한 샘플 문서만 제공하는 인스턴스에서
+위험을 명시적으로 승인할 때만 사용해야 합니다. 소스 코드가 오픈소스여도 업로드
+문서, 파싱 결과와 실험 코퍼스는 자동으로 공개 대상이 되지 않습니다.
+
+템플릿의 Tailwind 클래스를 변경한 경우 외부 CDN 코드가 다시 필요하지 않도록 로컬
+정적 CSS를 재생성합니다.
+
+```bash
+npx tailwindcss@3.4.17 -i assets/tailwind.css -o static/app.css \
+  --content './templates/**/*.html' --minify
+```
 
 ---
 

@@ -8,8 +8,26 @@ venv/
 # Runtime artifacts
 processed/
 uploads/
+documents/
+history.json
+.verify/
+tunnel.log
 
 # Local data / archives
 *.zip
+*.pdf
+*.hwp
+*.hwpx
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.odt
+*.rtf
+*.eml
+private_data/
+validation_corpus/
 .DS_Store
 .ipynb_checkpoints/

@@ -4,22 +4,28 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ModuDoc · 원본 비교</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/atom-one-dark.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
     <style>
         html, body { height: 100%; }
         #parsed table { border-collapse: collapse; width: 100%; margin: .4rem 0; font-size: .78rem; }
         #parsed td, #parsed th { border: 1px solid #d1d5db; padding: 4px 7px; vertical-align: top; }
         #parsed th { background: #f3f4f6; font-weight: 700; }
         #parsed mark { background: #fef08a; color: #111827; padding: 0 .1rem; border-radius: .15rem; }
+        #rawJson code { display: block; min-height: 100%; padding: 1rem; background: #111827; color: #e5e7eb; white-space: pre; }
         .page-chip { width: 2.35rem; height: 2rem; }
         .element-block { scroll-margin-top: .75rem; }
         .source-image { max-width: none; transform-origin: top left; }
+        .touch-scroll { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; overscroll-behavior: contain; }
+        @media (max-width: 1023px) {
+            html, body { height: 100dvh; }
+            .compare-pane { height: 100%; }
+            .compare-pane[data-mobile-active="false"] { display: none; }
+            .compare-pane[data-mobile-active="true"] { display: flex; }
+        }
     </style>
 </head>
-<body class="bg-gray-50 text-gray-900 flex h-screen overflow-hidden">
-    <aside class="w-64 bg-gray-900 text-white flex flex-col flex-shrink-0">
+<body class="bg-gray-50 text-gray-900 lg:flex h-[100dvh] overflow-hidden">
+    <aside class="hidden w-64 bg-gray-900 text-white lg:flex flex-col flex-shrink-0">
         <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">ModuDoc</div>
         <nav class="flex-1 p-4 space-y-2">
             <a href="/" class="block py-2.5 px-4 rounded transition hover:bg-gray-800 text-gray-400">새 변환 작업</a>
@@ -28,8 +34,8 @@
         </nav>
     </aside>
 
-    <main class="flex-1 grid grid-cols-[19rem_minmax(0,1fr)] overflow-hidden">
-        <section class="bg-white border-r border-gray-200 flex flex-col min-w-0">
+    <main id="appMain" class="h-[100dvh] flex-1 overflow-hidden lg:grid lg:grid-cols-[19rem_minmax(0,1fr)]">
+        <section class="hidden bg-white border-r border-gray-200 lg:flex flex-col min-w-0">
             <div class="px-4 py-3 border-b border-gray-200">
                 <div class="text-sm font-semibold text-gray-900">문서</div>
                 <div id="docCount" class="text-xs text-gray-500 mt-0.5">-</div>
@@ -40,18 +46,20 @@
             </div>
         </section>
 
-        <section class="flex flex-col min-w-0 overflow-hidden">
-            <header class="bg-white border-b border-gray-200 px-5 py-3 flex items-center gap-3 flex-wrap">
-                <div class="min-w-0 mr-auto">
-                    <h1 id="docTitle" class="text-base font-semibold text-gray-950 truncate">원본 비교 뷰어</h1>
+        <section id="viewerShell" class="h-full flex flex-col min-w-0 overflow-hidden">
+            <header class="bg-white border-b border-gray-200 px-3 py-2 lg:px-5 lg:py-3 flex items-center gap-2 lg:gap-3 flex-wrap">
+                <div class="min-w-0 w-full lg:w-auto lg:mr-auto">
+                    <label for="mobileDocSelect" class="sr-only">문서 선택</label>
+                    <select id="mobileDocSelect" class="lg:hidden w-full px-3 py-2 border border-gray-300 rounded text-sm bg-white"></select>
+                    <h1 id="docTitle" class="text-base font-semibold text-gray-950 truncate mt-2 lg:mt-0">원본 비교 뷰어</h1>
                     <div id="docMeta" class="text-xs text-gray-500 truncate mt-0.5"></div>
                 </div>
 
-                <div class="flex items-center gap-2">
-                    <button id="prevBtn" class="px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">이전</button>
-                    <input id="pageInput" type="number" min="1" class="w-20 px-2 py-2 border border-gray-300 rounded text-sm text-center tabular-nums">
+                <div class="flex items-center gap-1.5 lg:gap-2">
+                    <button id="prevBtn" class="px-2.5 lg:px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">이전</button>
+                    <input id="pageInput" type="number" min="1" class="w-16 lg:w-20 px-2 py-2 border border-gray-300 rounded text-sm text-center tabular-nums">
                     <span id="pageTotal" class="text-sm text-gray-500 tabular-nums">/ -</span>
-                    <button id="nextBtn" class="px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">다음</button>
+                    <button id="nextBtn" class="px-2.5 lg:px-3 py-2 rounded border border-gray-300 text-sm hover:bg-gray-100 disabled:opacity-40">다음</button>
                 </div>
 
                 <select id="pageFilter" class="px-3 py-2 border border-gray-300 rounded text-sm bg-white">
@@ -64,29 +72,33 @@
                 </select>
             </header>
 
-            <div id="summaryBar" class="bg-gray-50 border-b border-gray-200 px-5 py-2 flex items-center gap-2 overflow-x-auto text-xs"></div>
-            <div id="pageStrip" class="bg-white border-b border-gray-200 px-4 py-2 flex gap-1 overflow-x-auto"></div>
+            <div id="summaryBar" class="touch-scroll bg-gray-50 border-b border-gray-200 px-5 py-2 flex items-center gap-2 overflow-x-auto text-xs"></div>
+            <div id="pageStrip" class="touch-scroll bg-white border-b border-gray-200 px-4 py-2 flex gap-1 overflow-x-auto"></div>
+            <div class="lg:hidden grid grid-cols-2 border-b border-gray-200 bg-white p-1.5 gap-1.5">
+                <button id="mobileSourceBtn" class="px-3 py-2 rounded text-sm font-medium" aria-selected="true">원본</button>
+                <button id="mobileParsedBtn" class="px-3 py-2 rounded text-sm font-medium" aria-selected="false">파싱 결과</button>
+            </div>
 
-            <div class="flex-1 grid grid-cols-2 min-h-0 overflow-hidden">
-                <section class="bg-gray-100 border-r border-gray-200 flex flex-col min-w-0">
-                    <div class="h-12 px-4 border-b border-gray-200 bg-white flex items-center gap-3">
+            <div class="flex-1 min-h-0 overflow-hidden lg:grid lg:grid-cols-2">
+                <section id="sourcePane" class="compare-pane bg-gray-100 border-r border-gray-200 flex flex-col min-w-0" data-mobile-active="true">
+                    <div class="min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 bg-white flex items-center gap-2 lg:gap-3 flex-wrap">
                         <div class="font-semibold text-sm mr-auto">원본 페이지</div>
                         <button id="fitBtn" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">맞춤</button>
-                        <input id="zoomRange" type="range" min="60" max="220" value="100" class="w-32">
+                        <input id="zoomRange" type="range" min="60" max="220" value="100" class="w-24 sm:w-32">
                         <span id="zoomLabel" class="text-xs text-gray-500 w-11 text-right tabular-nums">100%</span>
                         <a id="openImageBtn" href="#" target="_blank" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">열기</a>
                     </div>
-                    <div id="imagePane" class="flex-1 overflow-auto p-4">
+                    <div id="imagePane" class="touch-scroll flex-1 overflow-auto p-2 lg:p-4">
                         <img id="pageImg" class="source-image bg-white border border-gray-300 shadow-sm" alt="원본 페이지">
                         <div id="noImg" class="hidden h-full items-center justify-center text-sm text-gray-500">원본 이미지 없음</div>
                     </div>
                 </section>
 
-                <section class="bg-white flex flex-col min-w-0">
-                    <div class="h-12 px-4 border-b border-gray-200 flex items-center gap-3">
+                <section id="parsedResultPane" class="compare-pane bg-white flex flex-col min-w-0" data-mobile-active="false">
+                    <div class="min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 flex items-center gap-2 lg:gap-3 flex-wrap">
                         <div class="font-semibold text-sm whitespace-nowrap mr-auto">파싱 결과</div>
-                        <div class="flex items-center gap-2 flex-shrink-0">
-                            <input id="searchBox" type="search" placeholder="결과 검색" class="w-44 px-2.5 py-1.5 border border-gray-300 rounded text-sm">
+                        <div class="flex items-center gap-2 flex-wrap justify-end">
+                            <input id="searchBox" type="search" placeholder="결과 검색" class="w-36 sm:w-44 px-2.5 py-1.5 border border-gray-300 rounded text-sm">
                             <div class="inline-flex rounded border border-gray-300 overflow-hidden">
                                 <button id="renderBtn" class="px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap">렌더링</button>
                                 <button id="jsonBtn" class="px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap">JSON</button>
@@ -95,7 +107,7 @@
                         </div>
                     </div>
                     <div id="pageBadges" class="px-4 py-2 border-b border-gray-200 flex items-center gap-1 overflow-x-auto text-xs"></div>
-                    <div id="parsedPane" class="flex-1 overflow-auto">
+                    <div id="parsedPane" class="touch-scroll flex-1 overflow-auto">
                         <div id="parsed" class="p-5 text-sm leading-6"></div>
                         <pre id="rawJson" class="hidden h-full m-0 rounded-none overflow-auto"><code class="language-json text-xs"></code></pre>
                     </div>
@@ -106,7 +118,7 @@
 
 <script>
 const $ = (s) => document.querySelector(s);
-const state = { docs: [], doc: null, idx: 0, mode: 'rendered', filter: 'all', search: '', zoom: 100 };
+const state = { docs: [], doc: null, idx: 0, mode: 'rendered', filter: 'all', search: '', zoom: 100, mobilePane: 'source' };
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#039;'}[c]));
@@ -178,6 +190,10 @@ function sanitizeTableHtml(html) {
 }
 function renderDocList() {
     $('#docCount').textContent = `${state.docs.length}개 문서`;
+    $('#mobileDocSelect').innerHTML = state.docs.map(d =>
+        `<option value="${escapeHtml(d.name)}">${escapeHtml(d.title || d.name)} · ${d.pages}p</option>`
+    ).join('');
+    if (state.doc) $('#mobileDocSelect').value = state.doc.name;
     $('#docList').innerHTML = state.docs.map(d => {
         const ps = d.provenance_summary || {};
         const issues = countValues(ps.issues);
@@ -230,6 +246,11 @@ function renderPageStrip() {
         return `<button data-page-idx="${i}" class="page-chip flex-shrink-0 rounded border text-xs tabular-nums ${cls} ${hidden ? 'opacity-25' : ''}">${p.page}</button>`;
     }).join('');
     document.querySelectorAll('[data-page-idx]').forEach(btn => btn.onclick = () => { state.idx = Number(btn.dataset.pageIdx); render(); });
+    requestAnimationFrame(() => {
+        document.querySelector(`[data-page-idx="${state.idx}"]`)?.scrollIntoView({
+            behavior: 'auto', block: 'nearest', inline: 'center'
+        });
+    });
 }
 function renderPageBadges(page) {
     if (!page) { $('#pageBadges').innerHTML = ''; return; }
@@ -291,8 +312,6 @@ function renderElements(page) {
 function renderRaw(page) {
     const code = $('#rawJson code');
     code.textContent = JSON.stringify(page?.raw ?? page?.elements ?? [], null, 2);
-    code.removeAttribute('data-highlighted');
-    hljs.highlightElement(code);
 }
 function renderImage(page) {
     const img = $('#pageImg');
@@ -320,6 +339,17 @@ function renderMode() {
     $('#renderBtn').className = rawOn ? 'px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap' : 'px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap';
     $('#jsonBtn').className = rawOn ? 'px-3 py-1.5 text-xs bg-gray-900 text-white whitespace-nowrap' : 'px-3 py-1.5 text-xs bg-white text-gray-700 whitespace-nowrap';
 }
+function renderMobilePane() {
+    const sourceOn = state.mobilePane === 'source';
+    $('#sourcePane').dataset.mobileActive = String(sourceOn);
+    $('#parsedResultPane').dataset.mobileActive = String(!sourceOn);
+    const active = 'px-3 py-2 rounded text-sm font-medium bg-gray-900 text-white';
+    const inactive = 'px-3 py-2 rounded text-sm font-medium bg-gray-100 text-gray-700';
+    $('#mobileSourceBtn').className = sourceOn ? active : inactive;
+    $('#mobileParsedBtn').className = sourceOn ? inactive : active;
+    $('#mobileSourceBtn').setAttribute('aria-selected', String(sourceOn));
+    $('#mobileParsedBtn').setAttribute('aria-selected', String(!sourceOn));
+}
 function render() {
     const doc = state.doc;
     if (!doc) return;
@@ -339,6 +369,7 @@ function render() {
     renderElements(page);
     renderRaw(page);
     renderMode();
+    renderMobilePane();
 }
 async function loadDoc(name) {
     const res = await fetch(`/api/doc/${encodeURIComponent(name)}`);
@@ -365,6 +396,9 @@ $('#pageInput').onchange = () => {
     if (i >= 0) { state.idx = i; render(); }
 };
 $('#pageFilter').onchange = () => { state.filter = $('#pageFilter').value; renderPageStrip(); };
+$('#mobileDocSelect').onchange = () => loadDoc($('#mobileDocSelect').value);
+$('#mobileSourceBtn').onclick = () => { state.mobilePane = 'source'; renderMobilePane(); };
+$('#mobileParsedBtn').onclick = () => { state.mobilePane = 'parsed'; renderMobilePane(); };
 $('#searchBox').oninput = () => { state.search = $('#searchBox').value; renderPageStrip(); renderElements(currentPage()); };
 $('#zoomRange').oninput = () => { state.zoom = Number($('#zoomRange').value); renderImage(currentPage()); };
 $('#fitBtn').onclick = () => { state.zoom = 100; renderImage(currentPage()); };
