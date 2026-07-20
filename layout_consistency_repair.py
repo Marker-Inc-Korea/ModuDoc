@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import os
@@ -60,6 +61,20 @@ def _normalized_inventory(data: dict) -> Counter:
     )
     value = unicodedata.normalize("NFKC", value).casefold()
     return Counter(char for char in value if not char.isspace())
+
+
+def _normalized_text_lines(data: dict) -> Counter:
+    lines = []
+    for element in data.get("elements") or []:
+        if not isinstance(element, dict) or element.get("type") != "text":
+            continue
+        for line in str(element.get("content") or "").splitlines():
+            normalized = " ".join(
+                unicodedata.normalize("NFKC", line).casefold().split()
+            )
+            if normalized:
+                lines.append(normalized)
+    return Counter(lines)
 
 
 def _max_text_run(data: dict) -> int:
@@ -183,9 +198,15 @@ def _response_json(client, model: str, image_path: Path, system: str, user: str,
 
 
 def _reassignment_only(original: dict, candidate: dict) -> bool:
+    if not isinstance(original, dict) or not isinstance(candidate, dict):
+        return False
     old_elements = original.get("elements") or []
     new_elements = candidate.get("elements") or []
+    if not isinstance(old_elements, list) or not isinstance(new_elements, list):
+        return False
     if len(old_elements) != len(new_elements) or not old_elements:
+        return False
+    if not all(isinstance(element, dict) for element in old_elements + new_elements):
         return False
     if [element.get("type") for element in old_elements] != [
         element.get("type") for element in new_elements
@@ -193,8 +214,6 @@ def _reassignment_only(original: dict, candidate: dict) -> bool:
         return False
     changed = False
     for old, new in zip(old_elements, new_elements):
-        if not isinstance(old, dict) or not isinstance(new, dict):
-            return False
         if old.get("type") == "text":
             changed = changed or old.get("content") != new.get("content")
             for key in ("caption", "description"):
@@ -204,7 +223,22 @@ def _reassignment_only(original: dict, candidate: dict) -> bool:
         for key in ("content", "caption", "description"):
             if old.get(key) != new.get(key):
                 return False
-    return changed and _normalized_inventory(original) == _normalized_inventory(candidate)
+    return (
+        changed
+        and _normalized_inventory(original) == _normalized_inventory(candidate)
+        and _normalized_text_lines(original) == _normalized_text_lines(candidate)
+    )
+
+
+def _merge_reassignment(original: dict, candidate: dict) -> dict | None:
+    """Apply validated text moves while retaining parser metadata and evidence."""
+    if not _reassignment_only(original, candidate):
+        return None
+    merged = copy.deepcopy(original)
+    for old, new in zip(merged["elements"], candidate["elements"]):
+        if old.get("type") == "text":
+            old["content"] = new.get("content")
+    return merged
 
 
 def repair_layout_consistency(
@@ -293,11 +327,15 @@ def repair_layout_consistency(
             record["error"] = f"repair request failed: {type(exc).__name__}: {exc}"
             results.append(record)
             continue
-        if not isinstance(repaired, dict) or not _reassignment_only(original, repaired):
+        if not isinstance(repaired, dict):
+            record["error"] = "repair returned invalid JSON"
+            results.append(record)
+            continue
+        repaired = _merge_reassignment(original, repaired)
+        if repaired is None:
             record["error"] = "repair was not a text-only inventory-preserving reassignment"
             results.append(record)
             continue
-        repaired["page_number"] = original.get("page_number")
         final_public = json.dumps(_public_candidate(repaired), ensure_ascii=False)
         try:
             final_verdict = _response_json(

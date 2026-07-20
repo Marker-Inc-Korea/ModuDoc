@@ -38,7 +38,12 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
             "page_number": 1,
             "elements": [
                 {"type": "heading_1", "content": "Features"},
-                {"type": "text", "content": "Search\nFirst bullet"},
+                {
+                    "type": "text",
+                    "content": "Search\nFirst bullet",
+                    "_source": "vlm_page",
+                    "_confidence": 0.91,
+                },
                 {"type": "text", "content": "Privacy\nSecond bullet\nSearch options"},
                 {
                     "type": "table",
@@ -74,6 +79,29 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
         }
         missing_text["elements"][1]["content"] = "Search\nFirst bullet"
         self.assertFalse(repair._reassignment_only(original, missing_text))
+
+        scrambled = {
+            **corrected,
+            "elements": [dict(item) for item in corrected["elements"]],
+        }
+        scrambled["elements"][1]["content"] = "Search\noptions Search\nFirst bullet"
+        scrambled["elements"][2]["content"] = "Privacy\nSecond bullet"
+        self.assertFalse(repair._reassignment_only(original, scrambled))
+
+        merged = repair._merge_reassignment(original, corrected)
+        self.assertIsNotNone(merged)
+        self.assertEqual(merged["elements"][1]["_source"], "vlm_page")
+        self.assertEqual(merged["elements"][1]["_confidence"], 0.91)
+        self.assertEqual(
+            merged["elements"][1]["content"],
+            "Search\nSearch options\nFirst bullet",
+        )
+
+        invalid_element = {
+            **corrected,
+            "elements": corrected["elements"][:-1] + ["not-an-element"],
+        }
+        self.assertFalse(repair._reassignment_only(original, invalid_element))
 
 
 if __name__ == "__main__":
