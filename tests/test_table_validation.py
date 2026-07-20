@@ -118,6 +118,103 @@ class GenericTableRepairTests(unittest.TestCase):
         )
         self.assertEqual(table_quality_repair._problem_tables(preview), [])
 
+    def test_only_nested_layout_mismatch_requires_independent_review(self):
+        self.assertTrue(
+            table_quality_repair._needs_nested_layout_review(
+                [{"issues": ["possible_nested_layout_mismatch"]}]
+            )
+        )
+        self.assertFalse(
+            table_quality_repair._needs_nested_layout_review(
+                [{"issues": ["possible_cross_row_bleed"]}]
+            )
+        )
+
+    def test_nested_layout_review_uses_all_image_bands_and_full_budget(self):
+        candidate = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>Area</td><td>Detail</td></tr>"
+                        "<tr><td>First</td><td><table><tr><td>A</td></tr>"
+                        "</table></td></tr></table>"
+                    ),
+                }
+            ],
+        }
+        with (
+            patch.object(
+                table_quality_repair,
+                "_encode_table_images",
+                return_value=["overview", "upper", "lower"],
+            ),
+            patch.object(
+                table_quality_repair,
+                "_request_json",
+                return_value={"pass": True, "outer_columns": 2},
+            ) as request_json,
+        ):
+            verdict = table_quality_repair._request_nested_layout_review(
+                object(), "test-model", Path("unused.png"), candidate
+            )
+
+        self.assertTrue(verdict["pass"])
+        request = request_json.call_args.args[1]
+        content = request["messages"][1]["content"]
+        self.assertEqual(
+            [item["image_url"]["url"] for item in content[:-1]],
+            [
+                "data:image/png;base64,overview",
+                "data:image/png;base64,upper",
+                "data:image/png;base64,lower",
+            ],
+        )
+        self.assertEqual(
+            request["max_tokens"],
+            table_quality_repair.TABLE_QUALITY_REPAIR_MAX_TOKENS,
+        )
+        self.assertIn("outer-row boundary", request["messages"][0]["content"])
+
+    def test_rejected_layout_feedback_is_sent_to_the_next_repair_attempt(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": "<table><tr><td>Area</td><td>Detail</td></tr></table>",
+                }
+            ]
+        }
+        problems = [
+            {"index": 0, "issues": ["possible_nested_layout_mismatch"]}
+        ]
+        with (
+            patch.object(
+                table_quality_repair,
+                "_encode_table_images",
+                return_value=["overview"],
+            ),
+            patch.object(
+                table_quality_repair,
+                "_request_json",
+                return_value={"page_number": 1, "elements": []},
+            ) as request_json,
+        ):
+            table_quality_repair._request_table_candidate(
+                object(),
+                "test-model",
+                Path("unused.png"),
+                original,
+                problems,
+                reviewer_feedback="A short inner line was treated as an outer row.",
+            )
+
+        request = request_json.call_args.args[1]
+        user_text = request["messages"][1]["content"][-1]["text"]
+        self.assertIn("independent layout reviewer rejected", user_text)
+        self.assertIn("short inner line", user_text)
+
     def test_tall_table_encoding_adds_overlapping_detail_bands(self):
         with tempfile.TemporaryDirectory() as directory:
             portrait = Path(directory) / "portrait.png"

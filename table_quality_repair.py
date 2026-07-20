@@ -67,6 +67,11 @@ Rules:
 - One continuous bordered grid is one table. Side-by-side grids are separate tables. Top/bottom grids with a separate border or gap and different column structures are separate tables.
 - Preserve two visually repeated tables even when their cells contain identical text.
 - Keep a genuinely nested grid inside its parent <td> only when it is visibly inside that outer cell.
+- Trace the OUTER vertical borders and column borders before any inner boxes.
+  An outer-row boundary meets those outer column borders; it may stop beside a
+  genuine rowspan. A short line whose two endpoints remain strictly inside one
+  parent cell belongs to an inner box or nested grid and must not create extra
+  outer <tr> rows. Keep text above and below it in the same parent <td>.
 - Every table must expand to a rectangle after colspan/rowspan. Do not add an all-empty padding column.
 - Preserve blank cells bounded by visible grid lines, including trailing blank header cells; do not absorb them into a neighboring colspan.
 - Preserve every visually merged header and body cell with the corresponding
@@ -93,11 +98,29 @@ Rules:
 - Count the visible top-level cell regions in each row before assigning spans, then expand every row mentally and ensure it resolves to the same column count.
 - Keep every blank cell bounded by visible grid lines, including leading and trailing blank header cells. Never absorb such a cell into a neighboring colspan.
 - Preserve merged headers and genuinely nested grids with correct colspan/rowspan.
+- Trace the OUTER vertical borders and column borders first. An outer-row
+  boundary meets those borders; it may stop beside a genuine rowspan. A short
+  line whose two endpoints remain strictly inside one parent cell is an inner-
+  box or nested-grid boundary and must not create another outer <tr>. Keep all
+  surrounding text in that same parent <td>.
 - A full-width section band is its own row with colspan covering every outer column;
   never attach it to one data column or split the data row below it.
 - Separate visually separate grids. Never add an all-empty padding column.
 - If the supplied reference is not a real bordered grid in the image, return an empty elements array.
 - Output no markdown fences or commentary."""
+
+
+NESTED_LAYOUT_REVIEW_SYSTEM = """You independently verify repaired table geometry against a page image.
+Return ONLY one valid JSON object:
+{"pass": true|false, "outer_columns": int, "outer_rows": int, "nested_cells": [{"outer_row": int, "outer_column": int}], "reason": "short geometric reason"}
+
+Judge geometry only, not punctuation, bullets, whitespace, spelling, or prose style.
+- Trace the outer vertical borders and column borders before looking at inner boxes.
+- An outer-row boundary meets outer column borders and may stop beside a rowspan;
+  a horizontal line whose endpoints both remain inside one outer cell is not an outer-row boundary.
+- A nested grid must remain inside the correct parent cell; its rows must not shift neighboring outer-column content into extra outer rows.
+- Every outer section label and its adjacent descriptions must occupy the same outer row as in the image.
+- Set pass=true only when outer column count, outer row sequence, merged cells, and nested parent-cell placement all match the image."""
 
 
 def _norm(text: object) -> str:
@@ -1069,6 +1092,7 @@ def _request_table_candidate(
     image_path: Path,
     original: dict,
     problems: list[dict],
+    reviewer_feedback: str = "",
 ) -> dict | None:
     references = []
     elements = original.get("elements") or []
@@ -1095,6 +1119,12 @@ def _request_table_candidate(
         "The images are the same page: first an overview, then enlarged overlapping vertical bands when present. "
         "Return only the corresponding corrected table grid(s)."
     )
+    if reviewer_feedback:
+        user_text += (
+            "\n\nAn independent layout reviewer rejected the previous attempt:\n"
+            f"<review_feedback>{reviewer_feedback[:2000]}</review_feedback>\n"
+            "Rebuild the geometry from the image and do not repeat that layout error."
+        )
     images = _encode_table_images(image_path)
     request = {
         "model": model,
@@ -1109,6 +1139,62 @@ def _request_table_candidate(
                     }
                     for encoded in images
                 ] + [{"type": "text", "text": user_text}],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": TABLE_QUALITY_REPAIR_MAX_TOKENS,
+        "timeout": TABLE_QUALITY_REPAIR_TIMEOUT,
+        "extra_body": {"repetition_penalty": 1.08, "no_repeat_ngram_size": 24},
+    }
+    try:
+        return _request_json(client, request)
+    except Exception:
+        if len(images) <= 1:
+            raise
+        request["messages"][1]["content"] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{images[0]}"},
+            },
+            {"type": "text", "text": user_text},
+        ]
+        return _request_json(client, request)
+
+
+def _needs_nested_layout_review(problems: list[dict]) -> bool:
+    return any(
+        "possible_nested_layout_mismatch" in set(problem.get("issues") or [])
+        for problem in problems
+    )
+
+
+def _request_nested_layout_review(
+    client,
+    model: str,
+    image_path: Path,
+    candidate: dict,
+) -> dict | None:
+    images = _encode_table_images(image_path)
+    user_text = (
+        "Repaired table candidate:\n"
+        f"<candidate>{_public_candidate(candidate)}</candidate>\n\n"
+        "The images are the same page: first an overview, then enlarged overlapping vertical bands when present. "
+        "Independently verify the outer grid and every nested grid's parent cell."
+    )
+    request = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": NESTED_LAYOUT_REVIEW_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    }
+                    for encoded in images
+                ]
+                + [{"type": "text", "text": user_text}],
             },
         ],
         "temperature": 0,
@@ -1888,10 +1974,21 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
             )
             continue
         targeted_accepted = False
+        review_only = bool(problems) and all(
+            set(problem.get("issues") or []).issubset(REVIEW_ISSUES)
+            for problem in problems
+        )
+        nested_layout_review = _needs_nested_layout_review(problems)
+        reviewer_feedback = ""
         for attempt in range(1, TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS + 1):
             try:
                 table_candidate = _request_table_candidate(
-                    client, model, image_path, original, problems
+                    client,
+                    model,
+                    image_path,
+                    original,
+                    problems,
+                    reviewer_feedback=reviewer_feedback,
                 )
             except Exception as exc:
                 table_candidate = None
@@ -1915,6 +2012,57 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                 continue
 
             table_candidate["page_number"] = record["page"]
+            if nested_layout_review:
+                try:
+                    layout_review = _request_nested_layout_review(
+                        client, model, image_path, table_candidate
+                    )
+                except Exception as exc:
+                    layout_review = None
+                    record.setdefault("layout_review_errors", []).append(
+                        {"attempt": attempt, "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                review_passed = bool(
+                    isinstance(layout_review, dict)
+                    and layout_review.get("pass") is True
+                )
+                review_reason = (
+                    str(layout_review.get("reason") or "")
+                    if isinstance(layout_review, dict)
+                    else "nested layout review returned no valid verdict"
+                )
+                record.setdefault("nested_layout_reviews", []).append(
+                    {
+                        "attempt": attempt,
+                        "pass": review_passed,
+                        "outer_columns": (
+                            layout_review.get("outer_columns")
+                            if isinstance(layout_review, dict)
+                            else None
+                        ),
+                        "outer_rows": (
+                            layout_review.get("outer_rows")
+                            if isinstance(layout_review, dict)
+                            else None
+                        ),
+                        "reason": review_reason[:2000],
+                    }
+                )
+                if not review_passed:
+                    reviewer_feedback = review_reason or (
+                        "The outer grid or nested parent-cell placement did not match the image."
+                    )
+                    record["candidate_options"].append(
+                        {
+                            "strategy": "targeted_table_graft",
+                            "attempt": attempt,
+                            "accepted": False,
+                            "error": "independent nested-layout review rejected candidate",
+                            "grafts": [],
+                        }
+                    )
+                    continue
+
             table_problems = _problem_tables(table_candidate)
             record.setdefault("targeted_diagnostics", []).append(
                 {
@@ -1945,10 +2093,6 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                     targeted_variants.append(("grid_corrected_table_graft", corrected))
 
             for targeted_strategy, targeted_candidate in targeted_variants:
-                review_only = all(
-                    set(problem.get("issues") or []).issubset(REVIEW_ISSUES)
-                    for problem in problems
-                )
                 minimum_sequence = (
                     0.80
                     if targeted_strategy == "grid_corrected_table_graft" or review_only
