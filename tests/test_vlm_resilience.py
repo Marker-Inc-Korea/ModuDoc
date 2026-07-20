@@ -11,6 +11,59 @@ import utils
 
 
 class VLMResilienceTests(unittest.TestCase):
+    def _column_test_image(self, painter):
+        from PIL import Image, ImageDraw
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "page.png"
+        image = Image.new("RGB", (1000, 1400), "white")
+        painter(ImageDraw.Draw(image))
+        image.save(path)
+        return path
+
+    @staticmethod
+    def _paint_two_text_columns(draw):
+        for y in range(100, 1300, 28):
+            draw.rectangle((70, y, 420, y + 8), fill="black")
+            draw.rectangle((580, y, 930, y + 8), fill="black")
+
+    def test_column_detector_accepts_text_dominant_two_column_page(self):
+        path = self._column_test_image(self._paint_two_text_columns)
+
+        split = utils._detect_column_split(path)
+
+        self.assertIsNotNone(split)
+        self.assertAlmostEqual(split, 0.5, delta=0.05)
+
+    def test_column_detector_rejects_coloured_screenshot_panels(self):
+        def paint(draw):
+            draw.rectangle((40, 80, 430, 1320), fill=(60, 130, 200))
+            draw.rectangle((570, 80, 960, 1320), fill=(80, 160, 90))
+
+        path = self._column_test_image(paint)
+
+        self.assertIsNone(utils._detect_column_split(path))
+
+    def test_column_detector_rejects_dense_grayscale_panels(self):
+        def paint(draw):
+            draw.rectangle((40, 80, 430, 1320), fill=(170, 170, 170))
+            draw.rectangle((570, 80, 960, 1320), fill=(170, 170, 170))
+
+        path = self._column_test_image(paint)
+
+        self.assertIsNone(utils._detect_column_split(path))
+
+    def test_column_detector_rejects_grid_spanning_the_gutter(self):
+        def paint(draw):
+            self._paint_two_text_columns(draw)
+            for y in range(180, 1200, 160):
+                draw.line((60, y, 940, y), fill="black", width=2)
+
+        path = self._column_test_image(paint)
+
+        self.assertIsNone(utils._detect_column_split(path))
+
     def test_flattened_page_is_split_around_exact_structured_table(self):
         intro = (
             "This overview preserves the narrative that appears before the data grid. "

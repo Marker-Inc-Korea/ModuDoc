@@ -99,19 +99,58 @@ def mask_pii(text, types=None):
 VLM_MULTICOL = os.environ.get("VLM_MULTICOL", "1") == "1"
 
 def _detect_column_split(png_path):
-    """2단 페이지면 가운데 거터 x비율(0~1) 반환, 아니면 None."""
+    """2단 본문이면 가운데 거터 x비율(0~1) 반환, 아니면 None."""
     try:
         from PIL import Image
         with Image.open(png_path) as im:
-            g = im.convert("L")
-            W, H = g.size
+            rgb = im.convert("RGB")
+            W, H = rgb.size
             sw = 500
             if W > sw:
-                g = g.resize((sw, max(1, int(H * sw / W)))); W, H = g.size
+                rgb = rgb.resize((sw, max(1, int(H * sw / W))))
+                W, H = rgb.size
+            g = rgb.convert("L")
+            gray_pixels = g.tobytes()
+            rgb_values = iter(rgb.tobytes())
+            total_pixels = max(1, W * H)
+
+            # Cropping is only useful for text-dominant pages. Screenshot-heavy
+            # manuals and richly coloured layouts can also have a central gap,
+            # but their intended order is not necessarily left-column first.
+            ink_fraction = sum(value < 245 for value in gray_pixels) / total_pixels
+            colour_fraction = sum(
+                max(red, green, blue) - min(red, green, blue) > 20 and gray < 245
+                for (red, green, blue), gray in zip(
+                    zip(rgb_values, rgb_values, rgb_values), gray_pixels
+                )
+            ) / total_pixels
+            if ink_fraction > 0.28 or colour_fraction > 0.04:
+                return None
+
             px = g.load()
             colfill = [sum(1 for y in range(H) if px[x, y] < 190) / H for x in range(W)]  # 열별 잉크 비율
             # 표 오탐 가드: 중앙대역 세로룰(>0.5) 있으면 표로 보고 미발동.
             if max(colfill[int(W * 0.35):int(W * 0.65)] or [0]) > 0.5:
+                return None
+            # 얇은 표 선은 축소 과정에서 세로룰 비율이 낮아질 수 있다. 중앙을
+            # 가로지르는 독립적인 긴 수평선이 반복되면 표/패널 레이아웃이다.
+            central_lo, central_hi = int(W * 0.35), int(W * 0.65)
+            min_rule_width = (central_hi - central_lo) * 0.60
+            long_rule_rows = []
+            for y in range(H):
+                longest = current = 0
+                for x in range(central_lo, central_hi):
+                    if px[x, y] < 190:
+                        current += 1
+                        longest = max(longest, current)
+                    else:
+                        current = 0
+                long_rule_rows.append(longest >= min_rule_width)
+            rule_groups = sum(
+                is_rule and (index == 0 or not long_rule_rows[index - 1])
+                for index, is_rule in enumerate(long_rule_rows)
+            )
+            if rule_groups >= 4:
                 return None
             lo, hi = int(W * 0.40), int(W * 0.60)
             band = [x for x in range(lo, hi) if colfill[x] < 0.04]                          # 중앙의 거의 빈 열
