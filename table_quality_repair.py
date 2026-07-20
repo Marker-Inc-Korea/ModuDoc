@@ -726,6 +726,31 @@ def _geometry_correction_choices(element: dict) -> dict:
             if any(cell.find("table") is not None for cell in cells):
                 return {}
             current_spans = [int(cell.get("colspan", 1)) for cell in cells]
+            if delta < 0:
+                for cell_index, cell in enumerate(cells):
+                    current = int(cell.get("colspan", 1))
+                    if (
+                        current != -delta
+                        or cell.get_text(" ", strip=True)
+                        or cell.find("table") is not None
+                    ):
+                        continue
+                    result_cells = [
+                        {
+                            "source_cell_index": source_index,
+                            "cell_text": source_cell.get_text(" ", strip=True),
+                            "colspan": int(source_cell.get("colspan", 1)),
+                        }
+                        for source_index, source_cell in enumerate(cells)
+                        if source_index != cell_index
+                    ]
+                    choices.append(
+                        {
+                            "choice_id": f"r{row_index}c{cell_index}_dropempty",
+                            "removed_empty_cell_indexes": [cell_index],
+                            "result_cells": result_cells,
+                        }
+                    )
             for cell_index, cell in enumerate(cells):
                 current = int(cell.get("colspan", 1))
                 proposed = current + delta
@@ -1090,7 +1115,13 @@ def _apply_geometry_correction(candidate: dict, correction: dict | None) -> dict
                 for cell_spec in result_cells
                 if "source_cell_index" in cell_spec
             ]
-            if source_indexes != list(range(len(cells))):
+            removed_indexes = choice.get("removed_empty_cell_indexes") or []
+            if (
+                any(type(index) is not int or not (0 <= index < len(cells)) for index in removed_indexes)
+                or any(cells[index].get_text(" ", strip=True) for index in removed_indexes)
+                or source_indexes
+                != [index for index in range(len(cells)) if index not in removed_indexes]
+            ):
                 return None
             rebuilt_cells = []
             for cell_spec in result_cells:
@@ -1115,6 +1146,147 @@ def _apply_geometry_correction(candidate: dict, correction: dict | None) -> dict
         element["content"] = patched_element["content"]
         changed = True
     return corrected if changed else None
+
+
+def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[dict]]:
+    """Build a text-lossless geometry candidate for common VLM row artifacts."""
+    candidate = copy.deepcopy(data)
+    changes = []
+    for element_index, element in enumerate(candidate.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        merged_row = None
+        for row_index in range(1, len(rows)):
+            previous_cells = rows[row_index - 1].find_all(
+                ["td", "th"], recursive=False
+            )
+            cells = rows[row_index].find_all(["td", "th"], recursive=False)
+            nonempty = [
+                index
+                for index, cell in enumerate(cells)
+                if cell.get_text(" ", strip=True)
+            ]
+            if (
+                len(cells) < 4
+                or len(cells) != len(previous_cells)
+                or len(nonempty) != 1
+                or sum(bool(cell.get_text(" ", strip=True)) for cell in previous_cells)
+                < max(3, len(previous_cells) // 2)
+                or any(int(cell.get("colspan", 1)) != 1 for cell in cells + previous_cells)
+                or any(int(cell.get("rowspan", 1)) != 1 for cell in cells + previous_cells)
+            ):
+                continue
+            cell_index = nonempty[0]
+            continuation = cells[cell_index].get_text(" ", strip=True)
+            previous_text = previous_cells[cell_index].get_text(" ", strip=True)
+            if (
+                not re.fullmatch(r"[A-Za-z][A-Za-z'-]{1,23}", continuation)
+                or continuation.isupper()
+                or not re.fullmatch(r"[A-Za-z][A-Za-z '-]{1,47}", previous_text)
+            ):
+                continue
+            previous_cells[cell_index].append(soup.new_tag("br"))
+            for child in list(cells[cell_index].contents):
+                previous_cells[cell_index].append(copy.copy(child))
+            rows[row_index].decompose()
+            merged_row = row_index
+            changes.append(
+                {
+                    "element_index": element_index,
+                    "strategy": "sparse_continuation_row_merged",
+                    "row_index": row_index,
+                    "cell_index": cell_index,
+                }
+            )
+            break
+
+        rows = table_validate._rows_of(table)
+        _, row_widths, _, _ = table_validate._build_grid(rows)
+        modal_width = (
+            Counter(row_widths).most_common(1)[0][0] if row_widths else 0
+        )
+        modal_rows = [
+            row
+            for row, width in zip(rows, row_widths)
+            if width == modal_width
+        ]
+        trailing_cells = [
+            row.find_all(["td", "th"], recursive=False)[-1]
+            for row in modal_rows
+            if row.find_all(["td", "th"], recursive=False)
+        ]
+        if (
+            len(trailing_cells) == len(modal_rows)
+            and len(modal_rows) >= 2
+            and all(
+                not cell.get_text(" ", strip=True)
+                and int(cell.get("colspan", 1)) == 1
+                and int(cell.get("rowspan", 1)) == 1
+                and cell.find("table") is None
+                for cell in trailing_cells
+            )
+        ):
+            for cell in trailing_cells:
+                cell.decompose()
+            changes.append(
+                {
+                    "element_index": element_index,
+                    "strategy": "uniform_empty_trailing_column_removed",
+                }
+            )
+
+        if merged_row is not None or any(
+            change["element_index"] == element_index for change in changes
+        ):
+            element["content"] = str(table)
+            for key in ("_source", "_confidence", "_issues", "_native"):
+                element.pop(key, None)
+    return (candidate, changes) if changes else (None, [])
+
+
+def _validated_deterministic_geometry_repair(
+    image_path: Path, original: dict
+) -> tuple[dict | None, list[dict], dict | None]:
+    normalized, changes = _normalize_sparse_continuation_rows(original)
+    if normalized is None:
+        return None, [], None
+    correction = _grid_line_geometry_correction(image_path, normalized)
+    corrected = _apply_geometry_correction(normalized, correction)
+    if corrected is None:
+        return None, [], None
+    old_problems = _problem_tables(original)
+    new_problems = _problem_tables(corrected)
+    old_table_count = sum(
+        isinstance(element, dict) and element.get("type") == "table"
+        for element in original.get("elements") or []
+    )
+    new_table_count = sum(
+        isinstance(element, dict) and element.get("type") == "table"
+        for element in corrected.get("elements") or []
+    )
+    text_inventory_preserved = Counter(_page_visible_text(original)) == Counter(
+        _page_visible_text(corrected)
+    )
+    if (
+        not old_problems
+        or len(new_problems) >= len(old_problems)
+        or old_table_count != new_table_count
+        or not text_inventory_preserved
+    ):
+        return None, [], None
+    corrected["quality_repair"] = True
+    metrics = {
+        "old_problem_tables": len(old_problems),
+        "new_problem_tables": len(new_problems),
+        "table_count": old_table_count,
+        "text_inventory_preserved": True,
+    }
+    return corrected, changes, metrics
 
 
 def _request_candidate(client, model: str, image_path: Path, text_path: Path, original: dict, problems: list[dict]) -> dict | None:
@@ -1184,6 +1356,34 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
             results.append(record)
             continue
         record["candidate_options"] = []
+        deterministic, deterministic_changes, deterministic_metrics = (
+            _validated_deterministic_geometry_repair(image_path, original)
+        )
+        if deterministic is not None:
+            record["candidate_options"].append(
+                {
+                    "strategy": "raster_evidenced_geometry_repair",
+                    "accepted": True,
+                    "metrics": deterministic_metrics,
+                    "changes": deterministic_changes,
+                }
+            )
+            persist_page(stem, json.dumps(deterministic, ensure_ascii=False))
+            record.update(
+                {
+                    "accepted": True,
+                    "strategy": "raster_evidenced_geometry_repair",
+                    "metrics": deterministic_metrics,
+                    "changes": deterministic_changes,
+                }
+            )
+            results.append(record)
+            logger.info(
+                "%s raster-evidenced geometry repair accepted: %s",
+                stem,
+                deterministic_metrics,
+            )
+            continue
         demoted, demotions, demotion_metrics = (
             _validated_borderless_definition_demotion(image_path, original)
         )

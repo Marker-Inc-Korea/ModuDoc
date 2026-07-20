@@ -185,6 +185,84 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIsNone(corrected)
         self.assertIn("colspan='3'", candidate["elements"][0]["content"])
 
+    def test_raster_evidenced_repair_merges_wrap_and_drops_phantom_column(self):
+        top = (
+            "<tr><td></td><td></td><td></td><td colspan='4'>Rating criteria</td>"
+            "<td></td><td colspan='4'>Significance</td><td></td></tr>"
+        )
+        header = (
+            "<tr>"
+            + "".join(
+                f"<td>{value}</td>"
+                for value in (
+                    "No.", "Topic", "Space", "Time", "Reversibility",
+                    "Cumulative", "Residual", "Mobilization", "Build",
+                    "Operate", "Close", "",
+                )
+            )
+            + "</tr>"
+        )
+        continuation = (
+            "<tr>" + "".join(
+                f"<td>{'Effects' if index == 5 else ''}</td>"
+                for index in range(12)
+            ) + "</tr>"
+        )
+        body_rows = []
+        for row_index in range(6):
+            values = [
+                str(row_index), f"Topic {row_index}", "L", "ST", "R", "",
+                "", "0", "-1", "0", "0", "",
+            ]
+            if row_index == 0:
+                values[1] = "NEGATIVE IMPACTS"
+            body_rows.append(
+                "<tr>" + "".join(f"<td>{value}</td>" for value in values) + "</tr>"
+            )
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "caption": "Impact summary",
+                    "content": "<table>" + top + header + continuation + "".join(body_rows) + "</table>",
+                }
+            ],
+        }
+        image = Image.new("RGB", (1200, 900), "white")
+        draw = ImageDraw.Draw(image)
+        x_lines = [50 + 100 * index for index in range(12)]
+        y_lines = [50 + 100 * index for index in range(9)]
+        for y in y_lines:
+            draw.line((x_lines[0], y, x_lines[-1], y), fill="black", width=3)
+        for row_index, (upper, lower) in enumerate(zip(y_lines, y_lines[1:])):
+            visible_x = (
+                [x_lines[index] for index in (0, 1, 2, 3, 6, 7, 8, 10, 11)]
+                if row_index == 0 else x_lines
+            )
+            for x in visible_x:
+                draw.line((x, upper, x, lower), fill="black", width=3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            image.save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertTrue(metrics["text_inventory_preserved"])
+        self.assertEqual(metrics["new_problem_tables"], 0)
+        self.assertEqual(len(changes), 2)
+        table = repaired["elements"][0]
+        self.assertIn("Cumulative<br/>Effects", table["content"])
+        self.assertEqual(
+            table_quality_repair._table_geometry(table)["expanded_row_widths"],
+            [11] * 8,
+        )
+
     def test_borderless_formula_definitions_are_demoted_losslessly(self):
         original = {
             "page_number": 1,
@@ -306,6 +384,131 @@ class GenericTableRepairTests(unittest.TestCase):
         )
 
         self.assertIsNone(table_validate._slice_native(native, fragment))
+
+    def test_native_match_uses_unique_ordered_text_for_split_cells(self):
+        native = (
+            "<table><tr><td>Review basis</td><td>Detailed explanation for the requested decision</td></tr>"
+            "<tr><td>Final outcome</td><td>Approval remains subject to documented controls</td></tr></table>"
+        )
+        split = (
+            "<table><tr><td>Review</td><td>basis</td><td>Detailed explanation</td></tr>"
+            "<tr><td>for the requested decision</td><td>Final</td><td>outcome</td></tr>"
+            "<tr><td>Approval remains</td><td>subject to documented</td><td>controls</td></tr></table>"
+        )
+
+        matched = table_validate.native_substitute(
+            split, table_validate.prepare_native([{"html": native}])
+        )
+
+        self.assertEqual(matched, native)
+
+    def test_ordered_native_match_rejects_ambiguous_equal_tables(self):
+        first = (
+            "<table><tr><td>Long review basis</td><td>Detailed explanation for the requested decision</td></tr>"
+            "<tr><td>Final outcome</td><td>Approval remains subject to documented controls</td></tr></table>"
+        )
+        second = (
+            "<table><tr><td>Long review basis Detailed explanation</td><td>for the requested decision</td></tr>"
+            "<tr><td>Final outcome Approval remains</td><td>subject to documented controls</td></tr></table>"
+        )
+        split = (
+            "<table><tr><td>Long</td><td>review basis</td><td>Detailed explanation</td></tr>"
+            "<tr><td>for the requested decision</td><td>Final outcome</td><td>Approval remains</td></tr>"
+            "<tr><td>subject</td><td>to documented</td><td>controls</td></tr></table>"
+        )
+
+        matched = table_validate.native_substitute(
+            split,
+            table_validate.prepare_native([{"html": first}, {"html": second}]),
+        )
+
+        self.assertIsNone(matched)
+
+    def test_native_slice_aligns_a_keyless_boundary_row_to_stable_spans(self):
+        native = (
+            "<table><tr><th colspan='2'>Kind</th><th colspan='2'>Coverage</th><th>Notes</th></tr>"
+            "<tr><td colspan='2'>First item</td><td colspan='2'>First coverage</td><td>One</td></tr>"
+            "<tr><td colspan='2'>Second item</td><td colspan='2'>Second coverage</td><td>Two</td></tr>"
+            "<tr><td colspan='2'>Third item</td><td colspan='2'>Third coverage</td><td>Three</td></tr>"
+            "<tr><td colspan='2'>Fourth item</td><td colspan='2'>Fourth coverage</td><td>Four</td></tr></table>"
+        )
+        fragment = (
+            "<table><tr><th colspan='2'>Kind</th><th colspan='2'>Coverage</th><th>Notes</th></tr>"
+            "<tr><td></td><td>Leading continuation</td><td></td></tr>"
+            "<tr><td>Second item</td><td>Second coverage</td><td>Two</td></tr>"
+            "<tr><td>Third item</td><td>Third coverage</td><td>Three</td></tr></table>"
+        )
+
+        sliced = table_validate._slice_native(native, fragment)
+        rows = table_validate._rows_of(
+            BeautifulSoup(sliced, "html.parser").find("table")
+        )
+        _, widths, _, _ = table_validate._build_grid(rows)
+
+        self.assertEqual(widths, [5, 5, 5, 5])
+        self.assertIn("Leading continuation", sliced)
+
+    def test_caption_duplicate_bracketed_metadata_row_is_removed(self):
+        html = (
+            "<table><tr><td colspan='3'>(Unit: millions)</td></tr>"
+            "<tr><td>Item</td><td>Amount</td><td>Notes</td></tr>"
+            "<tr><td>Alpha</td><td>10</td><td>Current</td></tr></table>"
+        )
+
+        cleaned = table_validate.strip_caption_duplicate_metadata_row(
+            html, "Portfolio summary (Unit: millions)"
+        )
+
+        rows = table_validate._rows_of(
+            BeautifulSoup(cleaned, "html.parser").find("table")
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("Unit: millions", _visible_text(cleaned))
+
+    def test_adjacent_native_fragments_merge_without_losing_inner_details(self):
+        native = (
+            "<table><tr><th colspan='2'>Kind</th><th colspan='2'>Coverage</th><th>Notes</th></tr>"
+            "<tr><td colspan='5'>Construction phase</td></tr>"
+            "<tr><td colspan='2'>Primary policy</td><td colspan='2'>General terms</td><td>General note</td></tr>"
+            "<tr><td colspan='2'>Delay policy</td><td colspan='2'>Delay terms</td><td>Delay note</td></tr>"
+            "<tr><td colspan='2'>Liability policy</td><td colspan='2'>Liability terms</td><td>Liability note</td></tr></table>"
+        )
+        elements = [
+            {
+                "type": "table",
+                "caption": "Coverage schedule",
+                "content": (
+                    "<table><tr><td>Kind</td><td>Coverage</td><td>Notes</td></tr>"
+                    "<tr><td colspan='3'>Construction phase</td></tr></table>"
+                ),
+            },
+            {
+                "type": "table",
+                "caption": "Coverage schedule",
+                "content": (
+                    "<table><tr><td rowspan='2'>Primary policy</td><td colspan='2'>General terms</td>"
+                    "<td rowspan='2'>Reference codes</td></tr>"
+                    "<tr><td>Part A</td><td>First detailed amount</td></tr>"
+                    "<tr><td></td><td>Part B</td><td>Second detailed amount</td><td>General note</td></tr>"
+                    "<tr><td>Delay policy</td><td colspan='2'>Delay terms</td><td>Delay note</td></tr>"
+                    "<tr><td>Liability policy</td><td colspan='2'>Liability terms</td><td>Liability note</td></tr></table>"
+                ),
+            },
+        ]
+
+        merged = table_validate.merge_adjacent_native_table_fragments(
+            elements, table_validate.prepare_native([{"html": native}])
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertIn("First detailed amount", merged[0]["content"])
+        self.assertIn("Second detailed amount", merged[0]["content"])
+        self.assertIn("General note", merged[0]["content"])
+        quality = table_validate.assess_table_quality(
+            merged[0]["content"], allow_nested=True
+        )
+        self.assertNotIn("ragged_rows", quality["issues"])
+        self.assertEqual(quality["cols"], 5)
 
     def test_formula_demote_is_blocked_when_a_grid_is_visible(self):
         original = {

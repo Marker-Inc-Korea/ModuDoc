@@ -1,7 +1,9 @@
 """표 HTML 검증·수리: side-by-side 분할, column-bleed 병합, ragged 행 패딩.
 수리 불가 시 needs_retry=True. 의존: bs4 + statistics."""
+import copy
 import re
 import statistics
+from collections import Counter
 from difflib import SequenceMatcher
 from functools import lru_cache
 from html import escape
@@ -470,12 +472,50 @@ def _slice_native(native_html, vlm_html):
     last_vlm = max(matched_vlm_positions)
     native_text = _ncell(" ".join(tr.get_text(" ", strip=True) for tr in keep))
 
+    def dominant_native_span_signature():
+        _, _, _, native_width = _build_grid(nb)
+        signatures = []
+        for row in nb:
+            cells = _direct_cells(row)
+            if len(cells) < 2 or any(_rspan(cell) != 1 for cell in cells):
+                continue
+            signature = tuple(_span_int(cell, "colspan") for cell in cells)
+            if sum(signature) == native_width:
+                signatures.append(signature)
+        if not signatures:
+            return None
+        counts = Counter(signatures).most_common()
+        if counts[0][1] < 2 or (len(counts) > 1 and counts[0][1] == counts[1][1]):
+            return None
+        return counts[0][0]
+
+    span_signature = dominant_native_span_signature()
+
+    def align_boundary_spans(row):
+        """Restore a seam row's spans from a stable native data-row shape."""
+        if not span_signature:
+            return row
+        cells = _direct_cells(row)
+        if (
+            len(cells) != len(span_signature)
+            or any(_rspan(cell) != 1 for cell in cells)
+            or any(_span_int(cell, "colspan") != 1 for cell in cells)
+            or sum(span_signature) == len(cells)
+        ):
+            return row
+        for cell, colspan in zip(cells, span_signature):
+            if colspan == 1:
+                cell.attrs.pop("colspan", None)
+            else:
+                cell["colspan"] = str(colspan)
+        return row
+
     def boundary_rows(rows):
         retained = []
         for row in rows:
             row_text = _ncell(row.get_text(" ", strip=True))
             if row_text and not _row_key(row) and row_text not in native_text:
-                retained.append(row)
+                retained.append(align_boundary_spans(row))
         return retained
 
     leading = boundary_rows(vb[:first_vlm])
@@ -523,6 +563,46 @@ def _cap_of(tab):
 
 def _seq_ratio(a, b):
     return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def _ordered_table_text(html):
+    try:
+        table = BeautifulSoup(html or "", "html.parser").find("table")
+    except Exception:
+        return ""
+    return _ncell(table.get_text(" ", strip=True)) if table else ""
+
+
+def _ordered_native_match(vlm_html, native_prepared):
+    """Match split-cell VLM output to one uniquely similar native table."""
+    vlm_text = _ordered_table_text(vlm_html)
+    if len(vlm_text) < 80:
+        return None
+    ranked = []
+    for native in native_prepared:
+        native_text = _ordered_table_text(native.get("html"))
+        if not native_text:
+            continue
+        length_ratio = min(len(vlm_text), len(native_text)) / max(
+            len(vlm_text), len(native_text)
+        )
+        if length_ratio < 0.90:
+            continue
+        similarity = SequenceMatcher(
+            None, vlm_text, native_text, autojunk=False
+        ).ratio()
+        ranked.append((similarity, length_ratio, native))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best_similarity, _, best = ranked[0]
+    if best_similarity < 0.97:
+        return None
+    if len(ranked) > 1:
+        second_similarity = ranked[1][0]
+        if second_similarity >= 0.80 and best_similarity - second_similarity < 0.05:
+            return None
+    return best["html"]
 
 def _graft_nested_native(vlm_html, native_prepared):
     """중첩표 VLM 표를 native 골격(열수가 더 많은 정답 구조)에 접합해 반환(불가 시 None).
@@ -602,10 +682,186 @@ def native_substitute(vlm_html, native_prepared, min_score=0.6):
         if score > best_score:
             best, best_score = nt, score
     if best is None or best_score < min_score:
-        return None
+        return _ordered_native_match(vlm_html, native_prepared)
     if best["_n"] > len(vset) * 1.5:          # 분할표 → 슬라이스
         return _slice_native(best["html"], vlm_html)
     return best["html"]
+
+
+def strip_caption_duplicate_metadata_row(html, caption):
+    """Remove a bracketed full-width metadata row already retained in caption."""
+    if not html or not caption:
+        return html
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table")
+        rows = _rows_of(table) if table else []
+        if len(rows) < 2:
+            return html
+        first_cells = _direct_cells(rows[0])
+        _, _, _, width = _build_grid(rows)
+        if (
+            len(first_cells) != 1
+            or _span_int(first_cells[0], "colspan") != width
+            or _rspan(first_cells[0]) != 1
+        ):
+            return html
+        metadata = first_cells[0].get_text(" ", strip=True)
+        if not re.fullmatch(
+            r"\s*[\(\[\{（［｛【].{1,100}[\)\]\}）］｝】]\s*",
+            metadata,
+            flags=re.DOTALL,
+        ):
+            return html
+        if _ncell(metadata) not in _ncell(caption):
+            return html
+        rows[0].decompose()
+        return str(table)
+    except Exception:
+        return html
+
+
+def _extend_edge_rowspans_over_placeholder_row(table):
+    """Fold one leaked inner-grid row back under its spanning edge cells."""
+    rows = _rows_of(table)
+    changed = False
+    for row_index, row in enumerate(rows):
+        cells = _direct_cells(row)
+        if len(cells) < 3:
+            continue
+        span = _rspan(cells[0])
+        if span < 2 or _rspan(cells[-1]) != span:
+            continue
+        extra_index = row_index + span
+        if extra_index >= len(rows):
+            continue
+        middle_rows = rows[row_index + 1 : extra_index]
+        extra_cells = _direct_cells(rows[extra_index])
+        if (
+            len(extra_cells) < 4
+            or extra_cells[0].get_text(" ", strip=True)
+            or not extra_cells[-1].get_text(" ", strip=True)
+            or any(len(_direct_cells(item)) != len(extra_cells) - 2 for item in middle_rows)
+        ):
+            continue
+        cells[0]["rowspan"] = str(span + 1)
+        cells[-1]["rowspan"] = str(span + 1)
+        cells[-1].append(BeautifulSoup("<br>", "html.parser").find("br"))
+        for child in list(extra_cells[-1].contents):
+            cells[-1].append(copy.copy(child))
+        extra_cells[0].decompose()
+        extra_cells[-1].decompose()
+        changed = True
+    return changed
+
+
+def _native_header_geometry(native_html):
+    table = BeautifulSoup(native_html or "", "html.parser").find("table")
+    rows = _rows_of(table) if table else []
+    if not rows:
+        return None
+    header_cells = _direct_cells(rows[0])
+    labels = tuple(_ncell(cell.get_text(" ", strip=True)) for cell in header_cells)
+    spans = tuple(_span_int(cell, "colspan") for cell in header_cells)
+    _, _, _, width = _build_grid(rows)
+    body_signatures = []
+    for row in rows[1:]:
+        cells = _direct_cells(row)
+        signature = tuple(_span_int(cell, "colspan") for cell in cells)
+        if len(cells) >= 2 and sum(signature) == width:
+            body_signatures.append(signature)
+    counts = Counter(body_signatures).most_common()
+    if (
+        len(labels) < 2
+        or not all(labels)
+        or sum(spans) != width
+        or not counts
+        or counts[0][1] < 2
+        or (len(counts) > 1 and counts[0][1] == counts[1][1])
+    ):
+        return None
+    return labels, spans, counts[0][0], width
+
+
+def merge_adjacent_native_table_fragments(elements, native_prepared):
+    """Join a detached header band to its body using unique native geometry."""
+    source = list(elements or [])
+    if not native_prepared:
+        return source
+    result = []
+    index = 0
+    while index < len(source):
+        if index + 1 >= len(source):
+            result.append(source[index])
+            break
+        first, second = source[index], source[index + 1]
+        if (
+            not isinstance(first, dict)
+            or not isinstance(second, dict)
+            or first.get("type") != "table"
+            or second.get("type") != "table"
+            or not _ncell(first.get("caption"))
+            or _ncell(first.get("caption")) != _ncell(second.get("caption"))
+        ):
+            result.append(first)
+            index += 1
+            continue
+        first_table = BeautifulSoup(first.get("content") or "", "html.parser").find("table")
+        second_table = BeautifulSoup(second.get("content") or "", "html.parser").find("table")
+        first_rows = _rows_of(first_table) if first_table else []
+        second_rows = _rows_of(second_table) if second_table else []
+        if (
+            not (2 <= len(first_rows) <= 3)
+            or len(second_rows) < 2
+            or len(_direct_cells(first_rows[0])) < 2
+            or len(_direct_cells(first_rows[-1])) != 1
+        ):
+            result.append(first)
+            index += 1
+            continue
+        header_labels = tuple(
+            _ncell(cell.get_text(" ", strip=True))
+            for cell in _direct_cells(first_rows[0])
+        )
+        native_matches = []
+        for native in native_prepared:
+            geometry = _native_header_geometry(native.get("html"))
+            if geometry and geometry[0] == header_labels:
+                native_matches.append(geometry)
+        if len(native_matches) != 1:
+            result.append(first)
+            index += 1
+            continue
+        _, header_spans, body_spans, width = native_matches[0]
+        merged_soup = BeautifulSoup("<table></table>", "html.parser")
+        merged_table = merged_soup.find("table")
+        for row in first_rows + second_rows:
+            merged_table.append(BeautifulSoup(str(row), "html.parser").find("tr"))
+        _extend_edge_rowspans_over_placeholder_row(merged_table)
+        merged_rows = _rows_of(merged_table)
+        for row_index, row in enumerate(merged_rows):
+            cells = _direct_cells(row)
+            signature = header_spans if row_index == 0 else body_spans
+            if len(cells) == 1:
+                cells[0]["colspan"] = str(width)
+            elif len(cells) == len(signature):
+                for cell, colspan in zip(cells, signature):
+                    if colspan == 1:
+                        cell.attrs.pop("colspan", None)
+                    else:
+                        cell["colspan"] = str(colspan)
+        _, row_widths, _, _ = _build_grid(merged_rows)
+        if not row_widths or len(set(row_widths)) != 1 or row_widths[0] != width:
+            result.append(first)
+            index += 1
+            continue
+        merged = {
+            key: value for key, value in first.items() if not key.startswith("_")
+        }
+        merged["content"] = str(merged_table)
+        result.append(merged)
+        index += 2
+    return result
 
 
 def _table_keyset(html):

@@ -95,8 +95,8 @@ def mask_pii(text, types=None):
     return out
 
 
-# 다단 페이지 열분리 추출: 기본 OFF.
-VLM_MULTICOL = os.environ.get("VLM_MULTICOL", "0") == "1"
+# Continuous columns are extracted independently to make visual order explicit.
+VLM_MULTICOL = os.environ.get("VLM_MULTICOL", "1") == "1"
 
 def _detect_column_split(png_path):
     """2단 페이지면 가운데 거터 x비율(0~1) 반환, 아니면 None."""
@@ -489,13 +489,26 @@ def _drop_prose_duplicated_by_nearby_tables(elements):
 def _drop_trailing_duplicate_heading_cluster(elements):
     """Drop a heading-only tail when every heading already appeared on the page."""
     result = list(elements or [])
-    start = len(result)
+    heading_end = len(result)
+    if heading_end:
+        suffix = result[-1]
+        suffix_text = (
+            str(suffix.get("content") or "").strip()
+            if isinstance(suffix, dict) else ""
+        )
+        if (
+            isinstance(suffix, dict)
+            and suffix.get("type", "text") in {"text", "footnote"}
+            and re.fullmatch(r"\d{4}", suffix_text)
+        ):
+            heading_end -= 1
+    start = heading_end
     while start > 0:
         element = result[start - 1]
         if not isinstance(element, dict) or not str(element.get("type") or "").startswith("heading_"):
             break
         start -= 1
-    if len(result) - start < 2:
+    if heading_end - start < 2:
         return result
 
     prior = {
@@ -504,9 +517,12 @@ def _drop_trailing_duplicate_heading_cluster(elements):
         if isinstance(element, dict)
         and str(element.get("type") or "").startswith("heading_")
     }
-    tail = [_compact_visible_text(element.get("content")) for element in result[start:]]
+    tail = [
+        _compact_visible_text(element.get("content"))
+        for element in result[start:heading_end]
+    ]
     if tail and all(value and value in prior for value in tail):
-        return result[:start]
+        return result[:start] + result[heading_end:]
     return result
 
 
@@ -623,6 +639,218 @@ def _dedupe_figures_supported_by_text_layer(elements, source_text):
         remove.update(index for index in indices if index not in keep)
 
     return [element for index, element in enumerate(source) if index not in remove]
+
+
+def _labels_relate(left, right):
+    left = _compact_visible_text(left)
+    right = _compact_visible_text(right)
+    if min(len(left), len(right)) < 4:
+        return False
+    if left in right or right in left:
+        return True
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    return matcher.ratio() >= 0.65 and matcher.find_longest_match().size >= 6
+
+
+def _dedupe_tables_supported_by_text_layer(elements, source_text):
+    """Drop a repeated table only when source anchors support fewer copies."""
+    source = list(elements or [])
+    normalized_source = _compact_visible_text(source_text)
+    if not normalized_source:
+        return source
+
+    groups = {}
+    table_anchors = {}
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        try:
+            soup = BeautifulSoup(element.get("content") or "", "html.parser")
+            visible = _compact_visible_text(soup.get_text(" ", strip=True))
+            anchors = [
+                _compact_visible_text(cell.get_text(" ", strip=True))
+                for cell in soup.find_all(["td", "th"])
+            ]
+        except Exception:
+            visible = _compact_visible_text(element.get("content"))
+            anchors = []
+        if len(visible) < 32:
+            continue
+        caption = _compact_visible_text(element.get("caption"))
+        signature = (visible, caption)
+        groups.setdefault(signature, []).append(index)
+        table_anchors[index] = sorted(
+            {anchor for anchor in anchors + [caption] if len(anchor) >= 10},
+            key=len,
+            reverse=True,
+        )[:8]
+
+    remove = set()
+    for (_, caption), indices in groups.items():
+        if len(indices) < 2:
+            continue
+        intervening = [
+            source[index]
+            for index in range(min(indices), max(indices) + 1)
+            if index not in indices
+        ]
+        if any(
+            not isinstance(element, dict)
+            or not str(element.get("type") or "").startswith("heading_")
+            for element in intervening
+        ):
+            continue
+        evidence = [
+            (anchor, count)
+            for anchor in table_anchors.get(indices[0], [])
+            if (count := normalized_source.count(anchor)) > 0
+        ]
+        if len(evidence) < 2 and not any(len(anchor) >= 24 for anchor, _ in evidence):
+            continue
+        supported_copies = min(count for _, count in evidence)
+        if supported_copies >= len(indices):
+            continue
+
+        def context_score(index):
+            score = 0
+            for distance in (1, 2):
+                previous_index = index - distance
+                if previous_index < 0:
+                    continue
+                previous = source[previous_index]
+                if (
+                    isinstance(previous, dict)
+                    and str(previous.get("type") or "").startswith("heading_")
+                    and _labels_relate(previous.get("content"), caption)
+                ):
+                    score = max(score, 3 - distance)
+            return score
+
+        scores = {index: context_score(index) for index in indices}
+        if intervening and max(scores.values(), default=0) <= 0:
+            continue
+        keep_count = max(1, supported_copies)
+        ranked = sorted(indices, key=lambda index: (-scores[index], index))
+        keep = set(ranked[:keep_count])
+        remove.update(index for index in indices if index not in keep)
+
+    return [element for index, element in enumerate(source) if index not in remove]
+
+
+def _dedupe_headings_supported_by_text_layer(elements, source_text):
+    """Resolve duplicate headings using source counts and adjacent content."""
+    source = list(elements or [])
+    normalized_source = _compact_visible_text(source_text)
+    if not normalized_source:
+        return source
+    groups = {}
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or not str(
+            element.get("type") or ""
+        ).startswith("heading_"):
+            continue
+        signature = _compact_visible_text(element.get("content"))
+        if len(signature) >= 5:
+            groups.setdefault(signature, []).append(index)
+
+    remove = set()
+
+    normalized_lines = [
+        value
+        for line in str(source_text or "").splitlines()
+        if (value := _compact_visible_text(line))
+    ]
+
+    def standalone_occurrences(signature):
+        count = 0
+        for line_index in range(len(normalized_lines)):
+            combined = ""
+            for width in range(1, 4):
+                if line_index + width > len(normalized_lines):
+                    break
+                combined += normalized_lines[line_index + width - 1]
+                if combined == signature:
+                    count += 1
+                    break
+                if len(combined) >= len(signature):
+                    break
+        return count
+
+    for signature, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        supported_copies = standalone_occurrences(signature)
+        if supported_copies < 1 or supported_copies >= len(indices):
+            continue
+
+        def context_score(index):
+            score = 0
+            heading = source[index].get("content")
+            for distance in (1, 2):
+                following_index = index + distance
+                if following_index >= len(source):
+                    continue
+                following = source[following_index]
+                if not isinstance(following, dict):
+                    continue
+                following_type = str(following.get("type") or "")
+                if following_type in {"table", "figure"} and _labels_relate(
+                    heading, following.get("caption")
+                ):
+                    score = max(score, 6 - distance)
+                elif (
+                    following_type in {"text", "footnote"}
+                    and len(_compact_visible_text(following.get("content"))) >= 24
+                ):
+                    score = max(score, 3 - distance)
+            return score
+
+        scores = {index: context_score(index) for index in indices}
+        ranked = sorted(indices, key=lambda index: (-scores[index], index))
+        keep_count = max(1, supported_copies)
+        if keep_count >= len(ranked):
+            continue
+        if scores[ranked[keep_count - 1]] <= scores[ranked[keep_count]]:
+            continue
+        keep = set(ranked[:keep_count])
+        remove.update(index for index in indices if index not in keep)
+    return [element for index, element in enumerate(source) if index not in remove]
+
+
+def _drop_prose_duplicated_by_nearby_figures(elements, source_text):
+    """Keep screenshot text once when a nearby figure already contains it."""
+    source = list(elements or [])
+    normalized_source = _compact_visible_text(source_text)
+    figures = []
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type") != "figure":
+            continue
+        visible = _compact_visible_text(
+            " ".join(
+                str(element.get(key) or "")
+                for key in ("content", "caption", "description")
+            )
+        )
+        if visible:
+            figures.append((index, visible))
+
+    cleaned = []
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type", "text") != "text":
+            cleaned.append(element)
+            continue
+        value = _compact_visible_text(element.get("content"))
+        duplicate = bool(
+            len(value) >= 16
+            and normalized_source.count(value) <= 1
+            and any(
+                abs(index - figure_index) <= 8 and value in figure_text
+                for figure_index, figure_text in figures
+            )
+        )
+        if not duplicate:
+            cleaned.append(element)
+    return cleaned
 
 
 def _mark_element(e, source=None, confidence=None, issues=None):
@@ -1503,7 +1731,7 @@ Use the following exact XML template:
  Rules for XML:
  1. Reading order:
     - Single-column: read top to bottom.
-    - Continuous newspaper/report columns: read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom). Content at the top of a right column can continue a section from the bottom of the left column.
+    - Continuous newspaper/report columns: emit the shared page header first, then read the LEFT body column fully (top to bottom), then the RIGHT body column (top to bottom), and emit the shared footer last. Keep each heading immediately followed by its body. If the bottom-left sentence continues at the top-right, emit that top-right fragment immediately after the bottom-left fragment before the next complete heading. Never use raw-text order to relocate a visual block.
     - Bounded peer cards/tiles in a grid: read each row left to right, then move to the next row. Keep each card's title and bullets together; never move bullets into a neighboring card.
     - Use the layout image to determine the number of columns.
 2. Repeat <element> tags as needed — multiple elements of the same type are allowed.
@@ -1545,7 +1773,7 @@ Use the following JSON schema:
  Rules for JSON:
  1. Reading order:
     - Single-column: read top to bottom.
-    - Continuous newspaper/report columns: read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom). Content at the top of a right column can continue a section from the bottom of the left column.
+    - Continuous newspaper/report columns: emit the shared page header first, then read the LEFT body column fully (top to bottom), then the RIGHT body column (top to bottom), and emit the shared footer last. Keep each heading immediately followed by its body. If the bottom-left sentence continues at the top-right, emit that top-right fragment immediately after the bottom-left fragment before the next complete heading. Never use raw-text order to relocate a visual block.
     - Bounded peer cards/tiles in a grid: read each row left to right, then move to the next row. Keep each card's title and bullets together; never move bullets into a neighboring card.
     - Use the layout image to determine the number of columns.
 2. "type" MUST be one of the specified enum values:
@@ -1575,7 +1803,7 @@ Your task is to convert the provided document text (and layout image if availabl
 - For tables: every Markdown table row must have the same number of columns as the header row.
 - LANGUAGE: Write every natural-language string you generate — figure "description", any summary, and captions you compose — in the SAME language as the document body. For a Korean document the description MUST be Korean; do NOT answer in English. (Transcribed content keeps the original language as printed.)
 - FIGURE description LENGTH (hard limit): keep every figure "description" to AT MOST ~300 characters (about 2–4 sentences). Describe ONLY what is visibly in the frame. NEVER repeat a phrase, and do NOT drift into background knowledge, history, geography, or speculation triggered by a place-name, sign, or label you read in the image — if you catch yourself restating or elaborating beyond what is visible, STOP immediately.
-- READING ORDER: for continuous newspaper/report columns, finish the ENTIRE left column top-to-bottom before starting the right column. For bounded peer cards or tiles, read each row left-to-right and keep each card's title and body together. Use the image, not raw-text order, to distinguish these layouts.
+- READING ORDER: emit any full-width page header first and footer last. For continuous newspaper/report body columns, finish the ENTIRE left column top-to-bottom before starting the right column, keeping every heading with its following body. If a sentence is cut at the bottom-left and resumes at the top-right, place the continuation immediately after that fragment before any new right-column heading. For bounded peer cards or tiles, read each row left-to-right and keep each card's title and body together. Use the image, never raw-text order, to place blocks.
 - Transcribe ONLY what is visibly printed on THIS page. Do NOT repeat, re-emit, or duplicate any block of text — each piece appears exactly once.
 - TABLE OF CONTENTS — STRUCTURE FIDELITY (critical):
   (1) If the page is a table of contents (e.g. "목차", "목 차", "Contents", dotted leader lines, right-aligned page numbers), preserve the page as TOC structure.
@@ -3350,7 +3578,16 @@ class DocumentProcessor:
                             source_text_layer = text_layer_file.read()
                     except OSError:
                         source_text_layer = ""
+                    elems = _dedupe_tables_supported_by_text_layer(
+                        elems, source_text_layer
+                    )
                     elems = _dedupe_figures_supported_by_text_layer(
+                        elems, source_text_layer
+                    )
+                    elems = _dedupe_headings_supported_by_text_layer(
+                        elems, source_text_layer
+                    )
+                    elems = _drop_prose_duplicated_by_nearby_figures(
                         elems, source_text_layer
                     )
                     norm = [re.sub(r"\s+", " ", (e.get("content") or "")).strip() for e in elems]
@@ -3473,6 +3710,9 @@ class DocumentProcessor:
                                     _native_prep = table_validate.prepare_native(json.load(_nf))
                             except Exception:
                                 _native_prep = []
+                        deduped = table_validate.merge_adjacent_native_table_fragments(
+                            deduped, _native_prep
+                        )
                         rebuilt = []
                         for e in deduped:
                             if e.get("type") == "table" and e.get("content"):
@@ -3480,6 +3720,9 @@ class DocumentProcessor:
                                 _nh = (table_validate.native_substitute(e["content"], _native_prep)
                                        if _native_prep else None)
                                 if _nh and _nh.strip() and "</table>" in _nh:
+                                    _nh = table_validate.strip_caption_duplicate_metadata_row(
+                                        _nh, e.get("caption")
+                                    )
                                     q = table_validate.assess_table_quality(
                                         _nh, e.get("caption"), allow_nested=True
                                     )

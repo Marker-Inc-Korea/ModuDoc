@@ -135,6 +135,21 @@ class VLMResilienceTests(unittest.TestCase):
             utils._drop_trailing_duplicate_heading_cluster(elements), elements
         )
 
+    def test_trailing_duplicate_headings_before_a_year_are_removed(self):
+        elements = [
+            {"type": "heading_2", "content": "Section One"},
+            {"type": "text", "content": "First body"},
+            {"type": "heading_3", "content": "Topic A"},
+            {"type": "text", "content": "Second body"},
+            {"type": "heading_1", "content": "Section One"},
+            {"type": "heading_2", "content": "Topic A"},
+            {"type": "text", "content": "2024"},
+        ]
+
+        cleaned = utils._drop_trailing_duplicate_heading_cluster(elements)
+
+        self.assertEqual(cleaned, elements[:4] + elements[-1:])
+
     def test_duplicate_figure_uses_text_layer_occurrence_count(self):
         figure = {
             "type": "figure",
@@ -243,6 +258,90 @@ class VLMResilienceTests(unittest.TestCase):
         )
 
         self.assertEqual(cleaned, elements)
+
+    def test_duplicate_table_keeps_copy_with_matching_heading(self):
+        table = {
+            "type": "table",
+            "caption": "Access preparation",
+            "content": (
+                "<table><tr><td>Item</td><td>Description</td></tr>"
+                "<tr><td>Certificate</td><td>Prepare a valid access certificate before sign-in</td></tr>"
+                "<tr><td>Storage</td><td>Keep the credential in an approved secure location</td></tr></table>"
+            ),
+        }
+        elements = [
+            table,
+            {"type": "heading_2", "content": "3. Access preparation"},
+            table.copy(),
+        ]
+        text_layer = (
+            "3. Access preparation Item Description Certificate "
+            "Prepare a valid access certificate before sign-in Storage "
+            "Keep the credential in an approved secure location"
+        )
+
+        cleaned = utils._dedupe_tables_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, elements[1:])
+
+    def test_duplicate_heading_keeps_the_one_attached_to_its_content(self):
+        elements = [
+            {"type": "heading_2", "content": "3. Access preparation"},
+            {"type": "heading_2", "content": "4. Registration"},
+            {"type": "text", "content": "An unrelated explanatory paragraph with sufficient length."},
+            {"type": "heading_2", "content": "3. Access preparation"},
+            {
+                "type": "table",
+                "caption": "Access preparation",
+                "content": "<table><tr><td>Item</td><td>Value</td></tr></table>",
+            },
+        ]
+
+        cleaned = utils._dedupe_headings_supported_by_text_layer(
+            elements, "3. Access preparation\n4. Registration\nItem Value"
+        )
+
+        self.assertEqual(
+            [item.get("content") for item in cleaned if item["type"].startswith("heading_")],
+            ["4. Registration", "3. Access preparation"],
+        )
+
+    def test_duplicate_heading_is_preserved_when_context_is_tied(self):
+        elements = [
+            {"type": "heading_2", "content": "Regional status"},
+            {"type": "text", "content": "A first substantial body paragraph for this repeated card."},
+            {"type": "heading_2", "content": "Regional status"},
+            {"type": "text", "content": "A second substantial body paragraph for this repeated card."},
+        ]
+
+        cleaned = utils._dedupe_headings_supported_by_text_layer(
+            elements, "Regional status\nA first substantial body paragraph"
+        )
+
+        self.assertEqual(cleaned, elements)
+
+    def test_nearby_screenshot_text_is_kept_only_in_figure(self):
+        text = {
+            "type": "text",
+            "content": "Select the confirmation control to complete account registration.",
+        }
+        figure = {
+            "type": "figure",
+            "content": (
+                "Instruction: Select the confirmation control to complete account registration."
+            ),
+            "caption": "Registration screen",
+            "description": "A screen showing the registration confirmation control.",
+        }
+
+        cleaned = utils._drop_prose_duplicated_by_nearby_figures(
+            [text, {"type": "heading_2", "content": "Registration"}, figure],
+            text["content"],
+        )
+
+        self.assertEqual(cleaned, [{"type": "heading_2", "content": "Registration"}, figure])
 
     def test_matching_attached_page_counter_is_removed_from_edge_heading(self):
         elements = [
