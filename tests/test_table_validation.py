@@ -254,6 +254,69 @@ class GenericTableRepairTests(unittest.TestCase):
         )
         self.assertIn("outer-row boundary", request["messages"][0]["content"])
 
+    def test_nested_layout_review_must_match_parsed_outer_geometry(self):
+        inner = (
+            "<table><tr><td>A</td><td>B</td></tr>"
+            "<tr><td>1</td><td>2</td></tr></table>"
+        )
+        candidate = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table>"
+                        "<tr><td colspan='3'>Header</td></tr>"
+                        f"<tr><td>Group</td><td>{inner}</td><td>Note</td></tr>"
+                        "<tr><td>Next</td><td>Value</td><td>Tail</td></tr>"
+                        "<tr><td>Last</td><td>Value</td><td>Tail</td></tr>"
+                        "</table>"
+                    ),
+                }
+            ]
+        }
+
+        self.assertTrue(
+            table_quality_repair._nested_review_geometry_consistent(
+                candidate, {"outer_rows": 4, "outer_columns": 3}
+            )
+        )
+        self.assertFalse(
+            table_quality_repair._nested_review_geometry_consistent(
+                candidate, {"outer_rows": 6, "outer_columns": 3}
+            )
+        )
+
+    def test_nested_layout_review_rejects_flattened_inner_rows(self):
+        candidate = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table>"
+                        "<tr><td colspan='3'>Header</td></tr>"
+                        "<tr><td>Group</td><td>Detail</td><td>Note</td></tr>"
+                        "<tr><td>A</td><td>B</td><td>C</td><td>D</td></tr>"
+                        "<tr><td>1</td><td>2</td><td>3</td></tr>"
+                        "<tr><td>Next</td><td>Value</td><td>Tail</td></tr>"
+                        "<tr><td>Last</td><td>Value</td><td>Tail</td></tr>"
+                        "</table>"
+                    ),
+                }
+            ]
+        }
+        review = {"outer_rows": 4, "outer_columns": 3}
+
+        self.assertFalse(
+            table_quality_repair._nested_review_geometry_consistent(
+                candidate, review
+            )
+        )
+        feedback = table_quality_repair._nested_review_geometry_feedback(
+            candidate, review
+        )
+        self.assertIn("4 rows by 3 columns", feedback)
+        self.assertIn("parent <td>", feedback)
+
     def test_rejected_layout_feedback_is_sent_to_the_next_repair_attempt(self):
         original = {
             "elements": [

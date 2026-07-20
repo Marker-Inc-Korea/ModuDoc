@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 TABLE_QUALITY_REPAIR = os.environ.get("TABLE_QUALITY_REPAIR", "1") == "1"
 TABLE_QUALITY_REPAIR_MAX_PAGES = max(0, int(os.environ.get("TABLE_QUALITY_REPAIR_MAX_PAGES", "8")))
 TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS = min(
-    3, max(1, int(os.environ.get("TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS", "2")))
+    3, max(1, int(os.environ.get("TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS", "3")))
 )
 TABLE_QUALITY_REPAIR_MAX_TOKENS = max(1024, int(os.environ.get("TABLE_QUALITY_REPAIR_MAX_TOKENS", "16384")))
 TABLE_QUALITY_REPAIR_TIMEOUT = max(60, int(os.environ.get("TABLE_QUALITY_REPAIR_TIMEOUT", "600")))
@@ -627,6 +627,54 @@ def _table_geometry(element: dict) -> dict:
         }
     except Exception:
         return {}
+
+
+def _nested_review_geometry_consistent(candidate: dict, review: dict) -> bool:
+    """Require a visual verdict to agree with the parsed outer HTML grid."""
+    try:
+        reviewed_rows = int(review.get("outer_rows"))
+        reviewed_columns = int(review.get("outer_columns"))
+    except (TypeError, ValueError):
+        return False
+    if reviewed_rows < 1 or reviewed_columns < 1:
+        return False
+
+    for element in candidate.get("elements") or []:
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        geometry = _table_geometry(element)
+        widths = geometry.get("expanded_row_widths") or []
+        if (
+            geometry.get("row_count") == reviewed_rows
+            and len(widths) == reviewed_rows
+            and all(width == reviewed_columns for width in widths)
+        ):
+            return True
+    return False
+
+
+def _nested_review_geometry_feedback(candidate: dict, review: dict) -> str:
+    reviewed_rows = review.get("outer_rows")
+    reviewed_columns = review.get("outer_columns")
+    parsed = [
+        _table_geometry(element)
+        for element in candidate.get("elements") or []
+        if isinstance(element, dict) and element.get("type") == "table"
+    ]
+    parsed_summary = [
+        {
+            "rows": geometry.get("row_count"),
+            "expanded_row_widths": geometry.get("expanded_row_widths") or [],
+        }
+        for geometry in parsed
+    ]
+    return (
+        "The visual reviewer counted a rectangular outer grid of "
+        f"{reviewed_rows} rows by {reviewed_columns} columns, but an HTML parser "
+        f"reads the candidate outer table geometry as {parsed_summary}. "
+        "Keep inner-grid rows inside their parent <td> and return a rectangular "
+        "outer table whose parsed row and column counts match the image."
+    )
 
 
 def _table_topology_signature(element: dict) -> tuple:
@@ -2084,19 +2132,34 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                     record.setdefault("layout_review_errors", []).append(
                         {"attempt": attempt, "error": f"{type(exc).__name__}: {exc}"}
                     )
-                layout_review_passed = bool(
+                review_claimed_pass = bool(
                     isinstance(layout_review, dict)
                     and layout_review.get("pass") is True
+                )
+                review_geometry_consistent = bool(
+                    review_claimed_pass
+                    and _nested_review_geometry_consistent(
+                        table_candidate, layout_review
+                    )
+                )
+                layout_review_passed = bool(
+                    review_claimed_pass and review_geometry_consistent
                 )
                 review_reason = (
                     str(layout_review.get("reason") or "")
                     if isinstance(layout_review, dict)
                     else "nested layout review returned no valid verdict"
                 )
+                if review_claimed_pass and not review_geometry_consistent:
+                    review_reason = _nested_review_geometry_feedback(
+                        table_candidate, layout_review
+                    )
                 record.setdefault("nested_layout_reviews", []).append(
                     {
                         "attempt": attempt,
                         "pass": layout_review_passed,
+                        "review_claimed_pass": review_claimed_pass,
+                        "candidate_geometry_consistent": review_geometry_consistent,
                         "outer_columns": (
                             layout_review.get("outer_columns")
                             if isinstance(layout_review, dict)
@@ -2244,19 +2307,32 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
                 record.setdefault("layout_review_errors", []).append(
                     {"stage": "full_page", "error": f"{type(exc).__name__}: {exc}"}
                 )
-            fallback_review_passed = bool(
+            fallback_review_claimed_pass = bool(
                 isinstance(fallback_review, dict)
                 and fallback_review.get("pass") is True
+            )
+            fallback_geometry_consistent = bool(
+                fallback_review_claimed_pass
+                and _nested_review_geometry_consistent(candidate, fallback_review)
+            )
+            fallback_review_passed = bool(
+                fallback_review_claimed_pass and fallback_geometry_consistent
             )
             fallback_reason = (
                 str(fallback_review.get("reason") or "")
                 if isinstance(fallback_review, dict)
                 else "nested layout review returned no valid verdict"
             )
+            if fallback_review_claimed_pass and not fallback_geometry_consistent:
+                fallback_reason = _nested_review_geometry_feedback(
+                    candidate, fallback_review
+                )
             record.setdefault("nested_layout_reviews", []).append(
                 {
                     "stage": "full_page",
                     "pass": fallback_review_passed,
+                    "review_claimed_pass": fallback_review_claimed_pass,
+                    "candidate_geometry_consistent": fallback_geometry_consistent,
                     "outer_columns": (
                         fallback_review.get("outer_columns")
                         if isinstance(fallback_review, dict)
