@@ -23,9 +23,6 @@ HARD_TABLE_ISSUES = {
     "empty_table",
     "ragged_rows",
     "nested_table",
-    "possible_missing_group_colspan",
-    "possible_collapsed_rating_date_columns",
-    "possible_collapsed_eca_category_columns",
     "quality_check_error",
 }
 
@@ -33,9 +30,6 @@ PARSER_HARD_TABLE_ISSUES = {
     "validator_error",
     "quality_check_error",
     "nested_table",
-    "possible_missing_group_colspan",
-    "possible_collapsed_rating_date_columns",
-    "possible_collapsed_eca_category_columns",
 }
 
 
