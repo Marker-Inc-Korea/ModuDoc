@@ -44,6 +44,9 @@ HARD_ISSUES = {
     "nested_table",
     "quality_check_error",
 }
+REVIEW_ISSUES = {
+    "possible_cross_row_bleed",
+}
 
 SYSTEM_PROMPT = """You are repairing a document page whose previous table extraction failed structural QA.
 Use the PAGE IMAGE as the sole source of truth. Return the COMPLETE page, not only the broken table.
@@ -78,6 +81,9 @@ Rules:
   the old HTML. Use them to locate malformed colspan/rowspan, but let visible
   borders in the image override the hint.
 - Preserve all visible cells and their reading order. Do not summarize or silently correct wording.
+- A supplied diagnostic may indicate that the next row's label was appended to
+  the preceding row's final cell. Recheck the visible row borders and keep each
+  label and value inside its own cell; never copy a row label across a boundary.
 - Use only <table>, <tr>, <td>, <br>, colspan, and rowspan. Do not use <th>.
 - Count the visible top-level cell regions in each row before assigning spans, then expand every row mentally and ensure it resolves to the same column count.
 - Keep every blank cell bounded by visible grid lines, including leading and trailing blank header cells. Never absorb such a cell into a neighboring colspan.
@@ -124,7 +130,8 @@ def _problem_tables(data: dict) -> list[dict]:
         quality = table_validate.assess_table_quality(
             element.get("content"), element.get("caption"), allow_nested=allow_nested
         )
-        issues = set(quality.get("issues") or []) & HARD_ISSUES
+        quality_issues = set(quality.get("issues") or [])
+        issues = quality_issues & (HARD_ISSUES | REVIEW_ISSUES)
         if issues or float(quality.get("confidence") or 0.0) < 0.75:
             problems.append({"index": index, "issues": sorted(issues), "quality": quality})
     return problems
@@ -563,6 +570,127 @@ def _table_text_reference(element: dict) -> dict:
     return reference
 
 
+def _borderless_definition_text(element: dict) -> str | None:
+    """Return lossless text for a small formula-variable definition layout."""
+    try:
+        table = BeautifulSoup(
+            element.get("content") or "", "html.parser"
+        ).find("table")
+        if table is None or table.find("table") is not None:
+            return None
+        rows = table_validate._rows_of(table)
+        if not (2 <= len(rows) <= 8):
+            return None
+        row_values = [
+            [
+                cell.get_text(" ", strip=True)
+                for cell in row.find_all(["td", "th"], recursive=False)
+            ]
+            for row in rows
+        ]
+        if any(not values for values in row_values):
+            return None
+        colon_rows = sum(
+            any(":" in value or "：" in value for value in values)
+            for values in row_values
+        )
+        has_formula_notation = bool(
+            table.find(["sub", "sup"])
+            or re.search(r"[=∑Σ∏√±×÷]", table.get_text(" ", strip=True))
+        )
+        if colon_rows < max(2, len(rows) - 1) or not has_formula_notation:
+            return None
+        lines = [" ".join(value for value in values if value).strip() for values in row_values]
+        if any(not line for line in lines):
+            return None
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _demote_borderless_definition_tables(
+    image_path: Path, original: dict
+) -> tuple[dict | None, list[dict]]:
+    """Demote formula definitions only when the page image has no table grid."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("L")
+    except Exception:
+        return None, []
+
+    candidate = copy.deepcopy(original)
+    elements = candidate.get("elements") or []
+    demotions = []
+    for problem in _problem_tables(original):
+        index = problem.get("index")
+        issues = set(problem.get("issues") or [])
+        if (
+            type(index) is not int
+            or not (0 <= index < len(elements))
+            or not issues
+            or not issues.issubset({"ragged_rows"})
+        ):
+            continue
+        element = elements[index]
+        text = _borderless_definition_text(element)
+        if not text:
+            continue
+        geometry = _table_geometry(element)
+        row_count = geometry.get("row_count") or 0
+        if (
+            row_count < 2
+            or _table_horizontal_window(image, row_count)
+            or len(_full_height_vertical_grid_lines(image)) >= 2
+        ):
+            continue
+        old_cells = _table_visible_text({**element, "caption": ""})
+        new_text = unicodedata.normalize("NFKC", text).casefold()
+        new_text = "".join(
+            char for char in new_text if char.isalnum() or char in "%+-~□☐☑✓"
+        )
+        if old_cells != new_text:
+            continue
+        replacement = {
+            key: value for key, value in element.items() if not key.startswith("_")
+        }
+        replacement.update(
+            {
+                "type": "text",
+                "content": text,
+                "_source": "borderless_definition_text",
+                "_confidence": 0.80,
+                "_issues": ["borderless_definition_demoted"],
+            }
+        )
+        elements[index] = replacement
+        demotions.append({"index": index, "rows": row_count})
+    return (candidate, demotions) if demotions else (None, [])
+
+
+def _validated_borderless_definition_demotion(
+    image_path: Path, original: dict
+) -> tuple[dict | None, list[dict], dict | None]:
+    """Return a deterministic, page-lossless demotion and its audit metrics."""
+    demoted, demotions = _demote_borderless_definition_tables(image_path, original)
+    if demoted is None:
+        return None, [], None
+    demoted["quality_repair"] = True
+    visible_text_preserved = _page_visible_text(original) == _page_visible_text(demoted)
+    old_problem_count = len(_problem_tables(original))
+    new_problem_count = len(_problem_tables(demoted))
+    if not visible_text_preserved or new_problem_count >= old_problem_count:
+        return None, [], None
+    metrics = {
+        "old_problem_tables": old_problem_count,
+        "new_problem_tables": new_problem_count,
+        "visible_text_preserved": True,
+        "demoted_tables": len(demotions),
+    }
+    return demoted, demotions, metrics
+
+
 def _geometry_correction_choices(element: dict) -> dict:
     """Enumerate lossless row layouts that can fix majority-width outliers."""
     geometry = _table_geometry(element)
@@ -704,6 +832,21 @@ def _horizontal_grid_lines(image) -> list[tuple[int, int, int, int]]:
         )
         if length >= minimum:
             lines.append((y, start, end, length))
+    return _group_adjacent_lines(lines)
+
+
+def _full_height_vertical_grid_lines(image) -> list[tuple[int, int, int, int]]:
+    """Find long vertical borders without assuming horizontal grid lines."""
+    width, height = image.size
+    data = image.tobytes()
+    minimum = max(50, int(height * 0.08))
+    lines = []
+    for x in range(width):
+        length, start, end = _longest_dark_run(
+            data[x::width], threshold=160
+        )
+        if length >= minimum:
+            lines.append((x, start, end, length))
     return _group_adjacent_lines(lines)
 
 
@@ -1041,6 +1184,34 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
             results.append(record)
             continue
         record["candidate_options"] = []
+        demoted, demotions, demotion_metrics = (
+            _validated_borderless_definition_demotion(image_path, original)
+        )
+        if demoted is not None:
+            record["candidate_options"].append(
+                {
+                    "strategy": "borderless_definition_demoted",
+                    "accepted": True,
+                    "metrics": demotion_metrics,
+                    "demotions": demotions,
+                }
+            )
+            persist_page(stem, json.dumps(demoted, ensure_ascii=False))
+            record.update(
+                {
+                    "accepted": True,
+                    "strategy": "borderless_definition_demoted",
+                    "metrics": demotion_metrics,
+                    "demotions": demotions,
+                }
+            )
+            results.append(record)
+            logger.info(
+                "%s borderless definition demoted: %s",
+                stem,
+                demotion_metrics,
+            )
+            continue
         targeted_accepted = False
         for attempt in range(1, TABLE_QUALITY_REPAIR_TABLE_ATTEMPTS + 1):
             try:

@@ -72,6 +72,111 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertEqual(result["issue_types"], [])
         self.assertEqual(result["structure_evidence"], [])
 
+    def test_page_counter_suffix_is_removed_before_text_comparison(self):
+        verdict = {
+            "pass": False,
+            "score": 35,
+            "severity": "major",
+            "issue_types": ["wrong_text", "wrong_order", "hallucination"],
+            "text_mismatches": [
+                {
+                    "image_text": "Appendix transaction report",
+                    "candidate_text": "Appendix transaction report - 18 -",
+                }
+            ],
+            "hallucinated_candidate_text": [
+                "Appendix transaction report - 18 -"
+            ],
+            "structure_evidence": [
+                "The extra '- 18 -' appears in the header instead of the footer."
+            ],
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Appendix transaction report - 18 -"
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+        self.assertEqual(result["text_mismatches"], [])
+        self.assertEqual(result["hallucinated_candidate_text"], [])
+        self.assertEqual(result["structure_evidence"], [])
+
+    def test_page_counter_structure_claim_is_ignored_without_position_wording(self):
+        verdict = {
+            "pass": False,
+            "score": 45,
+            "severity": "major",
+            "issue_types": ["wrong_order"],
+            "structure_evidence": [
+                "The title is combined with the printed counter '- 1 8 -'."
+            ],
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Appendix transaction report - 1 8 -"
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["structure_evidence"], [])
+
+    def test_element_type_only_claim_is_not_wrong_order(self):
+        verdict = {
+            "pass": False,
+            "score": 65,
+            "severity": "major",
+            "issue_types": ["wrong_order"],
+            "structure_evidence": [
+                "The image has a heading, but the candidate stores it as a text element."
+            ],
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Section heading Body content"
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["structure_evidence"], [])
+
+    def test_caption_metadata_has_no_above_or_below_position(self):
+        primary = {
+            "pass": False,
+            "score": 70,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The candidate caption is positioned below the table instead of above it."
+            ],
+        }
+
+        result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertTrue(result["pass"])
+
+    def test_wrong_card_association_remains_structural_evidence(self):
+        primary = {
+            "pass": False,
+            "score": 55,
+            "severity": "major",
+            "issue_types": ["wrong_order"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["wrong_order"],
+            "structure_evidence": [
+                "The second card's bullets are grouped under the third card title."
+            ],
+        }
+
+        result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["wrong_order"])
+
     def test_review_can_reject_an_unsupported_failure(self):
         primary = {
             "pass": False,
@@ -189,6 +294,30 @@ class VisualJudgeTests(unittest.TestCase):
 
         self.assertTrue(result["pass"])
 
+    def test_review_ignores_page_counter_attached_to_a_heading(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["wrong_text"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["wrong_text"],
+            "text_mismatches": [
+                {
+                    "image_text": "Appendix transaction report",
+                    "candidate_text": "Appendix transaction report - 18 -",
+                }
+            ],
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "Appendix transaction report - 18 -"
+        )
+
+        self.assertTrue(result["pass"])
+
     def test_review_structure_requires_structure_evidence(self):
         primary = {
             "pass": False,
@@ -205,6 +334,69 @@ class VisualJudgeTests(unittest.TestCase):
         result = visual_judge_pages.apply_failure_review(primary, review)
 
         self.assertTrue(result["pass"])
+
+    def test_review_rejects_cosmetic_table_evidence(self):
+        primary = {
+            "pass": False,
+            "score": 85,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The header has an extra space and a minor alignment difference."
+            ],
+            "reason": "This is only a minor formatting error; no content is wrong.",
+        }
+
+        result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_review_keeps_material_table_evidence(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has four columns, but the candidate has a missing column."
+            ],
+            "reason": "A data column is absent.",
+        }
+
+        result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["table_structure"])
+
+    def test_review_keeps_material_alignment_evidence(self):
+        primary = {
+            "pass": False,
+            "score": 55,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+        }
+        review = {
+            "confirmed_failure": True,
+            "confirmed_issue_types": ["table_structure"],
+            "structure_evidence": [
+                "Cell alignment shifted a value under the wrong header."
+            ],
+            "reason": "The alignment error changes the value-to-header association.",
+        }
+
+        result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["table_structure"])
 
 
 if __name__ == "__main__":

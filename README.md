@@ -150,6 +150,7 @@ export VLM_BASE_URL="http://localhost:8000/v1"
 | `ZOOM_VLM_TIMEOUT` | `180` | raster 표 zoom-pass 재추출 VLM 호출 타임아웃(초) |
 | `ZOOM_JUDGE_MAX_TOKENS` | `256` | zoom-pass A/B 심판 응답 토큰 상한 |
 | `ZOOM_JUDGE_TIMEOUT` | `60` | zoom-pass A/B 심판 VLM 호출 타임아웃(초) |
+| `ZOOM_MIN_TEXT_SIMILARITY` | `0.995` | zoom-pass 교체 전 반복값과 셀 읽기 순서를 포함해 보존해야 하는 최소 원문 유사도(최저 `0.98`) |
 | `ZOOM_MAX_CANDIDATES` | `16` | 문서당 zoom-pass 후보 raster 표 최대 개수. 큰 표부터 처리하며 `0`이면 제한 없음 |
 | `ZOOM_DOC_BUDGET_SEC` | `900` | 문서당 zoom-pass 전체 시간 예산(초). 예산 초과 시 남은 후보를 건너뜀, `0`이면 제한 없음 |
 | `TABLE_QUALITY_REPAIR` | `1` | ragged/그룹 헤더 붕괴 등 객관적 표 구조 오류 페이지만 이미지 기준으로 재추출 |

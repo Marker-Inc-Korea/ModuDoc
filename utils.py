@@ -510,6 +510,121 @@ def _drop_trailing_duplicate_heading_cluster(elements):
     return result
 
 
+def _dedupe_figures_supported_by_text_layer(elements, source_text):
+    """Remove exact duplicate figures only when the text layer supports fewer copies."""
+    source = list(elements or [])
+    normalized_source = _compact_visible_text(source_text)
+    if not normalized_source:
+        return source
+
+    groups = {}
+    for index, element in enumerate(source):
+        if not isinstance(element, dict) or element.get("type") != "figure":
+            continue
+        signature = tuple(
+            re.sub(r"\s+", " ", str(element.get(key) or "")).strip()
+            for key in ("content", "caption", "description")
+        )
+        if len(_compact_visible_text(signature[0])) < 32:
+            continue
+        groups.setdefault(signature, []).append(index)
+
+    remove = set()
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        first_index, last_index = min(indices), max(indices)
+        intervening = [
+            source[index]
+            for index in range(first_index, last_index + 1)
+            if index not in indices
+        ]
+        if any(
+            not isinstance(element, dict)
+            or not str(element.get("type") or "").startswith("heading_")
+            for element in intervening
+        ):
+            continue
+        figure = source[indices[0]]
+        anchors = []
+        content = str(figure.get("content") or "")
+        try:
+            soup = BeautifulSoup(content, "html.parser")
+            if soup.find(["td", "th"]):
+                anchors.extend(
+                    cell.get_text(" ", strip=True)
+                    for cell in soup.find_all(["td", "th"])
+                )
+            else:
+                anchors.extend(soup.get_text("\n", strip=True).splitlines())
+        except Exception:
+            anchors.extend(content.splitlines())
+        anchors.append(str(figure.get("caption") or ""))
+
+        normalized_anchors = sorted(
+            {
+                value
+                for item in anchors
+                if len(value := _compact_visible_text(item)) >= 10
+            },
+            key=len,
+            reverse=True,
+        )[:8]
+        occurrence_evidence = [
+            (anchor, count)
+            for anchor in normalized_anchors
+            if (count := normalized_source.count(anchor)) > 0
+        ]
+        if len(occurrence_evidence) < 2 and not any(
+            len(anchor) >= 24 for anchor, _ in occurrence_evidence
+        ):
+            continue
+        supported_copies = min(count for _, count in occurrence_evidence)
+        if supported_copies >= len(indices):
+            continue
+
+        caption = _compact_visible_text(figure.get("caption"))
+
+        def context_score(index):
+            score = 0
+            for distance in (1, 2):
+                previous_index = index - distance
+                if previous_index < 0:
+                    continue
+                previous = source[previous_index]
+                if not isinstance(previous, dict) or not str(
+                    previous.get("type") or ""
+                ).startswith("heading_"):
+                    continue
+                heading = _compact_visible_text(previous.get("content"))
+                if heading and caption:
+                    matcher = SequenceMatcher(
+                        None, heading, caption, autojunk=False
+                    )
+                    if (
+                        heading in caption
+                        or caption in heading
+                        or (
+                            matcher.ratio() >= 0.65
+                            and matcher.find_longest_match().size >= 6
+                        )
+                    ):
+                        score = max(score, 3 - distance)
+            return score
+
+        context_scores = {index: context_score(index) for index in indices}
+        if intervening and max(context_scores.values(), default=0) <= 0:
+            continue
+        keep_count = max(1, supported_copies)
+        ranked = sorted(
+            indices, key=lambda index: (-context_scores[index], index)
+        )
+        keep = set(ranked[:keep_count])
+        remove.update(index for index in indices if index not in keep)
+
+    return [element for index, element in enumerate(source) if index not in remove]
+
+
 def _mark_element(e, source=None, confidence=None, issues=None):
     """Attach lightweight provenance/confidence without changing public content fields."""
     if not isinstance(e, dict):
@@ -594,6 +709,30 @@ def _looks_page_artifact_text(text, page_no=None, index=0, total=0, has_page_mar
     return False
 
 
+def _strip_attached_page_counter(text, page_no=None, index=0, total=0):
+    """Strip an edge-attached printed counter only when it matches this page."""
+    value = str(text or "").strip()
+    edge = index <= 1 or index >= max(0, total - 3)
+    if not value or not edge or page_no is None:
+        return value
+    match = re.fullmatch(
+        r"(?P<body>.+?)\s*[-–—]\s*/?\s*"
+        r"(?P<digits>(?:\d\s*){1,4})[-–—]\s*",
+        value,
+    )
+    if not match:
+        return value
+    try:
+        printed_page = int(re.sub(r"\s+", "", match.group("digits")))
+        parsed_page = int(page_no)
+    except (TypeError, ValueError):
+        return value
+    body = match.group("body").strip()
+    if printed_page != parsed_page or sum(char.isalnum() for char in body) < 4:
+        return value
+    return body
+
+
 def _drop_page_artifact_elements(elements, page_no=None):
     """Remove page-number/header/footer noise from text-like elements only."""
     if not elements:
@@ -611,6 +750,12 @@ def _drop_page_artifact_elements(elements, page_no=None):
             cleaned.append(e)
             continue
         et = e.get("type", "text")
+        if et in {"text", "footnote", "heading_1", "heading_2", "heading_3"}:
+            stripped = _strip_attached_page_counter(
+                e.get("content"), page_no, idx, total
+            )
+            if stripped != str(e.get("content") or "").strip():
+                e = {**e, "content": stripped}
         if et in {"text", "footnote"} and _looks_page_artifact_text(
             e.get("content"), page_no, idx, total, has_page_marker
         ):
@@ -1355,11 +1500,12 @@ Use the following exact XML template:
     </elements>
 </document>
 
-Rules for XML:
-1. Reading order:
-   - Single-column: read top to bottom.
-   - Multi-column (2 or more columns): read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom).
-   - Use the layout image to determine the number of columns.
+ Rules for XML:
+ 1. Reading order:
+    - Single-column: read top to bottom.
+    - Continuous newspaper/report columns: read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom). Content at the top of a right column can continue a section from the bottom of the left column.
+    - Bounded peer cards/tiles in a grid: read each row left to right, then move to the next row. Keep each card's title and bullets together; never move bullets into a neighboring card.
+    - Use the layout image to determine the number of columns.
 2. Repeat <element> tags as needed — multiple elements of the same type are allowed.
 3. If an element does not exist, simply do not include that type.
 4. [TABLE — CRITICAL] Any grid of data with rows and columns MUST be output as HTML table. Rules:
@@ -1377,7 +1523,7 @@ Rules for XML:
    - figure: ONLY for actual embedded images, photographs, charts, or diagrams — NOT for text formatted with symbols like ▴, ●, ○, etc. Put the caption in the caption attribute. Always fill the description attribute with a detailed visual description: for charts/graphs describe what the chart shows, the overall trend, and key observations; for photographs describe what is depicted. For charts/graphs/plots: scan the ENTIRE chart image and transcribe the legible title, legend entries, axis labels, major endpoint/tick values, explicitly printed data labels, and annotations needed to interpret it. Do NOT enumerate unlabeled plotted samples, infer intermediate values, or repeat dense micro-labels. List retained items once in visual reading order. A screenshot dominated by readable forms, messages, Q&A cards, or document text is structured as separate text/table elements for its visible regions; do not duplicate that text in a figure element. For photographs or decorative images with no data, leave the element body empty. The description MUST be written in the document body language (Korean for a Korean document) EVEN IF the figure's labels are in another language; for other screenshots/UI captures put non-structured on-screen text in the body but still write the description — NEVER leave description empty for a figure. Match detail to type: charts → chart type + concrete trend shape (계단식/선형/급증·급락) + peak position + series comparison; diagrams → main nodes and their flow/relationships; photos/maps/renderings → key subject in 1–2 sentences; screenshots → one sentence on purpose (do not repeat the body data). ANTI-HALLUCINATION: if no numbers are printed on the axes/legend, do NOT invent them — state "축에 수치 미표기" and describe only the qualitative shape.
    - footnote: ONLY for superscript-style reference notes at the very bottom margin (e.g. *, ①, ※ markers). Do NOT use for regular body paragraphs.
    - table caption: Put the table title in the caption attribute, NOT as a separate heading element.
-6. CRITICAL — NO DUPLICATION: Each piece of content must appear exactly ONCE. Never output the same text in multiple elements."""
+ 6. CRITICAL — NO DUPLICATION: Each piece of content must appear exactly ONCE. Never output the same text in multiple elements. Emit an identical figure element twice only when two distinct visual instances are actually present on the page."""
         else:
             schema_instruction = """[FORMAT INSTRUCTION: JSON ONLY]
 CRITICAL: Output ONLY valid JSON.
@@ -1396,17 +1542,18 @@ Use the following JSON schema:
     ]
 }
 
-Rules for JSON:
-1. Reading order:
-   - Single-column: read top to bottom.
-   - Multi-column (2 or more columns): read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom).
-   - Use the layout image to determine the number of columns.
+ Rules for JSON:
+ 1. Reading order:
+    - Single-column: read top to bottom.
+    - Continuous newspaper/report columns: read the LEFT column fully (top to bottom), then the RIGHT column (top to bottom). Content at the top of a right column can continue a section from the bottom of the left column.
+    - Bounded peer cards/tiles in a grid: read each row left to right, then move to the next row. Keep each card's title and bullets together; never move bullets into a neighboring card.
+    - Use the layout image to determine the number of columns.
 2. "type" MUST be one of the specified enum values:
    - heading_1/2/3: For actual section titles and prominent standalone headings. Use for: section titles in body text (e.g. "Introduction", "1.1 Methods"); on slide/presentation pages, EACH visually prominent section label and numbered step title MUST be a SEPARATE heading element — do NOT merge section labels with their body text (e.g. on a slide with "Our Purpose\nMaking AI Beneficial", "Our Purpose" is heading_2 and "Making AI Beneficial" is text; on a slide with "01 - Find Resources\nStart by searching...", "01 - Find Resources" is heading_2 and "Start by searching..." is text); section labels that introduce a data block on a report/survey page (e.g. "Education Level", "Profession"). Do NOT use for: TOC entries, bold inline labels within a paragraph sentence (e.g. "Base model. We trained..." where text continues on the same line).
      IMPORTANT — PRESERVE the leading numbering/marker at the START of the heading "content" exactly as printed (e.g. "제1장", "제2조", "①", "1.", "가.", "(1)", "□", "○", "Ⅰ.") — do NOT strip it. This marker encodes the heading's hierarchy level and is required for downstream structuring.
    - toc_entry: ONLY for items listed on a Table of Contents page. Set content to "title::page_number".
    - text: General body paragraphs, including lists, bullet points, and any text content that is NOT a heading. Use **bold** for bold text within paragraphs.
-   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> (and <br> only inside a cell) — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be included as empty <td></td>. NEVER output table data as flat text. Put table title in "caption". Equations, formulas, and variable-definition lists without visible cell borders are text, NOT tables.
+   - table: [CRITICAL] Any grid of data MUST be output as HTML in "content". Use ONLY <table>, <tr>, <td> (and <br> only inside a cell) — NEVER <th>. You MAY use colspan/rowspan. Always use the layout IMAGE to detect tables visually (raw text loses column structure). Include ALL rows: title rows, multi-row headers (with correct colspan), data rows, totals rows. Empty cells must be included as empty <td></td>. Preserve side-by-side repeated column groups from the image; never stack them vertically into a narrower table. NEVER output table data as flat text. Put table title in "caption". Equations, formulas, and variable-definition lists without visible cell borders are text, NOT tables.
    - figure: ONLY for actual embedded images, photographs, charts, or diagrams that are visual/graphical content — NOT for text formatted with symbols like ▴, ●, ○, ☞, etc. Put caption in "caption". For charts/graphs/plots: scan the ENTIRE chart and put the legible title, legend entries, axis labels, major endpoint/tick values, explicitly printed data labels, and annotations needed to interpret it into "content". Do NOT enumerate unlabeled plotted samples, infer intermediate values, or repeat dense micro-labels. List retained items once in visual reading order. A screenshot dominated by readable forms, messages, Q&A cards, or document text MUST be structured as separate text/table elements for its visible regions; do not duplicate that text in a figure element. For photographs or decorative images with no data, leave "content" empty. ALWAYS fill "description" with a detailed visual description, written in the DOCUMENT BODY LANGUAGE (Korean for a Korean document) EVEN IF the figure's own labels/axes/legend are in another language — transcribe the foreign labels verbatim into "content", but NARRATE "description" in the document language. Write "description" with detail matched to the figure TYPE:
      • Chart/graph: name the chart type (막대/선/원), then the CONCRETE shape of the trend (계단식/선형/급증·급락/평탄), WHERE the peak/trough sits, and compare the series/legend entries by name. Include printed numbers (peaks, totals, legend values) ONLY if they are actually printed on the figure.
      • Diagram/flowchart/structure: enumerate the main nodes/components and the relationships, flow direction, or contract/transaction names connecting them.
@@ -1414,7 +1561,7 @@ Rules for JSON:
      • Screenshot/UI capture: ONE sentence on the screen's purpose — the on-screen data already goes in "content", so do NOT repeat it in the description.
      ANTI-HALLUCINATION: if the axes/legend/data-labels carry NO printed numbers, do NOT invent any — state "축에 수치 미표기" and describe only the qualitative shape. NEVER leave "description" empty for a figure. (한국어 차트 예: "분기별 매출 막대그래프. 9~12월 계단식 상승, 12월 1.2억으로 정점, A계열이 B계열을 상회.")
    - footnote: ONLY for superscript-style reference notes (e.g., *, ①, ※ markers at the very bottom margin of the page). Do NOT use for regular body text that happens to appear at the bottom.
-3. CRITICAL — NO DUPLICATION: Each piece of text content must appear exactly ONCE in the elements array. Never output the same content in multiple elements.
+ 3. CRITICAL — NO DUPLICATION: Each piece of text content must appear exactly ONCE in the elements array. Never output the same content in multiple elements. Emit an identical figure element twice only when two distinct visual instances are actually present on the page.
 4. If the page is empty, return an empty "elements" array."""
 
         system_prompt = f"""You are an expert document parsing AI.
@@ -1428,7 +1575,7 @@ Your task is to convert the provided document text (and layout image if availabl
 - For tables: every Markdown table row must have the same number of columns as the header row.
 - LANGUAGE: Write every natural-language string you generate — figure "description", any summary, and captions you compose — in the SAME language as the document body. For a Korean document the description MUST be Korean; do NOT answer in English. (Transcribed content keeps the original language as printed.)
 - FIGURE description LENGTH (hard limit): keep every figure "description" to AT MOST ~300 characters (about 2–4 sentences). Describe ONLY what is visibly in the frame. NEVER repeat a phrase, and do NOT drift into background knowledge, history, geography, or speculation triggered by a place-name, sign, or label you read in the image — if you catch yourself restating or elaborating beyond what is visible, STOP immediately.
-- READING ORDER on multi-column pages: finish the ENTIRE left column top-to-bottom BEFORE starting the right column. NEVER interleave left/right rows. Use the image to count columns.
+- READING ORDER: for continuous newspaper/report columns, finish the ENTIRE left column top-to-bottom before starting the right column. For bounded peer cards or tiles, read each row left-to-right and keep each card's title and body together. Use the image, not raw-text order, to distinguish these layouts.
 - Transcribe ONLY what is visibly printed on THIS page. Do NOT repeat, re-emit, or duplicate any block of text — each piece appears exactly once.
 - TABLE OF CONTENTS — STRUCTURE FIDELITY (critical):
   (1) If the page is a table of contents (e.g. "목차", "목 차", "Contents", dotted leader lines, right-aligned page numbers), preserve the page as TOC structure.
@@ -1436,9 +1583,9 @@ Your task is to convert the provided document text (and layout image if availabl
   (3) Section/group labels on a TOC page that do NOT have their own visible page number (e.g. "I. 시스템 개요 및 사용자 등록") are headings, not toc_entry. Do NOT copy a child row's page number onto a parent/group label.
   (4) Keep every visible TOC title and page number, including lower-page entries near the bottom. Never summarize the TOC.
 - TABLES — STRUCTURE FIDELITY (critical):
-  (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right), or are STACKED TOP/BOTTOM with a separate border/gap and different column structures, output EACH as its OWN separate <table> element. NEVER merge separate grids into one <table>.
+  (1) ONE <table> = exactly ONE continuous bordered grid. If two or more grids sit SIDE BY SIDE (left/right), or are STACKED TOP/BOTTOM with a separate border/gap and different column structures, output EACH as its OWN separate <table> element. A single outer grid with repeated side-by-side header groups remains one full-width table. In either case, NEVER flatten side-by-side groups by stacking them vertically into one narrow table.
   (2) Count the column count ONCE from the vertical border lines; EVERY <tr> must sum (counting colspan) to exactly that count — pad missing cells with <td></td>, never invent or drop columns.
-  (3) NO column-bleed: assign each printed value to EXACTLY ONE cell (the column whose borders bracket it). Two horizontally-adjacent <td> in a row MUST NOT contain identical text unless it is genuinely printed twice. An empty cell is <td></td> — never fill it by copying the neighbour.
+  (3) NO cell-boundary bleed: assign each printed value to EXACTLY ONE cell (the row and column whose borders bracket it). Two adjacent cells MUST NOT contain copied text unless it is genuinely printed twice. In particular, never append the next row's label to the preceding row's final cell. An empty cell is <td></td> — never fill it by copying a neighbour.
   (4) MERGED cells: a cell that visually spans N columns → colspan="N"; spanning N rows → rowspan="N". Reproduce multi-row headers exactly with colspan/rowspan; do not flatten or duplicate the spanned text into each cell.
   (5) NESTED table (a table inside a cell): keep it as a nested <table> INSIDE that <td>; do not splice its rows into the outer table.
   (6) HEADER WIDTH = BODY WIDTH: the header row's cells (counting colspan) MUST sum to the SAME column count as the body rows. When the body's left side is split into sub-columns by a rowspan category — e.g. body rows are [category | sub-item | content] (3 columns) where "category" spans several rows — the header label above must carry colspan to cover ALL the columns it sits over. Example: body is 3 columns [위험요인 | 세부요인 | 심사내용] → header MUST be <tr><td colspan="2">위험요인</td><td>심사내용</td></tr>, NEVER a 2-cell header over a 3-column body. A header narrower than the body is WRONG.
@@ -3194,6 +3341,18 @@ class DocumentProcessor:
                     _SUBSTR_DROPPABLE = {"text", "footnote"}
                     elems = [e for e in parsed.get("elements", []) if isinstance(e, dict)]
                     elems = _resolve_flattened_table_duplicates(elems)
+                    try:
+                        with open(
+                            os.path.join(doc_output_dir, f"{stem}.txt"),
+                            "r",
+                            encoding="utf-8",
+                        ) as text_layer_file:
+                            source_text_layer = text_layer_file.read()
+                    except OSError:
+                        source_text_layer = ""
+                    elems = _dedupe_figures_supported_by_text_layer(
+                        elems, source_text_layer
+                    )
                     norm = [re.sub(r"\s+", " ", (e.get("content") or "")).strip() for e in elems]
                     drop = [False] * len(elems)
                     for i in range(len(elems)):

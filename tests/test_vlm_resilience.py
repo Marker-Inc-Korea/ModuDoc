@@ -135,6 +135,135 @@ class VLMResilienceTests(unittest.TestCase):
             utils._drop_trailing_duplicate_heading_cluster(elements), elements
         )
 
+    def test_duplicate_figure_uses_text_layer_occurrence_count(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary",
+            "description": "A summary panel containing the regional values.",
+        }
+        elements = [figure, figure.copy()]
+        text_layer = (
+            "Regional summary Regional performance indicator "
+            "Current reporting value"
+        )
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, [figure])
+
+    def test_duplicate_figure_is_kept_after_its_matching_heading(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary procedure",
+            "description": "A summary panel containing the regional values.",
+        }
+        heading = {"type": "heading_2", "content": "B. Regional summary"}
+        text_layer = "B. Regional summary Regional performance indicator"
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            [figure, heading, figure.copy()], text_layer
+        )
+
+        self.assertEqual(cleaned, [heading, figure])
+
+    def test_visibly_repeated_figure_is_preserved_when_text_repeats(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary",
+            "description": "A summary panel containing the regional values.",
+        }
+        one_copy = (
+            "Regional summary Regional performance indicator "
+            "Current reporting value "
+        )
+        elements = [figure, figure.copy()]
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            elements, one_copy + one_copy
+        )
+
+        self.assertEqual(cleaned, elements)
+
+    def test_nonlocal_identical_figures_are_not_deduplicated(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary",
+            "description": "A summary panel containing the regional values.",
+        }
+        elements = [
+            figure,
+            {"type": "text", "content": "Independent discussion between figures."},
+            figure.copy(),
+        ]
+        text_layer = "Regional summary Regional performance indicator"
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, elements)
+
+    def test_figures_across_an_unrelated_heading_are_preserved(self):
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>Regional performance indicator</td>"
+                "<td>Current reporting value</td></tr></table>"
+            ),
+            "caption": "Regional summary",
+            "description": "A summary panel containing the regional values.",
+        }
+        elements = [
+            figure,
+            {"type": "heading_2", "content": "Independent appendix"},
+            figure.copy(),
+        ]
+        text_layer = "Regional summary Regional performance indicator"
+
+        cleaned = utils._dedupe_figures_supported_by_text_layer(
+            elements, text_layer
+        )
+
+        self.assertEqual(cleaned, elements)
+
+    def test_matching_attached_page_counter_is_removed_from_edge_heading(self):
+        elements = [
+            {"type": "heading_1", "content": "Appendix transaction report - 1 8 -"},
+            {"type": "text", "content": "Body content"},
+        ]
+
+        cleaned = utils._drop_page_artifact_elements(elements, page_no=18)
+
+        self.assertEqual(cleaned[0]["content"], "Appendix transaction report")
+
+    def test_nonmatching_numeric_title_suffix_is_preserved(self):
+        elements = [
+            {"type": "heading_1", "content": "Planning cycle - 2025 -"},
+            {"type": "text", "content": "Body content"},
+        ]
+
+        cleaned = utils._drop_page_artifact_elements(elements, page_no=18)
+
+        self.assertEqual(cleaned, elements)
+
     def test_excessive_stream_uses_semantic_source_ratio(self):
         with (
             patch.object(utils, "VLM_STREAM_ABORT_INPUT_MIN_CHARS", 10),

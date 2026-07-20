@@ -185,6 +185,190 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIsNone(corrected)
         self.assertIn("colspan='3'", candidate["elements"][0]["content"])
 
+    def test_borderless_formula_definitions_are_demoted_losslessly(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>x<sub>i</sub>: item index</td><td>D<sub>i</sub>: item value</td></tr>"
+                        "<tr><td>T</td><td>: total</td><td>t<sub>j</sub></td><td>: event date</td></tr>"
+                        "<tr><td>P<sub>j</sub></td><td>: event amount</td></tr></table>"
+                    ),
+                    "caption": "Formula definitions",
+                }
+            ],
+        }
+        image = Image.new("RGB", (600, 400), "white")
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "formula.png"
+            image.save(image_path)
+            demoted, records = (
+                table_quality_repair._demote_borderless_definition_tables(
+                    image_path, original
+                )
+            )
+            validated, validated_records, metrics = (
+                table_quality_repair._validated_borderless_definition_demotion(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(demoted)
+        self.assertEqual(records, [{"index": 0, "rows": 3}])
+        self.assertEqual(demoted["elements"][0]["type"], "text")
+        self.assertEqual(
+            table_quality_repair._page_visible_text(original),
+            table_quality_repair._page_visible_text(demoted),
+        )
+        self.assertEqual(table_quality_repair._problem_tables(demoted), [])
+        self.assertEqual(validated, demoted | {"quality_repair": True})
+        self.assertEqual(validated_records, records)
+        self.assertEqual(metrics["old_problem_tables"], 1)
+        self.assertEqual(metrics["new_problem_tables"], 0)
+
+    def test_cross_row_label_bleed_is_sent_for_image_review(self):
+        html = (
+            "<table><tr><td>Category</td><td>Detail</td><td>Action</td></tr>"
+            "<tr><td>First area</td><td>Initial risk</td>"
+            "<td>A sufficiently long mitigation description ending Next area risk</td></tr>"
+            "<tr><td>Next area</td><td>Secondary risk</td><td>Separate action</td></tr>"
+            "</table>"
+        )
+
+        quality = table_validate.assess_table_quality(html)
+        problems = table_quality_repair._problem_tables(
+            {"elements": [{"type": "table", "content": html}]}
+        )
+
+        self.assertIn("possible_cross_row_bleed", quality["issues"])
+        self.assertGreaterEqual(quality["confidence"], 0.75)
+        self.assertEqual(problems[0]["issues"], ["possible_cross_row_bleed"])
+
+    def test_non_trailing_category_mention_is_not_a_bleed_signal(self):
+        html = (
+            "<table><tr><td>Category</td><td>Detail</td><td>Action</td></tr>"
+            "<tr><td>First area</td><td>Initial risk</td>"
+            "<td>Next area is discussed here, followed by a long independent conclusion</td></tr>"
+            "<tr><td>Next area</td><td>Secondary risk</td><td>Separate action</td></tr>"
+            "</table>"
+        )
+
+        quality = table_validate.assess_table_quality(html)
+
+        self.assertNotIn("possible_cross_row_bleed", quality["issues"])
+
+    def test_native_slice_uses_order_to_disambiguate_repeated_row_labels(self):
+        native = (
+            "<table><tr><th>Label</th><th>Value</th></tr>"
+            "<tr><td>Repeated category</td><td>Early value</td></tr>"
+            "<tr><td>Earlier section</td><td>Earlier detail</td></tr>"
+            "<tr><td>Later first</td><td>One</td></tr>"
+            "<tr><td>Later second</td><td>Two</td></tr>"
+            "<tr><td>Repeated category</td><td>Later value</td></tr>"
+            "<tr><td>Later third</td><td>Three</td></tr>"
+            "<tr><td>Shared period</td><td></td></tr>"
+            "<tr><td>Omitted middle row</td><td>Must survive</td></tr>"
+            "<tr><td>Later fourth</td><td>Four</td></tr></table>"
+        )
+        page_fragment = (
+            "<table><tr><th>Label</th><th>Value</th></tr>"
+            "<tr><td></td><td>Leading continuation text</td></tr>"
+            "<tr><td>Later first</td><td>One</td></tr>"
+            "<tr><td>Later second</td><td>Two</td></tr>"
+            "<tr><td>Repeated category</td><td>Later value</td></tr>"
+            "<tr><td>Later third</td><td>Three</td></tr>"
+            "<tr><td>Shared period</td><td></td></tr>"
+            "<tr><td>Later fourth</td><td>Four</td></tr></table>"
+        )
+
+        sliced = table_validate._slice_native(native, page_fragment)
+
+        self.assertIsNotNone(sliced)
+        self.assertNotIn("Early value", sliced)
+        self.assertEqual(sliced.count("Repeated category"), 1)
+        self.assertIn("Omitted middle row", sliced)
+        self.assertIn("Leading continuation text", sliced)
+        self.assertLess(sliced.index("Later first"), sliced.index("Later fourth"))
+
+    def test_native_slice_rejects_an_ambiguous_single_repeated_anchor(self):
+        native = (
+            "<table><tr><th>Label</th><th>Value</th></tr>"
+            "<tr><td>Repeated category</td><td>Early</td></tr>"
+            "<tr><td>Middle category</td><td>Middle</td></tr>"
+            "<tr><td>Repeated category</td><td>Late</td></tr></table>"
+        )
+        fragment = (
+            "<table><tr><th>Label</th><th>Value</th></tr>"
+            "<tr><td>Repeated category</td><td>Observed</td></tr></table>"
+        )
+
+        self.assertIsNone(table_validate._slice_native(native, fragment))
+
+    def test_formula_demote_is_blocked_when_a_grid_is_visible(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>x<sub>i</sub>: item index</td><td>D<sub>i</sub>: item value</td></tr>"
+                        "<tr><td>T</td><td>: total</td><td>t<sub>j</sub></td><td>: event date</td></tr>"
+                        "<tr><td>P<sub>j</sub></td><td>: event amount</td></tr></table>"
+                    ),
+                }
+            ],
+        }
+        image = Image.new("RGB", (600, 400), "white")
+        draw = ImageDraw.Draw(image)
+        for y in (50, 150, 250, 350):
+            draw.line((50, y, 550, y), fill="black", width=3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            image.save(image_path)
+            demoted, records = (
+                table_quality_repair._demote_borderless_definition_tables(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(demoted)
+        self.assertEqual(records, [])
+
+    def test_formula_demote_is_blocked_by_vertical_only_grid_borders(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table><tr><td>x<sub>i</sub>: item index</td><td>D<sub>i</sub>: item value</td></tr>"
+                        "<tr><td>T</td><td>: total</td><td>t<sub>j</sub></td><td>: event date</td></tr>"
+                        "<tr><td>P<sub>j</sub></td><td>: event amount</td></tr></table>"
+                    ),
+                }
+            ],
+        }
+        image = Image.new("RGB", (600, 400), "white")
+        draw = ImageDraw.Draw(image)
+        for x in (100, 300, 500):
+            draw.line((x, 50, x, 350), fill="black", width=3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "vertical-grid.png"
+            image.save(image_path)
+            demoted, records = (
+                table_quality_repair._demote_borderless_definition_tables(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(demoted)
+        self.assertEqual(records, [])
+
     def test_blank_column_does_not_split_a_continuous_score_matrix(self):
         html = (
             "<table>"

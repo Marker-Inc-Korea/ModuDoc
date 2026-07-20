@@ -3,6 +3,8 @@
 임베디드 이미지를 확대해 VLM 으로 표를 다시 추출하고, VLM 심판이 원본보다 낫다고
 판정할 때만 해당 표 요소를 교체한다. 원본 셀 손실이 임계를 넘으면 교체하지 않는다."""
 import os, io, re, json, glob, base64, time
+from collections import Counter
+from difflib import SequenceMatcher
 
 ZOOM_RASTER_TABLES = os.environ.get("ZOOM_RASTER_TABLES", "1") == "1"
 ZOOM_MIN_INCH = float(os.environ.get("ZOOM_MIN_INCH", "3.0"))
@@ -10,7 +12,9 @@ ZOOM_MIN_WHITE = float(os.environ.get("ZOOM_MIN_WHITE", "0.4"))
 ZOOM_UPSCALE = float(os.environ.get("ZOOM_UPSCALE", "2.0"))
 ZOOM_MAXW = int(os.environ.get("ZOOM_MAXW", "2400"))
 ZOOM_OVERLAP = float(os.environ.get("ZOOM_OVERLAP", "0.55"))
-ZOOM_MAX_LOSS = float(os.environ.get("ZOOM_MAX_LOSS", "0.10"))
+ZOOM_MIN_TEXT_SIMILARITY = min(
+    1.0, max(0.98, float(os.environ.get("ZOOM_MIN_TEXT_SIMILARITY", "0.995")))
+)
 ZOOM_JUDGES = int(os.environ.get("ZOOM_JUDGES", "5"))
 ZOOM_WIN_FRAC = float(os.environ.get("ZOOM_WIN_FRAC", "0.8"))
 ZOOM_VLM_TIMEOUT = int(os.environ.get("ZOOM_VLM_TIMEOUT", "180"))
@@ -53,8 +57,123 @@ def _cellset(html):
     return {_ncell(c.get_text(" ", strip=True)) for c in soup.find_all(["td", "th"]) if c.get_text(strip=True)}
 
 
+def _ordered_cell_text(html):
+    """Return normalized cell text in document order, retaining repetitions."""
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return ""
+    return "".join(
+        value
+        for cell in soup.find_all(["td", "th"])
+        if (value := _ncell(cell.get_text(" ", strip=True)))
+    )
+
+
+def _table_text_preserved(original_html, candidate_html, threshold=None):
+    """Require repeated values and their reading order to remain lossless."""
+    if threshold is None:
+        threshold = ZOOM_MIN_TEXT_SIMILARITY
+    original = _ordered_cell_text(original_html)
+    candidate = _ordered_cell_text(candidate_html)
+    if not original or not candidate:
+        return False
+    shared = sum((Counter(original) & Counter(candidate)).values())
+    recall = shared / len(original)
+    precision = shared / len(candidate)
+    sequence = SequenceMatcher(
+        None, original, candidate, autojunk=False
+    ).ratio()
+    return recall >= threshold and precision >= threshold and sequence >= threshold
+
+
+def _lossless_table_assignment(elements, original_indices, candidates):
+    """Match every source table to one text-preserving candidate table."""
+    if not original_indices or len(original_indices) != len(candidates):
+        return None
+    options = {}
+    for original_index in original_indices:
+        original_html = elements[original_index].get("content", "")
+        options[original_index] = [
+            candidate_index
+            for candidate_index, candidate in enumerate(candidates)
+            if _rect_ok(candidate.get("content", ""))
+            and _table_text_preserved(
+                original_html, candidate.get("content", "")
+            )
+        ]
+        if not options[original_index]:
+            return None
+
+    ordered = sorted(original_indices, key=lambda index: len(options[index]))
+    assigned = {}
+    used = set()
+
+    def match(position):
+        if position == len(ordered):
+            return True
+        original_index = ordered[position]
+        for candidate_index in options[original_index]:
+            if candidate_index in used:
+                continue
+            assigned[original_index] = candidate_index
+            used.add(candidate_index)
+            if match(position + 1):
+                return True
+            used.remove(candidate_index)
+            assigned.pop(original_index, None)
+        return False
+
+    return dict(assigned) if match(0) else None
+
+
 def _overlap(a, b):
     return len(a & b) / len(a) if a else 0.0
+
+
+def _select_unique_table_page(pdata, pages, zoom_cell_set, candidates):
+    """Return one lossless source-page match, or None when location is ambiguous."""
+    matches = []
+    for page_path in pages:
+        data = pdata.get(page_path)
+        if not data:
+            continue
+        elements = data.get("elements", [])
+        original_indices = [
+            index
+            for index, element in enumerate(elements)
+            if element.get("type") == "table"
+            and _overlap(
+                _cellset(element.get("content", "")), zoom_cell_set
+            )
+            >= ZOOM_OVERLAP
+        ]
+        if not original_indices:
+            continue
+        assignment = _lossless_table_assignment(
+            elements, original_indices, candidates
+        )
+        if assignment is None:
+            continue
+        original_cells = set()
+        for index in original_indices:
+            original_cells |= _cellset(elements[index].get("content", ""))
+        coverage = _overlap(original_cells, zoom_cell_set)
+        matches.append(
+            (coverage, page_path, original_indices, assignment)
+        )
+    if not matches:
+        return None
+    best_coverage = max(item[0] for item in matches)
+    winners = [
+        item for item in matches if abs(item[0] - best_coverage) <= 1e-9
+    ]
+    if len(winners) != 1:
+        return None
+    coverage, page_path, original_indices, assignment = winners[0]
+    return page_path, original_indices, assignment, coverage
 
 
 def _white_frac(im):
@@ -76,7 +195,7 @@ def _rect_ok(html):
         _g, rw, _R, _C = tv._build_grid(tv._rows_of(t))
         return len(set(rw)) <= 1
     except Exception:
-        return True
+        return False
 
 
 def _client(api_key):
@@ -248,56 +367,36 @@ def zoom_raster_tables(doc_output_dir, source_path, api_key, model_name):
         if len(zset) < 4:
             continue
 
-        # 원본 표 매칭: 모든 페이지에서 zoom 셀과 겹치는 표 element 를 찾아 커버리지 최대 페이지 선택
-        best = None
-        for pj in pages:
-            d = pdata[pj]
-            if not d:
-                continue
-            els = d.get("elements", [])
-            match = [i for i, e in enumerate(els)
-                     if e.get("type") == "table" and _overlap(_cellset(e.get("content", "")), zset) >= ZOOM_OVERLAP]
-            if not match:
-                continue
-            oset = set()
-            for i in match:
-                oset |= _cellset(els[i].get("content", ""))
-            cov = _overlap(oset, zset)
-            if best is None or cov > best[3]:
-                best = (pj, match, oset, cov)
-        if best is None:
+        selected = _select_unique_table_page(pdata, pages, zset, ztabs)
+        if selected is None:
             continue
-        pj, match, oset, cov = best
+        pj, match, assignment, _coverage = selected
 
-        # 무손실 안전망: 원본 셀 대부분이 zoom 출력에 존재해야(심판 무관, 항상 강제)
-        lost = [c for c in oset if c not in zset and len(c) > 1]
-        if len(lost) > max(1, len(oset) * ZOOM_MAX_LOSS):
-            continue
         els = pdata[pj]["elements"]
+        # Keep candidate order aligned with source-table order for both the
+        # judge and in-place replacement. This preserves intervening headings
+        # and prevents one large candidate from absorbing neighboring tables.
+        ordered_zoom = [ztabs[assignment[index]] for index in match]
         # VLM 심판: 이미지 대비 원본구조 vs zoom구조 — zoom 이 다수결로 명확히 나을 때만 교체
         orig_html = "\n".join(els[i].get("content", "") for i in match)
-        zoom_html = "\n".join(z.get("content", "") for z in ztabs)
+        zoom_html = "\n".join(z.get("content", "") for z in ordered_zoom)
         if not _judge_zoom_wins(client, model_name, f["data"], orig_html, zoom_html):
             continue
 
-        # 교체: 매칭 표 element 제거, 첫 매칭 위치에 zoom 표 삽입(캡션은 원본 제목 우선)
-        mset = set(match); pos = min(match)
-        newz = []
-        for z in ztabs:
-            zc = _cellset(z.get("content", ""))
-            bi = max(match, key=lambda i: _overlap(_cellset(els[i].get("content", "")), zc), default=None)
-            cap = (els[bi].get("caption", "") if bi is not None else "") or z.get("caption", "")
-            newz.append({
+        # Replace one-for-one in place so non-table elements retain their order.
+        rebuilt = list(els)
+        for original_index in match:
+            z = ztabs[assignment[original_index]]
+            cap = els[original_index].get("caption", "") or z.get("caption", "")
+            rebuilt[original_index] = {
                 "type": "table",
                 "content": z.get("content", ""),
                 "caption": cap,
                 "_zoom": True,
                 "_source": "zoom_table",
                 "_confidence": 0.88,
-            })
-        pdata[pj]["elements"] = ([e for i, e in enumerate(els) if i < pos and i not in mset]
-                                 + newz
-                                 + [e for i, e in enumerate(els) if i > pos and i not in mset])
+            }
+        pdata[pj]["elements"] = rebuilt
         json.dump(pdata[pj], open(pj, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
-        replaced += len(newz)
+        replaced += len(match)
     return replaced

@@ -3,6 +3,7 @@
 import re
 import statistics
 from difflib import SequenceMatcher
+from functools import lru_cache
 from html import escape
 from bs4 import BeautifulSoup
 
@@ -96,6 +97,40 @@ def _has_colspan_crossing(grid, seam):
 
 def _direct_cells(row):
     return row.find_all(["td", "th"], recursive=False)
+
+
+def _has_possible_cross_row_bleed(rows):
+    """Detect a row label repeated near the end of the preceding row's last cell.
+
+    This is only a review signal. It does not alter table text because a repeated
+    label can be legitimate; the image-backed quality pass decides whether a
+    cell boundary actually needs correction.
+    """
+    for previous, current in zip(rows, rows[1:]):
+        previous_cells = _direct_cells(previous)
+        current_cells = _direct_cells(current)
+        if (
+            len(previous_cells) < 2
+            or len(previous_cells) != len(current_cells)
+        ):
+            continue
+        previous_tail = _norm(
+            previous_cells[-1].get_text(" ", strip=True)
+        ).casefold()
+        current_label = _norm(
+            current_cells[0].get_text(" ", strip=True)
+        ).casefold()
+        if (
+            not (3 <= len(current_label) <= 40)
+            or sum(char.isalpha() for char in current_label) < 2
+            or len(previous_tail) < len(current_label) + 8
+        ):
+            continue
+        position = previous_tail.rfind(current_label)
+        chars_after = len(previous_tail) - position - len(current_label)
+        if position >= 0 and chars_after <= 8:
+            return True
+    return False
 
 
 def _span_int(cell, attr, default=1):
@@ -315,6 +350,8 @@ def assess_table_quality(html, caption=None, allow_nested=False):
         if table.find("th") is not None:
             out["issues"].append("th_tags_present")
             out["confidence"] = min(out["confidence"], 0.90)
+        if _has_possible_cross_row_bleed(rows):
+            out["issues"].append("possible_cross_row_bleed")
 
         return out
     except Exception:
@@ -371,26 +408,86 @@ def _rspan(cell):
         return 1
 
 def _slice_native(native_html, vlm_html):
-    """VLM 조각 본문 첫 셀 키에 해당하는 네이티브 본문행(+rowspan 연속행) + 네이티브 헤더."""
+    """Align a page fragment to one contiguous, ordered native-table slice."""
     nh, nb = _split_header_body(native_html)
     _vh, vb = _split_header_body(vlm_html)
-    vkeys = {_row_key(tr) for tr in vb if _row_key(tr)}
-    if not vkeys:
+    keyed_vlm_rows = [
+        (index, key)
+        for index, tr in enumerate(vb)
+        if (key := _row_key(tr))
+    ]
+    native_keys = [_row_key(tr) for tr in nb]
+    if not keyed_vlm_rows or not native_keys:
         return None
-    keep_idx = set()
-    for i, tr in enumerate(nb):
-        if _row_key(tr) in vkeys:
-            keep_idx.add(i)
-            span = max((_rspan(c) for c in tr.find_all(["td", "th"], recursive=False)), default=1)
-            for j in range(i + 1, min(i + span, len(nb))):   # rowspan 그룹 연속행 동반(dangling rowspan 방지)
-                cells_j = nb[j].find_all(["td", "th"], recursive=False)
-                if cells_j and _rspan(cells_j[0]) > 1:       # 다음 그룹 앵커 → 과다 rowspan 확장 중단
-                    break
-                keep_idx.add(j)
-    keep = [tr for i, tr in enumerate(nb) if i in keep_idx]
-    if len(keep) < max(2, len(vb) // 2):     # 키 매칭 빈약 시 포기
+
+    vlm_keys = [key for _, key in keyed_vlm_rows]
+
+    def mapping_score(pairs):
+        if not pairs:
+            return (0, 0, 0)
+        native_indices = [pair[1] for pair in pairs]
+        span = native_indices[-1] - native_indices[0] + 1
+        return (len(pairs), -(span - len(pairs)), -span)
+
+    @lru_cache(maxsize=None)
+    def align(vlm_index, native_index):
+        if vlm_index >= len(vlm_keys) or native_index >= len(native_keys):
+            return ()
+        options = [
+            align(vlm_index + 1, native_index),
+            align(vlm_index, native_index + 1),
+        ]
+        if vlm_keys[vlm_index] == native_keys[native_index]:
+            options.append(
+                ((vlm_index, native_index),)
+                + align(vlm_index + 1, native_index + 1)
+            )
+        return max(options, key=mapping_score)
+
+    matches = align(0, 0)
+    minimum_matches = max(2, (len(vlm_keys) + 1) // 2)
+    if len(matches) < minimum_matches:
         return None
-    return "<table>" + "".join(str(tr) for tr in nh) + "".join(str(tr) for tr in keep) + "</table>"
+    native_start = matches[0][1]
+    native_end = matches[-1][1]
+    native_span = native_end - native_start + 1
+    if native_span > max(len(matches) + 2, int(len(matches) * 1.5)):
+        return None
+
+    # Keep complete rowspan groups and every row between the first and last
+    # ordered anchor. Missing an interior VLM row must not drop native content.
+    keep_idx = set(range(native_start, native_end + 1))
+    cursor = 0
+    for group in _rowspan_groups(nb):
+        group_indices = set(range(cursor, cursor + len(group)))
+        if group_indices & keep_idx:
+            keep_idx.update(group_indices)
+        cursor += len(group)
+    keep = [tr for index, tr in enumerate(nb) if index in keep_idx]
+
+    matched_vlm_positions = [keyed_vlm_rows[index][0] for index, _ in matches]
+    first_vlm = min(matched_vlm_positions)
+    last_vlm = max(matched_vlm_positions)
+    native_text = _ncell(" ".join(tr.get_text(" ", strip=True) for tr in keep))
+
+    def boundary_rows(rows):
+        retained = []
+        for row in rows:
+            row_text = _ncell(row.get_text(" ", strip=True))
+            if row_text and not _row_key(row) and row_text not in native_text:
+                retained.append(row)
+        return retained
+
+    leading = boundary_rows(vb[:first_vlm])
+    trailing = boundary_rows(vb[last_vlm + 1 :])
+    return (
+        "<table>"
+        + "".join(str(tr) for tr in nh)
+        + "".join(str(tr) for tr in leading)
+        + "".join(str(tr) for tr in keep)
+        + "".join(str(tr) for tr in trailing)
+        + "</table>"
+    )
 
 def _cell_own_text(cell):
     """셀의 텍스트(중첩 <table> 내용 제외) 정규화."""

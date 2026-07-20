@@ -35,6 +35,8 @@ Return ONLY valid JSON with this schema:
   "structure_evidence": ["specific image-vs-candidate fact, e.g. image has 6 columns but candidate has 5"],
   "reason": "short reason"
 }
+Keep every evidence list to at most four decisive items and the reason to one
+sentence. Do not exhaustively enumerate matching text.
 
 Pass only if important visible text and document structure are preserved.
 Fail for missing headings, missing list/table rows, wrong TOC page numbers,
@@ -49,9 +51,23 @@ Also ignore colors, borders, font size/weight, centering, exact coordinates,
 and whether visible content is represented as text versus a figure body. The
 schema does not encode visual styling. Judge reading order and semantic
 structure, not visual presentation.
+Do not fail because a visible heading, formula, numbered item, or footnote is
+stored in a text element when its content and sequence are preserved. A table
+caption is metadata, not a sequenced element, so it cannot be "above" or
+"below" a table in the candidate.
+For continuous multi-column prose, the expected structured order is the full
+left column top-to-bottom followed by the next column. A heading at the top of
+the right column can continue a numbered section from the bottom of the left
+column; infer hierarchy from numbering and typography, not vertical position
+alone. Numbered section markers take priority: an unnumbered heading between
+two numbered sections can remain a subsection of the earlier numbered section
+even when it begins the next column. For bounded peer cards or tiles, use row
+order left-to-right and keep each card's title and bullets together.
 For tables, exact HTML tags may differ, but cells/rows/headers and merged-cell
-meaning must be preserved. For figures/screenshots/charts, visible labels/data
-and a reasonable description must be present.
+meaning must be preserved. Before claiming that the candidate split or merged
+tables, count its actual top-level table elements and <table> tags and cite the
+relevant element index. For figures/screenshots/charts, visible labels/data and
+a reasonable description must be present.
 
 Evidence is mandatory for a failure:
 - Every wrong_text claim needs an image_text/candidate_text pair. Never cite
@@ -85,6 +101,8 @@ Return ONLY valid JSON:
   "rejected_claims": ["short explanation"],
   "reason": "short final reason"
 }
+Keep every evidence list to at most four decisive items and the reason to one
+sentence. Do not copy all matching candidate text into text_mismatches.
 
 Confirm a category only when you independently observe a material error and
 can fill its corresponding evidence field. Reject claims based only on color,
@@ -93,6 +111,16 @@ coordinates, heading-vs-caption choice, or text-vs-figure element type. Text is
 not missing if it appears anywhere in the candidate. For order claims, read the
 actual candidate element sequence and compare it with the image.
 For table claims, verify visible row/column/merged-cell meaning, not HTML style.
+Count the candidate's actual top-level table elements and <table> tags before
+confirming any split/merge claim. Treat caption as metadata with no above/below
+position. Do not confirm a failure merely because a heading, formula, numbered
+item, or footnote is represented by a text element.
+For continuous multi-column prose, expect the full left column before the next
+column and derive heading hierarchy from numbering and typography. An
+unnumbered heading between two numbered sections can belong to the earlier
+section even at the top of the next column. For bounded peer cards or tiles,
+expect row order left-to-right and verify that each card's body remains attached
+to its own title.
 Whitespace and punctuation-style variants are not wrong_text. Page counters,
 repeated headers, and repeated footers are not missing_text.
 When evidence is ambiguous, set confirmed_failure=false rather than guessing."""
@@ -188,9 +216,18 @@ def looks_like_page_artifact(text: object) -> bool:
     )
 
 
+def strip_page_artifact_suffix(text: object) -> str:
+    """Remove a delimiter-wrapped printed page counter from a longer block."""
+    value = str(text or "").strip()
+    stripped = re.sub(
+        r"\s*[-–—]\s*(?:\d\s*){1,4}[-–—]\s*$", "", value
+    ).strip()
+    return stripped if stripped else value
+
+
 def looks_like_page_artifact_evidence(text: object) -> bool:
     value = str(text or "").casefold()
-    return any(
+    if any(
         marker in value
         for marker in (
             "page number",
@@ -201,7 +238,130 @@ def looks_like_page_artifact_evidence(text: object) -> bool:
             "쪽 번호",
             "인쇄 번호",
         )
+    ):
+        return True
+    return bool(re.search(r"[-–—]\s*(?:\d\s*){1,4}[-–—]", value))
+
+
+def looks_cosmetic_only(text: object) -> bool:
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    cosmetic = any(
+        marker in value
+        for marker in (
+            "minor formatting",
+            "formatting error",
+            "spacing",
+            "whitespace",
+            "extra space",
+            "font",
+            "color",
+            "alignment",
+            "cosmetic",
+            "사소한 서식",
+            "공백",
+            "띄어쓰기",
+            "글꼴",
+            "색상",
+            "정렬",
+        )
     )
+    cosmetic_only_qualifier = any(
+        marker in value
+        for marker in (
+            "minor",
+            "only formatting",
+            "formatting only",
+            "only a formatting",
+            "no content is wrong",
+            "no textual content is wrong",
+            "cosmetic only",
+            "merely cosmetic",
+            "사소",
+            "서식만",
+            "내용은 정확",
+            "텍스트는 정확",
+        )
+    )
+    material = any(
+        marker in value
+        for marker in (
+            "missing row",
+            "missing column",
+            "extra row",
+            "extra column",
+            "fewer rows",
+            "fewer columns",
+            "more rows",
+            "more columns",
+            "wrong column",
+            "wrong row",
+            "wrong header",
+            "under the wrong header",
+            "shifted value",
+            "cell boundary",
+            "different column layout",
+            "merged cell",
+            "split table",
+            "separate table",
+            "rowspan",
+            "colspan",
+            "누락된 행",
+            "누락된 열",
+            "추가 행",
+            "추가 열",
+            "잘못된 열",
+            "잘못된 행",
+            "잘못된 머리글",
+            "셀 경계",
+            "병합 셀",
+            "표 분리",
+        )
+    )
+    return cosmetic and cosmetic_only_qualifier and not material
+
+
+def looks_schema_representation_only(text: object) -> bool:
+    """Reject claims about JSON element choice rather than semantic structure."""
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    if "caption" in value and any(
+        marker in value
+        for marker in ("above", "below", "before", "after", "position", "placed")
+    ):
+        return True
+    representation = any(
+        marker in value
+        for marker in (
+            "as a text element",
+            "as text element",
+            "as plain text",
+            "as regular text",
+            "represented as text",
+            "listed as text",
+            "listed as a regular text",
+            "header-like text",
+            "split into multiple text elements",
+            "separate text block",
+            "standalone line item",
+            "텍스트 요소로",
+            "일반 텍스트로",
+            "캡션 위치",
+        )
+    )
+    material_association = any(
+        marker in value
+        for marker in (
+            "grouped under",
+            "attached to the wrong",
+            "wrong row",
+            "wrong column",
+            "candidate sequence",
+            "image order",
+            "행에 잘못",
+            "열에 잘못",
+            "잘못 묶",
+        )
+    )
+    return representation and not material_association
 
 
 def structured_plain_text(path: str) -> str:
@@ -252,8 +412,14 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
     structure_evidence = [
         str(item).strip()
         for item in (verdict.get("structure_evidence") or [])
-        if str(item).strip() and not looks_like_page_artifact_evidence(item)
+        if str(item).strip()
+        and not looks_like_page_artifact_evidence(item)
+        and not looks_schema_representation_only(item)
     ]
+    if structure_evidence and looks_cosmetic_only(
+        " ".join(structure_evidence) + " " + str(verdict.get("reason") or "")
+    ):
+        structure_evidence = []
     nstruct = norm_text(structured_text)
     missing = [
         item for item in missing
@@ -267,8 +433,8 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
             continue
         image_text = str(item.get("image_text") or "").strip()
         candidate_text = str(item.get("candidate_text") or "").strip()
-        nimage = norm_text(image_text)
-        ncandidate = norm_text(candidate_text)
+        nimage = norm_text(strip_page_artifact_suffix(image_text))
+        ncandidate = norm_text(strip_page_artifact_suffix(candidate_text))
         if (
             nimage
             and ncandidate
@@ -287,6 +453,7 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
         if norm_text(item)
         and norm_text(item) in nstruct
         and not looks_like_page_artifact(item)
+        and strip_page_artifact_suffix(item) == str(item or "").strip()
     ]
     if not missing:
         issues = [item for item in issues if item != "missing_text"]
@@ -347,8 +514,8 @@ def validated_review_issue_types(review: dict, structured_text: str = "") -> lis
             continue
         image_text = str(item.get("image_text") or "").strip()
         candidate_text = str(item.get("candidate_text") or "").strip()
-        nimage = norm_text(image_text)
-        ncandidate = norm_text(candidate_text)
+        nimage = norm_text(strip_page_artifact_suffix(image_text))
+        ncandidate = norm_text(strip_page_artifact_suffix(candidate_text))
         if (
             nimage
             and ncandidate
@@ -367,6 +534,7 @@ def validated_review_issue_types(review: dict, structured_text: str = "") -> lis
         if norm_text(item)
         and norm_text(item) in nstruct
         and not looks_like_page_artifact(item)
+        and strip_page_artifact_suffix(item) == str(item or "").strip()
     ]
     if hallucinated:
         valid.add("hallucination")
@@ -374,8 +542,15 @@ def validated_review_issue_types(review: dict, structured_text: str = "") -> lis
     structure_evidence = [
         str(item).strip()
         for item in ((review or {}).get("structure_evidence") or [])
-        if str(item).strip() and not looks_like_page_artifact_evidence(item)
+        if str(item).strip()
+        and not looks_like_page_artifact_evidence(item)
+        and not looks_schema_representation_only(item)
     ]
+    review_reason = str((review or {}).get("reason") or "")
+    if structure_evidence and looks_cosmetic_only(
+        " ".join(structure_evidence) + " " + review_reason
+    ):
+        structure_evidence = []
     if structure_evidence:
         valid.update(
             item
@@ -447,7 +622,7 @@ def apply_failure_review(primary: dict, review: dict, structured_text: str = "")
 
 def review_failure(client, model: str, structured: str, primary: dict, b64: str,
                    args: argparse.Namespace) -> dict | None:
-    user = (
+    base_user = (
         "Structured JSON candidate:\n"
         "<structured_json>\n"
         f"{structured}\n"
@@ -460,6 +635,12 @@ def review_failure(client, model: str, structured: str, primary: dict, b64: str,
     )
     for attempt in range(args.retries + 1):
         try:
+            user = base_user
+            if attempt:
+                user += (
+                    "\n\nRetry requirement: return one compact JSON object only. "
+                    "Keep every evidence list to at most four items and the reason to one sentence."
+                )
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -473,7 +654,10 @@ def review_failure(client, model: str, structured: str, primary: dict, b64: str,
                     },
                 ],
                 temperature=0,
-                max_tokens=args.review_max_tokens,
+                max_tokens=(
+                    args.review_max_tokens
+                    if not attempt else max(args.review_max_tokens, 2048)
+                ),
                 timeout=args.review_timeout,
                 response_format={"type": "json_object"},
                 extra_body={"repetition_penalty": 1.08, "no_repeat_ngram_size": 16},
@@ -592,7 +776,7 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
         return result
 
     structured = compact_structured(item["structured"], args.structured_limit)
-    user = (
+    base_user = (
         "Structured JSON candidate:\n"
         "<structured_json>\n"
         f"{structured}\n"
@@ -603,6 +787,12 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
     last_error = None
     for attempt in range(args.retries + 1):
         try:
+            user = base_user
+            if attempt:
+                user += (
+                    "\n\nRetry requirement: return one compact JSON object only. "
+                    "Keep every evidence list to at most four items and the reason to one sentence."
+                )
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -616,14 +806,20 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
                     },
                 ],
                 temperature=0,
-                max_tokens=args.max_tokens,
+                max_tokens=(
+                    args.max_tokens if not attempt else max(args.max_tokens, 4096)
+                ),
                 timeout=args.timeout,
                 response_format={"type": "json_object"},
                 extra_body={"repetition_penalty": 1.08, "no_repeat_ngram_size": 16},
             )
             verdict = first_json_obj(resp.choices[0].message.content)
             if verdict is None:
-                raise ValueError("judge returned no parseable JSON object")
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
+                raise ValueError(
+                    "judge returned no parseable JSON object"
+                    + (f" (finish_reason={finish_reason})" if finish_reason else "")
+                )
             plain_text = structured_plain_text(item["structured"])
             verdict = stabilize_verdict(verdict, plain_text)
             primary = dict(verdict)
