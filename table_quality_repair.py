@@ -1526,6 +1526,390 @@ def _cell_has_contrasting_ink(image, left: int, right: int, top: int, bottom: in
     return contrasting >= max(16, int(len(values) * 0.0015)) and fraction < 0.40
 
 
+def _internal_horizontal_segments(
+    image, left: int, right: int, top: int, bottom: int
+) -> list[tuple[int, int, int, int]]:
+    """Find substantial short lines contained within one outer cell."""
+    left = max(0, left)
+    right = min(image.width, right)
+    top = max(0, top + 5)
+    bottom = min(image.height, bottom - 5)
+    if right - left < 20 or bottom - top < 20:
+        return []
+    pixels = image.load()
+    minimum = max(24, int((right - left) * 0.35))
+    lines = []
+    for y in range(top, bottom):
+        values = [pixels[x, y] for x in range(left, right)]
+        length, start, end = _longest_dark_run(values, threshold=160)
+        if length >= minimum:
+            lines.append((y, left + start, left + end, length))
+    return _group_adjacent_lines(lines)
+
+
+def _raster_outer_grid_shape(image, row_count: int, column_count: int) -> dict | None:
+    """Find one long-line outer grid with one full-width section row."""
+    if row_count < 3 or column_count < 2:
+        return None
+    lines = _horizontal_grid_lines(image)
+    if len(lines) < row_count + 1:
+        return None
+
+    endpoint_tolerance = max(8, int(image.width * 0.012))
+    endpoint_groups = []
+    for line in lines:
+        matches = []
+        for group_index, group in enumerate(endpoint_groups):
+            left = round(sum(item[1] for item in group) / len(group))
+            right = round(sum(item[2] for item in group) / len(group))
+            if (
+                abs(line[1] - left) <= endpoint_tolerance
+                and abs(line[2] - right) <= endpoint_tolerance
+            ):
+                matches.append(
+                    (abs(line[1] - left) + abs(line[2] - right), group_index)
+                )
+        if matches:
+            endpoint_groups[min(matches)[1]].append(line)
+        else:
+            endpoint_groups.append([line])
+
+    candidates = []
+    duplicate_tolerance = max(4, int(image.height * 0.003))
+    for group in endpoint_groups:
+        deduplicated = []
+        for line in sorted(group):
+            if (
+                deduplicated
+                and line[0] - deduplicated[-1][0] <= duplicate_tolerance
+            ):
+                if line[3] > deduplicated[-1][3]:
+                    deduplicated[-1] = line
+                continue
+            deduplicated.append(line)
+        if len(deduplicated) != row_count + 1:
+            continue
+        left = round(sum(item[1] for item in deduplicated) / len(deduplicated))
+        right = round(sum(item[2] for item in deduplicated) / len(deduplicated))
+        if right - left < max(120, int(image.width * 0.35)):
+            continue
+        boundaries = [item[0] for item in deduplicated]
+        if any(lower - upper < 12 for upper, lower in zip(boundaries, boundaries[1:])):
+            continue
+
+        row_lines = []
+        for upper, lower in zip(boundaries, boundaries[1:]):
+            detected = _vertical_grid_lines(image, left, right, upper, lower)
+            row_lines.append(
+                [
+                    value
+                    for value in detected
+                    if abs(value - left) > endpoint_tolerance
+                    and abs(value - right) > endpoint_tolerance
+                ]
+            )
+        if any(len(items) not in (0, column_count - 1) for items in row_lines):
+            continue
+        section_rows = [
+            index for index, items in enumerate(row_lines) if not items
+        ]
+        full_rows = [items for items in row_lines if items]
+        if len(section_rows) != 1 or len(full_rows) != row_count - 1:
+            continue
+        columns = [
+            round(sum(items[index] for items in full_rows) / len(full_rows))
+            for index in range(column_count - 1)
+        ]
+        if any(
+            abs(items[index] - columns[index]) > endpoint_tolerance
+            for items in full_rows
+            for index in range(column_count - 1)
+        ):
+            continue
+        candidates.append(
+            {
+                "rows": row_count,
+                "columns": column_count,
+                "section_row": section_rows[0],
+                "horizontal_boundaries": boundaries,
+                "vertical_boundaries": [left, *columns, right],
+            }
+        )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _direct_cell_placements(rows) -> list[list[dict]]:
+    """Map each direct cell to its logical grid start and source span."""
+    carry = {}
+    placements = []
+    for row_index, row in enumerate(rows):
+        occupied = {column for column, remaining in carry.items() if remaining > 0}
+        additions = {}
+        row_placements = []
+        column = 0
+        for cell in row.find_all(["td", "th"], recursive=False):
+            while column in occupied:
+                column += 1
+            colspan = table_validate._span_int(cell, "colspan")
+            rowspan = table_validate._span_int(cell, "rowspan")
+            covered = range(column, column + colspan)
+            if any(item in occupied for item in covered):
+                return []
+            row_placements.append(
+                {
+                    "row": row_index,
+                    "column": column,
+                    "colspan": colspan,
+                    "rowspan": rowspan,
+                    "cell": cell,
+                }
+            )
+            for item in covered:
+                occupied.add(item)
+                if rowspan > 1:
+                    additions[item] = max(additions.get(item, 0), rowspan - 1)
+            column += colspan
+        carry = {
+            item: remaining - 1
+            for item, remaining in carry.items()
+            if remaining - 1 > 0
+        }
+        for item, remaining in additions.items():
+            carry[item] = max(carry.get(item, 0), remaining)
+        placements.append(row_placements)
+    return placements
+
+
+def _cell_own_normalized_text(cell) -> str:
+    fragment = BeautifulSoup(str(cell), "html.parser")
+    for nested in fragment.find_all("table"):
+        nested.decompose()
+    return re.sub(r"\s+", "", fragment.get_text(" ", strip=True))
+
+
+def _raster_evidenced_rowspan_section_rebuild(
+    image_path: Path, data: dict
+) -> tuple[dict | None, list[dict]]:
+    """Lift a misplaced section band and collapse its rowspan detail group."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("L")
+    except Exception:
+        return None, []
+
+    candidates = []
+    for element_index, element in enumerate(data.get("elements") or []):
+        if (
+            not isinstance(element, dict)
+            or element.get("type") != "table"
+            or "nested_table_kept" not in set(element.get("_issues") or [])
+        ):
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is None:
+            continue
+        rows = table_validate._rows_of(table)
+        geometry = _table_geometry(element)
+        widths = geometry.get("expanded_row_widths") or []
+        column_count = geometry.get("most_frequent_width") or 0
+        if (
+            len(rows) < 5
+            or column_count < 2
+            or len(widths) != len(rows)
+            or any(width != column_count for width in widths)
+        ):
+            continue
+        placements = _direct_cell_placements(rows)
+        if len(placements) != len(rows):
+            continue
+
+        for group_start, row_placements in enumerate(placements):
+            anchors = [
+                item
+                for item in row_placements
+                if item["colspan"] == 1 and 3 <= item["rowspan"] <= 6
+            ]
+            if len(anchors) != 1:
+                continue
+            anchor = anchors[0]
+            group_size = anchor["rowspan"]
+            group_end = group_start + group_size
+            if group_end > len(rows):
+                continue
+            group = [
+                item
+                for row_items in placements[group_start:group_end]
+                for item in row_items
+            ]
+            if (
+                any(item["colspan"] != 1 for item in group)
+                or any(item["row"] + item["rowspan"] > group_end for item in group)
+            ):
+                continue
+
+            band_options = []
+            for item in row_placements:
+                text = _cell_own_normalized_text(item["cell"])
+                if (
+                    item is anchor
+                    or item["rowspan"] != 1
+                    or item["cell"].find("table") is not None
+                    or not (2 <= len(text) <= 80)
+                ):
+                    continue
+                band_options.append((len(text), item))
+            band_options.sort(key=lambda value: value[0])
+            if not band_options or (
+                len(band_options) > 1
+                and band_options[0][0] * 2 > band_options[1][0]
+            ):
+                continue
+            band = band_options[0][1]
+
+            coverage = Counter()
+            for item in group:
+                if item is band:
+                    continue
+                for row_index in range(item["row"], item["row"] + item["rowspan"]):
+                    coverage[(row_index, item["column"])] += 1
+            if any(
+                coverage[(row_index, column)] != (
+                    0
+                    if row_index == group_start and column == band["column"]
+                    else 1
+                )
+                for row_index in range(group_start, group_end)
+                for column in range(column_count)
+            ):
+                continue
+
+            output_row_count = len(rows) - group_size + 2
+            raster = _raster_outer_grid_shape(
+                image, output_row_count, column_count
+            )
+            if not raster or raster["section_row"] != group_start:
+                continue
+
+            rebuilt_table = soup.new_tag("table")
+            for row in rows[:group_start]:
+                rebuilt_table.append(copy.copy(row))
+
+            section_row = soup.new_tag("tr")
+            section_cell = copy.copy(band["cell"])
+            section_cell.attrs.pop("rowspan", None)
+            section_cell["colspan"] = str(column_count)
+            section_row.append(section_cell)
+            rebuilt_table.append(section_row)
+
+            merged_row = soup.new_tag("tr")
+            valid = True
+            merged_top = raster["horizontal_boundaries"][group_start + 1]
+            merged_bottom = raster["horizontal_boundaries"][group_start + 2]
+            for column in range(column_count):
+                parts = sorted(
+                    [
+                        item
+                        for item in group
+                        if item is not band and item["column"] == column
+                    ],
+                    key=lambda item: item["row"],
+                )
+                if not parts:
+                    valid = False
+                    break
+                if len(parts) > 1 and not _internal_horizontal_segments(
+                    image,
+                    raster["vertical_boundaries"][column],
+                    raster["vertical_boundaries"][column + 1],
+                    merged_top,
+                    merged_bottom,
+                ):
+                    valid = False
+                    break
+                if len(parts) == 1:
+                    merged_cell = copy.copy(parts[0]["cell"])
+                    merged_cell.attrs.pop("rowspan", None)
+                    merged_cell.attrs.pop("colspan", None)
+                    merged_row.append(merged_cell)
+                    continue
+
+                plain = [
+                    item for item in parts if item["cell"].find("table") is None
+                ]
+                if not plain:
+                    valid = False
+                    break
+                ranked_plain = sorted(
+                    plain,
+                    key=lambda item: (item["rowspan"], item["row"]),
+                    reverse=True,
+                )
+                if (
+                    len(ranked_plain) > 1
+                    and ranked_plain[0]["rowspan"] == ranked_plain[1]["rowspan"]
+                ):
+                    valid = False
+                    break
+                base = ranked_plain[0]
+                merged_cell = soup.new_tag("td")
+                for part_index, part in enumerate(parts):
+                    if part_index:
+                        merged_cell.append(soup.new_tag("br"))
+                    source_cell = part["cell"]
+                    if part is base or source_cell.find("table") is not None:
+                        for child in list(source_cell.contents):
+                            merged_cell.append(copy.copy(child))
+                        continue
+                    nested_table = soup.new_tag("table")
+                    nested_row = soup.new_tag("tr")
+                    nested_cell = soup.new_tag("td")
+                    for child in list(source_cell.contents):
+                        nested_cell.append(copy.copy(child))
+                    nested_row.append(nested_cell)
+                    nested_table.append(nested_row)
+                    merged_cell.append(nested_table)
+                merged_row.append(merged_cell)
+            if not valid:
+                continue
+            rebuilt_table.append(merged_row)
+            for row in rows[group_end:]:
+                rebuilt_table.append(copy.copy(row))
+
+            candidate = copy.deepcopy(data)
+            patched_element = candidate["elements"][element_index]
+            patched_element["content"] = str(rebuilt_table)
+            for key in ("_source", "_confidence", "_issues", "_native"):
+                patched_element.pop(key, None)
+            candidate_geometry = _table_geometry(patched_element)
+            if candidate_geometry.get("expanded_row_widths") != (
+                [column_count] * output_row_count
+            ):
+                continue
+            candidates.append(
+                (
+                    candidate,
+                    {
+                        "element_index": element_index,
+                        "strategy": "raster_rowspan_section_group_rebuilt",
+                        "source_rows": len(rows),
+                        "output_rows": output_row_count,
+                        "columns": column_count,
+                        "group_size": group_size,
+                    },
+                )
+            )
+
+    if len(candidates) != 1:
+        return None, []
+    candidate, change = candidates[0]
+    if Counter(_page_visible_text(data)) != Counter(_page_visible_text(candidate)):
+        return None, []
+    return candidate, [change]
+
+
 def _raster_evidenced_header_rebuild(
     image_path: Path, data: dict
 ) -> tuple[dict | None, list[dict]]:
@@ -1994,6 +2378,10 @@ def _validated_deterministic_geometry_repair(
     image_path: Path, original: dict
 ) -> tuple[dict | None, list[dict], dict | None]:
     corrected, changes = _normalize_grouped_stub_rowspans(original)
+    if corrected is None:
+        corrected, changes = _raster_evidenced_rowspan_section_rebuild(
+            image_path, original
+        )
     if corrected is None:
         corrected, changes = _raster_evidenced_header_rebuild(image_path, original)
     if corrected is None:

@@ -39,6 +39,53 @@ class GenericTableRepairTests(unittest.TestCase):
         summary = row(["Grand total", "", "25", "26", "27", "28", "29", ""])
         return "<table>" + header + "".join(body) + summary + "</table>"
 
+    @staticmethod
+    def _rowspan_section_table():
+        return (
+            "<table>"
+            "<tr><th>Kind</th><th>Terms</th><th>Coverage</th></tr>"
+            "<tr><td rowspan='3'>Primary group</td><td>Build phase</td>"
+            "<td>Inset summary with enough words to be longer</td></tr>"
+            "<tr><td>Main conditions</td>"
+            "<td rowspan='2'>Primary coverage statement</td></tr>"
+            "<tr><td><table><tr><td>A</td><td>One</td></tr>"
+            "<tr><td>B</td><td>Two</td></tr></table></td></tr>"
+            "<tr><td>Second group</td><td>Second terms</td>"
+            "<td>Second coverage</td></tr>"
+            "<tr><td>Third group</td><td>Third terms</td>"
+            "<td>Third coverage</td></tr>"
+            "</table>"
+        )
+
+    @staticmethod
+    def _rowspan_section_image(full_width_section=True, right_internal_box=True):
+        image = Image.new("L", (1000, 1100), "white")
+        draw = ImageDraw.Draw(image)
+        columns = [100, 330, 700, 900]
+        rows = [100, 190, 270, 700, 880, 1000]
+        for y in rows:
+            draw.line((columns[0], y, columns[-1], y), fill="black", width=3)
+        for row_index, (top, bottom) in enumerate(zip(rows, rows[1:])):
+            draw.line(
+                (columns[0], top, columns[0], bottom), fill="black", width=3
+            )
+            draw.line(
+                (columns[-1], top, columns[-1], bottom), fill="black", width=3
+            )
+            if row_index != 1 or not full_width_section:
+                for x in columns[1:-1]:
+                    draw.line((x, top, x, bottom), fill="black", width=3)
+
+        # Short internal lines stay well inside one outer cell.
+        for x in (390, 480, 650):
+            draw.line((x, 430, x, 620), fill="black", width=3)
+        for y in (430, 520, 620):
+            draw.line((390, y, 650, y), fill="black", width=3)
+        if right_internal_box:
+            for y in (380, 560):
+                draw.line((720, y, 880, y), fill="black", width=3)
+        return image
+
     def test_grouped_stub_rowspans_are_restored_without_text_changes(self):
         original = {
             "page_number": 1,
@@ -691,6 +738,97 @@ class GenericTableRepairTests(unittest.TestCase):
             table_quality_repair._table_geometry(table)["expanded_row_widths"],
             [11] * 8,
         )
+
+    def test_raster_evidenced_rowspan_section_group_is_rebuilt_losslessly(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": self._rowspan_section_table(),
+                    "_source": "vlm_table_repaired",
+                    "_confidence": 0.8,
+                    "_issues": ["nested_table_kept"],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            self._rowspan_section_image().save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertTrue(metrics["text_inventory_preserved"])
+        self.assertEqual(
+            changes[0]["strategy"],
+            "raster_rowspan_section_group_rebuilt",
+        )
+        element = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(element)["expanded_row_widths"],
+            [3] * 5,
+        )
+        soup = BeautifulSoup(element["content"], "html.parser")
+        rows = table_validate._rows_of(soup.find("table"))
+        section_cells = rows[1].find_all(["td", "th"], recursive=False)
+        self.assertEqual(len(section_cells), 1)
+        self.assertEqual(section_cells[0].get("colspan"), "3")
+        self.assertEqual(len(rows[2].find_all("table")), 2)
+        self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+        self.assertCountEqual(
+            table_quality_repair._page_visible_text(original),
+            table_quality_repair._page_visible_text(repaired),
+        )
+
+    def test_rowspan_section_rebuild_requires_a_raster_section_band(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": self._rowspan_section_table(),
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept"],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            self._rowspan_section_image(full_width_section=False).save(image_path)
+            repaired, changes = (
+                table_quality_repair._raster_evidenced_rowspan_section_rebuild(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
+
+    def test_rowspan_section_rebuild_requires_each_internal_box(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": self._rowspan_section_table(),
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept"],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            self._rowspan_section_image(right_internal_box=False).save(image_path)
+            repaired, changes = (
+                table_quality_repair._raster_evidenced_rowspan_section_rebuild(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
 
     def test_raster_evidenced_repair_rebuilds_a_shifted_two_row_header(self):
         original = {
