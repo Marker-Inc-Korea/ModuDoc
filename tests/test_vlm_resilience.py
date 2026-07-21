@@ -588,6 +588,52 @@ class VLMResilienceTests(unittest.TestCase):
 
         self.assertEqual(merged, columns[0] + columns[1])
 
+    def test_clipped_full_width_header_suffix_is_dropped_from_right_crop(self):
+        columns = [
+            [{"type": "heading_1", "content": "Left topic"}],
+            [
+                {"type": "heading_1", "content": "y handbook"},
+                {"type": "heading_1", "content": "Right topic"},
+            ],
+        ]
+
+        cleaned = utils._drop_clipped_multicolumn_header_fragments(
+            columns,
+            "Environmental safety handbook\nRepeated page label\nLeft topic",
+        )
+
+        self.assertEqual(
+            cleaned,
+            [
+                columns[0],
+                [{"type": "heading_1", "content": "Right topic"}],
+            ],
+        )
+
+    def test_complete_right_column_heading_is_not_dropped_as_header_fragment(self):
+        columns = [
+            [{"type": "heading_1", "content": "Left topic"}],
+            [{"type": "heading_1", "content": "Safety handbook"}],
+        ]
+
+        cleaned = utils._drop_clipped_multicolumn_header_fragments(
+            columns, "Environmental safety handbook\nLeft topic"
+        )
+
+        self.assertEqual(cleaned, columns)
+
+    def test_capitalized_short_header_suffix_is_not_assumed_to_be_clipped(self):
+        columns = [
+            [{"type": "heading_1", "content": "Left topic"}],
+            [{"type": "heading_1", "content": "Safety"}],
+        ]
+
+        cleaned = utils._drop_clipped_multicolumn_header_fragments(
+            columns, "Environmental health and Safety\nLeft topic"
+        )
+
+        self.assertEqual(cleaned, columns)
+
     def test_duplicate_heading_keeps_the_one_attached_to_its_content(self):
         elements = [
             {"type": "heading_2", "content": "3. Access preparation"},
@@ -666,6 +712,34 @@ class VLMResilienceTests(unittest.TestCase):
         )
 
         self.assertEqual(cleaned, [first, second, figure])
+
+    def test_multiple_duplicate_instructions_are_removed_from_structured_figure(self):
+        first = {
+            "type": "text",
+            "content": "1. Choose the pending request from the filtered results.",
+        }
+        second = {
+            "type": "text",
+            "content": "2. Confirm the selected request in the approval dialog.",
+        }
+        heading = {"type": "heading_2", "content": "Approval workflow"}
+        figure = {
+            "type": "figure",
+            "content": (
+                "<table><tr><td>1. Choose the pending request from the filtered results.</td></tr>"
+                "<tr><td>2. Confirm the selected request in the approval dialog.</td></tr>"
+                "<tr><td>3. Save the completed request.</td></tr></table>"
+            ),
+            "caption": "Approval screen",
+            "description": "A screen showing three numbered workflow steps.",
+        }
+
+        cleaned = utils._drop_prose_duplicated_by_nearby_figures(
+            [first, second, heading, figure],
+            first["content"] + "\n" + second["content"] + "\n3. Save the completed request.",
+        )
+
+        self.assertEqual(cleaned, [heading, figure])
 
     def test_matching_attached_page_counter_is_removed_from_edge_heading(self):
         elements = [

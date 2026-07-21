@@ -103,6 +103,31 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
         }
         self.assertFalse(repair._reassignment_only(original, invalid_element))
 
+    def test_reassignment_gate_allows_bullet_segments_to_move_between_panels(self):
+        original = {
+            "elements": [
+                {"type": "text", "content": "Search"},
+                {
+                    "type": "text",
+                    "content": (
+                        "Privacy • Private period • Search options "
+                        "• Records lookup"
+                    ),
+                },
+            ]
+        }
+        corrected = {
+            "elements": [
+                {
+                    "type": "text",
+                    "content": "Search\n• Search options\n• Records lookup",
+                },
+                {"type": "text", "content": "Privacy\n• Private period"},
+            ]
+        }
+
+        self.assertTrue(repair._reassignment_only(original, corrected))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -860,6 +860,49 @@ def _normalize_roman_section_subheadings(elements):
     return result
 
 
+def _drop_clipped_multicolumn_header_fragments(columns, source_text):
+    """Drop a short header suffix created by cropping a full-width page header."""
+    cleaned = [list(column or []) for column in columns or []]
+    if len(cleaned) < 2:
+        return cleaned
+    source_lines = [
+        (line.strip(), _compact_visible_text(line))
+        for line in str(source_text or "").splitlines()[:16]
+        if line.strip()
+    ]
+    for column_index in range(1, len(cleaned)):
+        remove = set()
+        for element_index, element in enumerate(cleaned[column_index][:3]):
+            if not isinstance(element, dict) or not str(
+                element.get("type") or ""
+            ).startswith("heading_"):
+                continue
+            raw = str(element.get("content") or "").strip()
+            fragment = _compact_visible_text(raw)
+            if not (4 <= len(fragment) <= 32):
+                continue
+            matches = []
+            for _, full in source_lines:
+                if (
+                    len(full) >= len(fragment) + 5
+                    and full.endswith(fragment)
+                    and len(fragment) * 5 <= len(full) * 3
+                ):
+                    matches.append(full)
+            if len(matches) != 1:
+                continue
+            first_alpha = next((char for char in raw if char.isalpha()), "")
+            if first_alpha and first_alpha.islower():
+                remove.add(element_index)
+        if remove:
+            cleaned[column_index] = [
+                element
+                for index, element in enumerate(cleaned[column_index])
+                if index not in remove
+            ]
+    return cleaned
+
+
 def _merge_multicolumn_elements(columns):
     """Merge independently extracted columns and repair a proven carry-over line."""
     if len(columns or []) != 2:
@@ -1171,10 +1214,21 @@ def _drop_prose_duplicated_by_nearby_figures(elements, source_text):
     for index, element in enumerate(source):
         if not isinstance(element, dict) or element.get("type") != "figure":
             continue
+        content = str(element.get("content") or "")
+        if "<" in content and ">" in content:
+            try:
+                content = BeautifulSoup(content, "html.parser").get_text(
+                    " ", strip=True
+                )
+            except Exception:
+                pass
         visible = _compact_visible_text(
             " ".join(
-                str(element.get(key) or "")
-                for key in ("content", "caption", "description")
+                (
+                    content,
+                    str(element.get("caption") or ""),
+                    str(element.get("description") or ""),
+                )
             )
         )
         if visible:
@@ -1185,7 +1239,11 @@ def _drop_prose_duplicated_by_nearby_figures(elements, source_text):
         if not isinstance(element, dict) or element.get("type", "text") != "text":
             continue
         value = _compact_visible_text(element.get("content"))
-        if len(value) < 16 or normalized_source.count(value) > 1:
+        raw_value = str(element.get("content") or "").lstrip()
+        numbered = bool(
+            re.match(r"^(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d+[.)])", raw_value)
+        )
+        if len(value) < (4 if numbered else 16) or normalized_source.count(value) > 1:
             continue
         matching_figures = [
             figure_index
@@ -1195,11 +1253,34 @@ def _drop_prose_duplicated_by_nearby_figures(elements, source_text):
         if len(matching_figures) == 1:
             matches_by_figure.setdefault(matching_figures[0], []).append(index)
 
-    remove = {
-        text_indices[0]
-        for text_indices in matches_by_figure.values()
-        if len(text_indices) == 1
-    }
+    remove = set()
+    for figure_index, text_indices in matches_by_figure.items():
+        if len(text_indices) == 1:
+            remove.add(text_indices[0])
+            continue
+        figure = source[figure_index]
+        soup = BeautifulSoup(str(figure.get("content") or ""), "html.parser")
+        table = soup.find("table")
+        if table is None:
+            continue
+        row_texts = [
+            _compact_visible_text(row.get_text(" ", strip=True))
+            for row in table.find_all("tr")
+        ]
+        assignments = []
+        for text_index in text_indices:
+            value = _compact_visible_text(source[text_index].get("content"))
+            matching_rows = [
+                row_index
+                for row_index, row_text in enumerate(row_texts)
+                if value and value in row_text
+            ]
+            if len(matching_rows) != 1:
+                assignments = []
+                break
+            assignments.append(matching_rows[0])
+        if assignments and len(set(assignments)) == len(assignments):
+            remove.update(text_indices)
     return [element for index, element in enumerate(source) if index not in remove]
 
 
@@ -4227,6 +4308,18 @@ class DocumentProcessor:
                     columns.append(
                         pj if isinstance(pj, list) else pj.get("elements", [])
                     )
+                try:
+                    with open(
+                        os.path.join(doc_output_dir, f"{stem}.txt"),
+                        encoding="utf-8",
+                        errors="replace",
+                    ) as source_file:
+                        source_text = source_file.read()
+                except OSError:
+                    source_text = ""
+                columns = _drop_clipped_multicolumn_header_fragments(
+                    columns, source_text
+                )
                 merged = _merge_multicolumn_elements(columns)
                 if not merged:
                     return None

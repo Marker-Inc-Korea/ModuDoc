@@ -86,6 +86,43 @@ class GenericTableRepairTests(unittest.TestCase):
                 draw.line((720, y, 880, y), fill="black", width=3)
         return image
 
+    @staticmethod
+    def _flattened_section_table():
+        return (
+            "<table>"
+            "<tr><th>Kind</th><th>Terms</th><th>Coverage</th></tr>"
+            "<tr><td rowspan='3'>Primary group</td>"
+            "<td colspan='2'>Build phase</td></tr>"
+            "<tr><td rowspan='2'>Main conditions</td>"
+            "<td>Primary coverage heading</td></tr>"
+            "<tr><td>(A)<br>First detail<br>(B)<br>Second detail</td>"
+            "<td>Coverage continuation</td></tr>"
+            "<tr><td>Second group</td><td colspan='2'>Second terms</td>"
+            "<td>Second coverage</td></tr>"
+            "<tr><td>Third group</td>"
+            "<td colspan='2'>Third terms<br>Shared trailing detail</td>"
+            "<td>Shared trailing detail</td></tr>"
+            "</table>"
+        )
+
+    @staticmethod
+    def _nested_table_with_external_note_image():
+        image = Image.new("L", (1000, 1000), "white")
+        draw = ImageDraw.Draw(image)
+        rows = [100, 200, 300, 400, 500, 800]
+        for y in rows:
+            draw.line((100, y, 900, y), fill="black", width=3)
+        for top, bottom in zip(rows[:3], rows[1:4]):
+            for x in (300, 500, 700):
+                draw.line((x, top, x, bottom), fill="black", width=3)
+        draw.line((300, rows[3], 300, rows[4]), fill="black", width=3)
+        draw.line((300, rows[4], 300, rows[5]), fill="black", width=3)
+        for x in (400, 500, 600, 700, 800):
+            draw.line((x, 560, x, 740), fill="black", width=3)
+        for y in (560, 620, 680, 740):
+            draw.line((300, y, 900, y), fill="black", width=3)
+        return image
+
     def test_grouped_stub_rowspans_are_restored_without_text_changes(self):
         original = {
             "page_number": 1,
@@ -783,6 +820,201 @@ class GenericTableRepairTests(unittest.TestCase):
             table_quality_repair._page_visible_text(original),
             table_quality_repair._page_visible_text(repaired),
         )
+
+    def test_flattened_section_group_is_rebuilt_from_unique_raster_grid(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": self._flattened_section_table(),
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["ragged_rows"],
+                }
+            ]
+        }
+        source_text = (
+            "Kind Terms Coverage Primary group Build phase Main conditions "
+            "Primary coverage heading (A) First detail (B) Second detail "
+            "Coverage continuation Second group Second terms Second coverage "
+            "Third group Third terms Shared trailing detail"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            text_path = Path(directory) / "page.txt"
+            self._rowspan_section_image().save(image_path)
+            text_path.write_text(source_text, encoding="utf-8")
+
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original, text_path
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(
+            changes[0]["strategy"],
+            "raster_flattened_section_group_rebuilt",
+        )
+        self.assertEqual(changes[0]["source_supported_duplicates_removed"], 1)
+        table = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(table)["expanded_row_widths"],
+            [3] * 5,
+        )
+        self.assertEqual(
+            len(BeautifulSoup(table["content"], "html.parser").find_all("table")),
+            3,
+        )
+        self.assertTrue(metrics["source_supported_cleanup"])
+        self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+
+    def test_flattened_section_rebuild_requires_internal_boxes_in_all_columns(self):
+        original = {
+            "elements": [
+                {"type": "table", "content": self._flattened_section_table()}
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            self._rowspan_section_image(right_internal_box=False).save(image_path)
+            repaired, changes = (
+                table_quality_repair._raster_evidenced_flattened_section_rebuild(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
+
+    def test_nested_table_external_note_is_split_by_outer_raster_boundary(self):
+        nested = (
+            "<table>"
+            + "".join(
+                "<tr><td>A</td><td>B</td><td>C</td><td>D</td></tr>"
+                for _ in range(4)
+            )
+            + "</table>"
+        )
+        html = (
+            "<table>"
+            "<tr><td>A</td><td>B</td><td>C</td><td>D</td></tr>"
+            "<tr><td>E</td><td>F</td><td>G</td><td>H</td></tr>"
+            "<tr><td>I</td><td>J</td><td>K</td><td>L</td></tr>"
+            "<tr><td>M</td><td colspan='3'>Summary</td></tr>"
+            f"<tr><td rowspan='2'>Detail</td><td colspan='5'>{nested}</td></tr>"
+            "<tr><td colspan='6'>Outside note</td></tr>"
+            "</table>"
+        )
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": html,
+                    "_source": "vlm_table_repaired",
+                    "_issues": ["nested_table_kept", "ragged_rows"],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            self._nested_table_with_external_note_image().save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(changes[0]["strategy"], "raster_external_note_extracted")
+        self.assertEqual(
+            [element["type"] for element in repaired["elements"]],
+            ["table", "text"],
+        )
+        self.assertEqual(
+            table_quality_repair._table_geometry(repaired["elements"][0])[
+                "expanded_row_widths"
+            ],
+            [4] * 5,
+        )
+        self.assertTrue(metrics["text_inventory_preserved"])
+        self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+
+    def test_repeated_column_groups_are_rebuilt_only_with_source_copies(self):
+        html = (
+            "<table><tr><td>Before</td><td>After</td></tr>"
+            + "".join(
+                f"<tr><td>L{index}</td><td>R{index}</td></tr>"
+                for index in range(1, 7)
+            )
+            + "</table>"
+        )
+        original = {"elements": [{"type": "table", "content": html}]}
+        image = Image.new("L", (1000, 600), "white")
+        draw = ImageDraw.Draw(image)
+        xs = [100 + index * 133 for index in range(7)]
+        xs[-1] = 900
+        ys = [100, 200, 300, 400]
+        for y in ys:
+            draw.line((xs[0], y, xs[-1], y), fill="black", width=3)
+        for x in xs:
+            draw.line((x, ys[0], x, ys[-1]), fill="black", width=3)
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            text_path = Path(directory) / "page.txt"
+            image.save(image_path)
+            text_path.write_text(
+                "Before After Before After Before After "
+                + " ".join(f"L{i} R{i}" for i in range(1, 7)),
+                encoding="utf-8",
+            )
+            repaired, changes, metrics = (
+                table_quality_repair._validated_repeated_column_group_rebuild(
+                    image_path, text_path, original
+                )
+            )
+            text_path.write_text(
+                "Before After " + " ".join(f"L{i} R{i}" for i in range(1, 7)),
+                encoding="utf-8",
+            )
+            rejected = (
+                table_quality_repair._validated_repeated_column_group_rebuild(
+                    image_path, text_path, original
+                )
+            )
+            ambiguous = {
+                "elements": [
+                    {
+                        "type": "table",
+                        "content": html.replace("Before", "No").replace(
+                            "After", "ID"
+                        ),
+                    }
+                ]
+            }
+            text_path.write_text(
+                "No ID No ID No ID "
+                + " ".join(f"L{i} R{i}" for i in range(1, 7)),
+                encoding="utf-8",
+            )
+            ambiguous_rejected = (
+                table_quality_repair._validated_repeated_column_group_rebuild(
+                    image_path, text_path, ambiguous
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(
+            changes[0]["strategy"], "raster_repeated_column_groups_rebuilt"
+        )
+        self.assertEqual(
+            table_quality_repair._table_geometry(repaired["elements"][0])[
+                "expanded_row_widths"
+            ],
+            [6] * 3,
+        )
+        self.assertTrue(metrics["source_supported_header_repetitions"])
+        self.assertIsNone(rejected[0])
+        self.assertIsNone(ambiguous_rejected[0])
 
     def test_rowspan_section_rebuild_requires_a_raster_section_band(self):
         original = {

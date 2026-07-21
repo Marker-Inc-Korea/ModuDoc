@@ -59,6 +59,23 @@ class VisualJudgeTests(unittest.TestCase):
 
         self.assertEqual(visual_judge_pages.objective_quality_failures(data), [])
 
+    def test_structure_facts_tolerate_invalid_table_spans(self):
+        data = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        '<table><tr><td colspan="invalid">A</td></tr></table>'
+                    ),
+                }
+            ]
+        }
+
+        facts = visual_judge_pages.candidate_structure_facts(data)
+
+        self.assertEqual(facts["table_elements"][0]["rows"], 1)
+        self.assertEqual(facts["table_elements"][0]["columns"], 1)
+
     def test_visible_attachment_notice_is_reviewed_instead_of_hard_failed(self):
         data = {
             "low_confidence": True,
@@ -73,6 +90,28 @@ class VisualJudgeTests(unittest.TestCase):
         }
 
         self.assertEqual(visual_judge_pages.objective_quality_failures(data), [])
+        self.assertTrue(visual_judge_pages.is_notice_only_page(data))
+
+    def test_html_entities_do_not_create_text_mismatches(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["wrong_text"],
+            "text_mismatches": [
+                {
+                    "image_text": "Standards & Practice",
+                    "candidate_text": "Standards &amp; Practice",
+                }
+            ],
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Standards &amp; Practice"
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
 
     def test_page_counter_is_not_treated_as_missing_content(self):
         verdict = {
@@ -211,6 +250,70 @@ class VisualJudgeTests(unittest.TestCase):
         }
 
         result = visual_judge_pages.apply_failure_review(primary, review)
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["wrong_order"])
+
+    def test_unindexed_structural_claim_is_rejected_when_candidate_facts_exist(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["wrong_order", "table_structure"],
+            "structure_evidence": [
+                "The candidate order differs from the image.",
+                "The image has three rows while the candidate has two rows.",
+            ],
+        }
+        facts = {
+            "element_indices": [0, 1],
+            "table_elements": {1: {"rows": 3, "columns": 2, "table_tags": 1}},
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "First Second", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_indexed_geometry_claim_remains_a_structural_failure(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has 4 rows, while candidate element index 1 has 3 rows."
+            ],
+        }
+        facts = {
+            "element_indices": [0, 1],
+            "table_elements": {1: {"rows": 3, "columns": 2, "table_tags": 1}},
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "First Second", facts
+        )
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["table_structure"])
+
+    def test_indexed_order_claim_requires_two_candidate_element_references(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["wrong_order"],
+            "structure_evidence": [
+                "Candidate element index 1 precedes candidate element index 0, but the image reverses them."
+            ],
+        }
+        facts = {"element_indices": [0, 1], "table_elements": {}}
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "First Second", facts
+        )
 
         self.assertFalse(result["pass"])
         self.assertEqual(result["issue_types"], ["wrong_order"])

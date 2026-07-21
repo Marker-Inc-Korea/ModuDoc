@@ -1197,6 +1197,233 @@ def _vertical_grid_lines(image, left: int, right: int, top: int, bottom: int) ->
     return [line[0] for line in _group_adjacent_lines(lines)]
 
 
+def _dedupe_positions(values: list[int], tolerance: int) -> list[int]:
+    groups = []
+    for value in sorted(values):
+        if not groups or value - groups[-1][-1] > tolerance:
+            groups.append([])
+        groups[-1].append(value)
+    return [round(sum(group) / len(group)) for group in groups]
+
+
+def _faint_horizontal_grid_lines(image) -> list[tuple[int, int, int, int]]:
+    """Detect light gray/colored grid rules while retaining long-run evidence."""
+    width, height = image.size
+    data = image.tobytes()
+    minimum = max(120, int(width * 0.25))
+    lines = []
+    for y in range(height):
+        length, start, end = _longest_dark_run(
+            data[y * width : (y + 1) * width], threshold=205
+        )
+        if length >= minimum:
+            lines.append((y, start, end, length))
+    return _group_adjacent_lines(lines)
+
+
+def _simple_rectangular_raster_grids(image) -> list[dict]:
+    """Return uniquely bordered rectangular grids with stable row boundaries."""
+    lines = _faint_horizontal_grid_lines(image)
+    endpoint_tolerance = max(8, int(image.width * 0.012))
+    groups = []
+    current = []
+    for line in lines:
+        if current and (
+            abs(line[1] - current[-1][1]) > endpoint_tolerance
+            or abs(line[2] - current[-1][2]) > endpoint_tolerance
+        ):
+            if len(current) >= 3:
+                groups.append(current)
+            current = []
+        current.append(line)
+    if len(current) >= 3:
+        groups.append(current)
+
+    candidates = []
+    for group in groups:
+        left = round(sum(line[1] for line in group) / len(group))
+        right = round(sum(line[2] for line in group) / len(group))
+        if right - left < max(180, int(image.width * 0.30)):
+            continue
+        vertical_rows = []
+        for upper, lower in zip(group, group[1:]):
+            positions = _vertical_grid_lines(
+                image, left, right, upper[0], lower[0]
+            )
+            positions = _dedupe_positions(
+                positions, max(4, int((right - left) * 0.006))
+            )
+            vertical_rows.append(positions)
+        if not vertical_rows or min(map(len, vertical_rows)) < 3:
+            continue
+        column_boundaries = len(vertical_rows[0])
+        if any(len(row) != column_boundaries for row in vertical_rows):
+            continue
+        position_tolerance = max(6, int((right - left) * 0.012))
+        reference = [
+            round(sum(row[index] for row in vertical_rows) / len(vertical_rows))
+            for index in range(column_boundaries)
+        ]
+        if any(
+            abs(row[index] - reference[index]) > position_tolerance
+            for row in vertical_rows
+            for index in range(column_boundaries)
+        ):
+            continue
+        candidates.append(
+            {
+                "rows": len(group) - 1,
+                "columns": column_boundaries - 1,
+                "horizontal_boundaries": [line[0] for line in group],
+                "vertical_boundaries": reference,
+                "area": (right - left) * (group[-1][0] - group[0][0]),
+            }
+        )
+    unique = {}
+    for candidate in candidates:
+        key = (
+            candidate["rows"],
+            candidate["columns"],
+            tuple(candidate["horizontal_boundaries"]),
+        )
+        unique[key] = candidate
+    return sorted(unique.values(), key=lambda item: item["area"], reverse=True)
+
+
+def _looks_like_repeated_column_group_fold(
+    data: dict, text_path: Path | None
+) -> bool:
+    tables = [
+        element
+        for element in data.get("elements") or []
+        if isinstance(element, dict) and element.get("type") == "table"
+    ]
+    if len(tables) != 1 or text_path is None or not text_path.exists():
+        return False
+    element = tables[0]
+    soup = BeautifulSoup(element.get("content") or "", "html.parser")
+    table = soup.find("table")
+    if table is None or table.find("table") is not None:
+        return False
+    rows = table_validate._rows_of(table)
+    if not (5 <= len(rows) <= 20):
+        return False
+    cells = [
+        row.find_all(["td", "th"], recursive=False) for row in rows
+    ]
+    if not cells or not (2 <= len(cells[0]) <= 3):
+        return False
+    if any(
+        len(row_cells) != len(cells[0])
+        or any(
+            table_validate._span_int(cell, "colspan") != 1
+            or table_validate._span_int(cell, "rowspan") != 1
+            for cell in row_cells
+        )
+        for row_cells in cells
+    ):
+        return False
+    source = _norm(text_path.read_text(encoding="utf-8", errors="replace"))
+    return bool(
+        source
+        and all(
+            len(value := _norm(cell.get_text(" ", strip=True))) >= 3
+            and source.count(value) >= 2
+            for cell in cells[0]
+        )
+    )
+
+
+def _validated_repeated_column_group_rebuild(
+    image_path: Path, text_path: Path, original: dict
+) -> tuple[dict | None, list[dict], dict | None]:
+    """Expand a column-group table only when raster and text copies prove it."""
+    from PIL import Image
+
+    if not _looks_like_repeated_column_group_fold(original, text_path):
+        return None, [], None
+    tables = [
+        (index, element)
+        for index, element in enumerate(original.get("elements") or [])
+        if isinstance(element, dict) and element.get("type") == "table"
+    ]
+    element_index, element = tables[0]
+    soup = BeautifulSoup(element.get("content") or "", "html.parser")
+    table = soup.find("table")
+    rows = table_validate._rows_of(table)
+    cells = [row.find_all(["td", "th"], recursive=False) for row in rows]
+    old_columns = len(cells[0])
+    try:
+        with Image.open(image_path) as source_image:
+            raster_grids = _simple_rectangular_raster_grids(
+                source_image.convert("L")
+            )
+    except Exception:
+        return None, [], None
+    matches = []
+    for raster in raster_grids:
+        if raster["columns"] <= old_columns or raster["columns"] % old_columns:
+            continue
+        groups = raster["columns"] // old_columns
+        if len(rows) != 1 + (raster["rows"] - 1) * groups:
+            continue
+        matches.append((raster, groups))
+    if len(matches) != 1:
+        return None, [], None
+    raster, group_count = matches[0]
+    source_text = _norm(text_path.read_text(encoding="utf-8", errors="replace"))
+    header_values = [_norm(cell.get_text(" ", strip=True)) for cell in cells[0]]
+    if any(
+        not value or source_text.count(value) < group_count
+        for value in header_values
+    ):
+        return None, [], None
+
+    rebuilt = soup.new_tag("table")
+    header_row = soup.new_tag("tr")
+    for _ in range(group_count):
+        for cell in cells[0]:
+            header_row.append(copy.copy(cell))
+    rebuilt.append(header_row)
+    cursor = 1
+    for _ in range(raster["rows"] - 1):
+        row = soup.new_tag("tr")
+        for _ in range(group_count):
+            for cell in cells[cursor]:
+                row.append(copy.copy(cell))
+            cursor += 1
+        rebuilt.append(row)
+
+    candidate = copy.deepcopy(original)
+    patched = candidate["elements"][element_index]
+    patched["content"] = str(rebuilt)
+    for key in ("_source", "_confidence", "_issues", "_native"):
+        patched.pop(key, None)
+    geometry = _table_geometry(patched)
+    if geometry.get("expanded_row_widths") != [raster["columns"]] * raster["rows"]:
+        return None, [], None
+    if _problem_tables(candidate):
+        return None, [], None
+    candidate["quality_repair"] = True
+    change = {
+        "element_index": element_index,
+        "strategy": "raster_repeated_column_groups_rebuilt",
+        "source_rows": len(rows),
+        "source_columns": old_columns,
+        "output_rows": raster["rows"],
+        "output_columns": raster["columns"],
+        "header_repetitions": group_count,
+    }
+    metrics = {
+        "old_problem_tables": len(_problem_tables(original)),
+        "new_problem_tables": 0,
+        "table_count": 1,
+        "raster_geometry": [raster["rows"], raster["columns"]],
+        "source_supported_header_repetitions": True,
+    }
+    return candidate, [change], metrics
+
+
 def _grid_line_geometry_correction(image_path: Path, candidate: dict) -> dict | None:
     """Resolve table-row spans only when raster grid lines provide unique evidence."""
     from PIL import Image
@@ -1910,6 +2137,390 @@ def _raster_evidenced_rowspan_section_rebuild(
     return candidate, [change]
 
 
+def _horizontal_line_families(image) -> list[list[tuple[int, int, int, int]]]:
+    tolerance = max(8, int(image.width * 0.012))
+    families = []
+    for line in _horizontal_grid_lines(image):
+        matches = [
+            family
+            for family in families
+            if abs(line[1] - family[0][1]) <= tolerance
+            and abs(line[2] - family[0][2]) <= tolerance
+        ]
+        if len(matches) == 1:
+            matches[0].append(line)
+        elif not matches:
+            families.append([line])
+    return [
+        sorted(family)
+        for family in families
+        if len(family) >= 3
+        and family[0][2] - family[0][1] >= max(180, int(image.width * 0.30))
+    ]
+
+
+def _raster_evidenced_trailing_note_extraction(
+    image_path: Path, data: dict
+) -> tuple[dict | None, list[dict]]:
+    """Move a border-external note out of a nested table using outer rules."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("L")
+    except Exception:
+        return None, []
+    candidates = []
+    for element_index, element in enumerate(data.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is None:
+            continue
+        rows = table_validate._rows_of(table)
+        if len(rows) < 4:
+            continue
+        nested_rows = [
+            index
+            for index, row in enumerate(rows)
+            if any(
+                cell.find("table") is not None
+                for cell in row.find_all(["td", "th"], recursive=False)
+            )
+        ]
+        if nested_rows != [len(rows) - 2]:
+            continue
+        nested_row = rows[-2]
+        trailing_row = rows[-1]
+        nested_cells = nested_row.find_all(["td", "th"], recursive=False)
+        trailing_cells = trailing_row.find_all(["td", "th"], recursive=False)
+        if (
+            len(nested_cells) != 2
+            or len(trailing_cells) != 1
+            or table_validate._span_int(nested_cells[0], "rowspan") != 2
+            or nested_cells[1].find("table") is None
+        ):
+            continue
+        prefix_widths = []
+        for row in rows[:-2]:
+            width = sum(
+                table_validate._span_int(cell, "colspan")
+                for cell in row.find_all(["td", "th"], recursive=False)
+            )
+            prefix_widths.append(width)
+        if not prefix_widths or len(set(prefix_widths)) != 1:
+            continue
+        target_width = prefix_widths[0]
+        if target_width < 2:
+            continue
+        families = [
+            family
+            for family in _horizontal_line_families(image)
+            if len(family) == len(rows)
+        ]
+        if len(families) != 1:
+            continue
+        outer = families[0]
+        internal_counts = []
+        for upper, lower in zip(outer[:3], outer[1:4]):
+            positions = _dedupe_positions(
+                _vertical_grid_lines(
+                    image, outer[0][1], outer[0][2], upper[0], lower[0]
+                ),
+                max(5, int((outer[0][2] - outer[0][1]) * 0.008)),
+            )
+            internal_counts.append(len(positions))
+        if sum(count == target_width - 1 for count in internal_counts) < 2:
+            continue
+
+        candidate = copy.deepcopy(data)
+        patched = candidate["elements"][element_index]
+        patched_soup = BeautifulSoup(patched.get("content") or "", "html.parser")
+        patched_table = patched_soup.find("table")
+        patched_rows = table_validate._rows_of(patched_table)
+        note = patched_rows[-1].get_text("\n", strip=True)
+        patched_rows[-1].decompose()
+        repaired_cells = table_validate._rows_of(patched_table)[-1].find_all(
+            ["td", "th"], recursive=False
+        )
+        repaired_cells[0].attrs.pop("rowspan", None)
+        repaired_cells[1]["colspan"] = str(target_width - 1)
+        patched["content"] = str(patched_table)
+        for key in ("_source", "_confidence", "_issues", "_native"):
+            patched.pop(key, None)
+        candidate["elements"].insert(
+            element_index + 1,
+            {
+                "type": "text",
+                "content": note,
+                "_source": "raster_outside_table_note",
+                "_confidence": 0.95,
+            },
+        )
+        if _table_geometry(patched).get("expanded_row_widths") != [
+            target_width
+        ] * (len(rows) - 1):
+            continue
+        candidates.append(
+            (
+                candidate,
+                {
+                    "element_index": element_index,
+                    "strategy": "raster_external_note_extracted",
+                    "source_rows": len(rows),
+                    "output_rows": len(rows) - 1,
+                    "columns": target_width,
+                },
+            )
+        )
+    if len(candidates) != 1:
+        return None, []
+    candidate, change = candidates[0]
+    if Counter(_page_visible_text(data)) != Counter(_page_visible_text(candidate)):
+        return None, []
+    return candidate, [change]
+
+
+def _flat_detail_nested_table(soup, cell):
+    lines = [
+        value.strip()
+        for value in cell.get_text("\n", strip=True).splitlines()
+        if value.strip()
+    ]
+    marker = re.compile(
+        r"^(?:\([A-Za-z0-9]+\)(?:[&/+,-]\([A-Za-z0-9]+\))?|[A-Za-z0-9]{1,4}[.)])$"
+    )
+    marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if marker.fullmatch(re.sub(r"\s+", "", line))
+    ]
+    table = soup.new_tag("table")
+    if (
+        len(marker_indexes) >= 2
+        and marker_indexes[0] == 0
+        and all(
+            next_index > marker_index + 1
+            for marker_index, next_index in zip(
+                marker_indexes,
+                marker_indexes[1:] + [len(lines)],
+            )
+        )
+    ):
+        for position, marker_index in enumerate(marker_indexes):
+            end = (
+                marker_indexes[position + 1]
+                if position + 1 < len(marker_indexes)
+                else len(lines)
+            )
+            row = soup.new_tag("tr")
+            key = soup.new_tag("td")
+            key.string = lines[marker_index]
+            value = soup.new_tag("td")
+            for line_index, line in enumerate(lines[marker_index + 1 : end]):
+                if line_index:
+                    value.append(soup.new_tag("br"))
+                value.append(line)
+            row.extend([key, value])
+            table.append(row)
+        return table
+    row = soup.new_tag("tr")
+    nested_cell = soup.new_tag("td")
+    for child in list(cell.contents):
+        nested_cell.append(copy.copy(child))
+    row.append(nested_cell)
+    table.append(row)
+    return table
+
+
+def _strip_source_unsupported_adjacent_suffixes(table, source_text: str) -> int:
+    normalized_source = _norm(source_text)
+    if not normalized_source:
+        return 0
+    removed = 0
+    for row in table_validate._rows_of(table):
+        cells = row.find_all(["td", "th"], recursive=False)
+        for left, right in zip(cells, cells[1:]):
+            right_text = right.get_text(" ", strip=True)
+            right_norm = _norm(right_text)
+            left_lines = [
+                value.strip()
+                for value in left.get_text("\n", strip=True).splitlines()
+                if value.strip()
+            ]
+            if len(right_norm) < 12 or normalized_source.count(right_norm) != 1:
+                continue
+            match_start = None
+            for start in range(len(left_lines)):
+                if _norm(" ".join(left_lines[start:])) == right_norm:
+                    match_start = start
+                    break
+            if match_start is None or match_start == 0:
+                continue
+            left.clear()
+            for line_index, line in enumerate(left_lines[:match_start]):
+                if line_index:
+                    left.append(BeautifulSoup("<br/>", "html.parser").br)
+                left.append(line)
+            removed += 1
+    return removed
+
+
+def _raster_evidenced_flattened_section_rebuild(
+    image_path: Path, data: dict, source_text: str = ""
+) -> tuple[dict | None, list[dict]]:
+    """Rebuild a section band when nested cell details were shifted into rows."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("L")
+    except Exception:
+        return None, []
+    candidates = []
+    for element_index, element in enumerate(data.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        if len(rows) < 5:
+            continue
+        first_cells = rows[0].find_all(["td", "th"], recursive=False)
+        column_count = sum(
+            table_validate._span_int(cell, "colspan") for cell in first_cells
+        )
+        if column_count < 2:
+            continue
+        for group_start, row in enumerate(rows[1:], 1):
+            cells = row.find_all(["td", "th"], recursive=False)
+            if len(cells) != 2:
+                continue
+            anchor, band = cells
+            group_size = table_validate._span_int(anchor, "rowspan")
+            if (
+                table_validate._span_int(anchor, "colspan") != 1
+                or not (2 <= group_size <= 6)
+                or table_validate._span_int(band, "rowspan") != 1
+                or table_validate._span_int(band, "colspan") != column_count - 1
+                or group_start + group_size > len(rows)
+            ):
+                continue
+            continuation_rows = rows[group_start + 1 : group_start + group_size]
+            continuation_cells = [
+                item.find_all(["td", "th"], recursive=False)
+                for item in continuation_rows
+            ]
+            if (
+                not continuation_cells
+                or any(len(items) != column_count - 1 for items in continuation_cells)
+            ):
+                continue
+            output_rows = len(rows) - group_size + 2
+            raster = _raster_outer_grid_shape(image, output_rows, column_count)
+            if not raster or raster["section_row"] != group_start:
+                continue
+            merged_top = raster["horizontal_boundaries"][group_start + 1]
+            merged_bottom = raster["horizontal_boundaries"][group_start + 2]
+            if any(
+                not _internal_horizontal_segments(
+                    image,
+                    raster["vertical_boundaries"][column],
+                    raster["vertical_boundaries"][column + 1],
+                    merged_top,
+                    merged_bottom,
+                )
+                for column in range(1, column_count)
+            ):
+                continue
+            trailing_rows = rows[group_start + group_size :]
+            if any(
+                len(item.find_all(["td", "th"], recursive=False))
+                != column_count
+                for item in trailing_rows
+            ):
+                continue
+
+            rebuilt = soup.new_tag("table")
+            for prefix in rows[:group_start]:
+                rebuilt.append(copy.copy(prefix))
+            section_row = soup.new_tag("tr")
+            section_cell = copy.copy(band)
+            section_cell.attrs.pop("rowspan", None)
+            section_cell["colspan"] = str(column_count)
+            section_row.append(section_cell)
+            rebuilt.append(section_row)
+
+            merged_row = soup.new_tag("tr")
+            anchor_cell = copy.copy(anchor)
+            anchor_cell.attrs.pop("rowspan", None)
+            anchor_cell.attrs.pop("colspan", None)
+            merged_row.append(anchor_cell)
+            base_cells = continuation_cells[0]
+            detail_rows = continuation_cells[1:]
+            for column_index, base_cell in enumerate(base_cells):
+                merged_cell = soup.new_tag("td")
+                details = [items[column_index] for items in detail_rows]
+                if table_validate._span_int(base_cell, "rowspan") > 1:
+                    for child in list(base_cell.contents):
+                        merged_cell.append(copy.copy(child))
+                    for detail in details:
+                        merged_cell.append(soup.new_tag("br"))
+                        merged_cell.append(_flat_detail_nested_table(soup, detail))
+                else:
+                    merged_cell.append(_flat_detail_nested_table(soup, base_cell))
+                    for detail in details:
+                        merged_cell.append(soup.new_tag("br"))
+                        for child in list(detail.contents):
+                            merged_cell.append(copy.copy(child))
+                merged_row.append(merged_cell)
+            rebuilt.append(merged_row)
+            for trailing in trailing_rows:
+                copied = copy.copy(trailing)
+                for cell in copied.find_all(["td", "th"], recursive=False):
+                    cell.attrs.pop("rowspan", None)
+                    cell.attrs.pop("colspan", None)
+                rebuilt.append(copied)
+
+            duplicate_cells_removed = _strip_source_unsupported_adjacent_suffixes(
+                rebuilt, source_text
+            )
+            candidate = copy.deepcopy(data)
+            patched = candidate["elements"][element_index]
+            patched["content"] = str(rebuilt)
+            for key in ("_source", "_confidence", "_issues", "_native"):
+                patched.pop(key, None)
+            if _table_geometry(patched).get("expanded_row_widths") != [
+                column_count
+            ] * output_rows:
+                continue
+            candidates.append(
+                (
+                    candidate,
+                    {
+                        "element_index": element_index,
+                        "strategy": "raster_flattened_section_group_rebuilt",
+                        "source_rows": len(rows),
+                        "output_rows": output_rows,
+                        "columns": column_count,
+                        "group_size": group_size,
+                        "source_supported_duplicates_removed": duplicate_cells_removed,
+                    },
+                )
+            )
+    if len(candidates) != 1:
+        return None, []
+    candidate, change = candidates[0]
+    if not change["source_supported_duplicates_removed"] and Counter(
+        _page_visible_text(data)
+    ) != Counter(_page_visible_text(candidate)):
+        return None, []
+    return candidate, [change]
+
+
 def _raster_evidenced_header_rebuild(
     image_path: Path, data: dict
 ) -> tuple[dict | None, list[dict]]:
@@ -2375,12 +2986,25 @@ def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[d
 
 
 def _validated_deterministic_geometry_repair(
-    image_path: Path, original: dict
+    image_path: Path, original: dict, text_path: Path | None = None
 ) -> tuple[dict | None, list[dict], dict | None]:
     corrected, changes = _normalize_grouped_stub_rowspans(original)
     if corrected is None:
+        corrected, changes = _raster_evidenced_trailing_note_extraction(
+            image_path, original
+        )
+    if corrected is None:
         corrected, changes = _raster_evidenced_rowspan_section_rebuild(
             image_path, original
+        )
+    if corrected is None:
+        source_text = (
+            text_path.read_text(encoding="utf-8", errors="replace")
+            if text_path is not None and text_path.exists()
+            else ""
+        )
+        corrected, changes = _raster_evidenced_flattened_section_rebuild(
+            image_path, original, source_text
         )
     if corrected is None:
         corrected, changes = _raster_evidenced_header_rebuild(image_path, original)
@@ -2405,11 +3029,18 @@ def _validated_deterministic_geometry_repair(
     text_inventory_preserved = Counter(_page_visible_text(original)) == Counter(
         _page_visible_text(corrected)
     )
+    source_supported_cleanup = bool(
+        changes
+        and all(
+            change.get("source_supported_duplicates_removed", 0) > 0
+            for change in changes
+        )
+    )
     if (
         not old_problems
         or len(new_problems) >= len(old_problems)
         or old_table_count != new_table_count
-        or not text_inventory_preserved
+        or not (text_inventory_preserved or source_supported_cleanup)
     ):
         return None, [], None
     corrected["quality_repair"] = True
@@ -2417,7 +3048,8 @@ def _validated_deterministic_geometry_repair(
         "old_problem_tables": len(old_problems),
         "new_problem_tables": len(new_problems),
         "table_count": old_table_count,
-        "text_inventory_preserved": True,
+        "text_inventory_preserved": text_inventory_preserved,
+        "source_supported_cleanup": source_supported_cleanup,
     }
     return corrected, changes, metrics
 
@@ -2471,8 +3103,21 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
             and _borderless_definition_text(element)
             for element in data.get("elements") or []
         )
-        if problems or has_formula_definition:
-            candidates.append((structured_path, data, problems))
+        stem = structured_path.name[: -len("_structured.json")]
+        image_path = root / f"{stem}.png"
+        text_path = root / f"{stem}.txt"
+        repeated_group_rebuild = (None, [], None)
+        if image_path.exists() and _looks_like_repeated_column_group_fold(
+            data, text_path
+        ):
+            repeated_group_rebuild = _validated_repeated_column_group_rebuild(
+                image_path, text_path, data
+            )
+        if problems or has_formula_definition or repeated_group_rebuild[0] is not None:
+            candidates.append(
+                (structured_path, data, problems, repeated_group_rebuild)
+            )
+    candidates.sort(key=lambda item: item[3][0] is None)
     if TABLE_QUALITY_REPAIR_MAX_PAGES > 0:
         candidates = candidates[:TABLE_QUALITY_REPAIR_MAX_PAGES]
     if not candidates:
@@ -2485,7 +3130,7 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
         max_retries=0,
     )
     results = []
-    for structured_path, original, problems in candidates:
+    for structured_path, original, problems, repeated_group_rebuild in candidates:
         stem = structured_path.name[: -len("_structured.json")]
         image_path = root / f"{stem}.png"
         text_path = root / f"{stem}.txt"
@@ -2495,8 +3140,38 @@ def repair_low_quality_pages(doc_output_dir: str, api_key: str, model: str, pers
             results.append(record)
             continue
         record["candidate_options"] = []
+        if repeated_group_rebuild[0] is not None:
+            deterministic, deterministic_changes, deterministic_metrics = (
+                repeated_group_rebuild
+            )
+            record["candidate_options"].append(
+                {
+                    "strategy": "raster_repeated_column_groups_rebuilt",
+                    "accepted": True,
+                    "metrics": deterministic_metrics,
+                    "changes": deterministic_changes,
+                }
+            )
+            persist_page(stem, json.dumps(deterministic, ensure_ascii=False))
+            record.update(
+                {
+                    "accepted": True,
+                    "strategy": "raster_repeated_column_groups_rebuilt",
+                    "metrics": deterministic_metrics,
+                    "changes": deterministic_changes,
+                }
+            )
+            results.append(record)
+            logger.info(
+                "%s raster repeated-column rebuild accepted: %s",
+                stem,
+                deterministic_metrics,
+            )
+            continue
         deterministic, deterministic_changes, deterministic_metrics = (
-            _validated_deterministic_geometry_repair(image_path, original)
+            _validated_deterministic_geometry_repair(
+                image_path, original, text_path
+            )
         )
         if deterministic is not None:
             record["candidate_options"].append(

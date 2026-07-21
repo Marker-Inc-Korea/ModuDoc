@@ -68,13 +68,28 @@ def _normalized_text_lines(data: dict) -> Counter:
     for element in data.get("elements") or []:
         if not isinstance(element, dict) or element.get("type") != "text":
             continue
-        for line in str(element.get("content") or "").splitlines():
+        for line in re.split(
+            r"(?:\r?\n)+|(?=[•◦▪■□※])",
+            str(element.get("content") or ""),
+        ):
             normalized = " ".join(
                 unicodedata.normalize("NFKC", line).casefold().split()
             )
+            normalized = re.sub(r"^[•◦▪■□※]\s*", "", normalized)
             if normalized:
                 lines.append(normalized)
     return Counter(lines)
+
+
+def _normalized_word_inventory(data: dict) -> Counter:
+    """Preserve lexical content while allowing line and panel boundaries to move."""
+    value = " ".join(
+        str(element.get("content") or "")
+        for element in data.get("elements") or []
+        if isinstance(element, dict) and element.get("type") == "text"
+    )
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return Counter(re.findall(r"\w+", value, flags=re.UNICODE))
 
 
 def _max_text_run(data: dict) -> int:
@@ -226,6 +241,8 @@ def _reassignment_only(original: dict, candidate: dict) -> bool:
     return (
         changed
         and _normalized_inventory(original) == _normalized_inventory(candidate)
+        and _normalized_word_inventory(original)
+        == _normalized_word_inventory(candidate)
         and _normalized_text_lines(original) == _normalized_text_lines(candidate)
     )
 

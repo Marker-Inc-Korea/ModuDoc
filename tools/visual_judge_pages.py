@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import html
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import unicodedata
 from pathlib import Path
 
 from PIL import Image
+from bs4 import BeautifulSoup
 
 
 SYSTEM = """You are a strict visual QA judge for document parsing.
@@ -83,6 +85,10 @@ Evidence is mandatory for a failure:
   structure_evidence describing both image and candidate, including short
   candidate snippets in their actual JSON sequence. Read that sequence before
   claiming an ordering difference.
+- Write every candidate reference in structural evidence exactly as
+  "candidate element index N". Order evidence must cite at least two candidate
+  indexes. Table evidence must cite its candidate table index and numeric image
+  versus candidate row/column counts.
 - Text present in any candidate element is not missing merely because its
   element type differs. Do not require a figure description to repeat text
   already preserved in separate text/table elements.
@@ -133,6 +139,10 @@ or phase row inside one continuous, aligned outer grid is valid as a colspan row
 within one table and does not by itself prove that separate tables were merged.
 Whitespace and punctuation-style variants are not wrong_text. Page counters,
 repeated headers, and repeated footers are not missing_text.
+Write every structural candidate reference exactly as "candidate element index
+N". Order evidence must cite at least two candidate indexes. Table evidence
+must cite its candidate table index and numeric image-versus-candidate row or
+column counts.
 When evidence is ambiguous, set confirmed_failure=false rather than guessing."""
 
 
@@ -204,7 +214,9 @@ def first_json_obj(text: str | None) -> dict | None:
 
 
 def norm_text(text: object) -> str:
-    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    value = unicodedata.normalize(
+        "NFKC", html.unescape(str(text or ""))
+    ).casefold()
     return "".join(char for char in value if char.isalnum())
 
 
@@ -397,11 +409,7 @@ def objective_quality_failures(data: dict) -> list[str]:
         for element in data.get("elements") or []
         if isinstance(element, dict)
     ]
-    notice_only = bool(elements) and all(
-        element.get("_source") == "eml_notice"
-        and str(element.get("content") or "").strip()
-        for element in elements
-    )
+    notice_only = is_notice_only_page(data)
     if data.get("low_confidence") and not notice_only:
         failures.append("page_low_confidence")
     for index, element in enumerate(elements):
@@ -426,7 +434,101 @@ def objective_quality_failures(data: dict) -> list[str]:
     return sorted(set(failures))
 
 
-def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
+def is_notice_only_page(data: dict) -> bool:
+    elements = [
+        element
+        for element in (data or {}).get("elements") or []
+        if isinstance(element, dict)
+    ]
+    return bool(elements) and all(
+        element.get("_source") == "eml_notice"
+        and str(element.get("content") or "").strip()
+        for element in elements
+    )
+
+
+def candidate_structure_facts(data: dict) -> dict:
+    elements = list(data.get("elements") or []) if isinstance(data, dict) else []
+    tables = {}
+
+    def span(value: object) -> int:
+        try:
+            return max(1, int(value or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(str(element.get("content") or ""), "html.parser")
+        table = soup.find("table")
+        if table is None:
+            continue
+        rows = [
+            row
+            for row in table.find_all("tr")
+            if row.find_parent("table") is table
+        ]
+        widths = [
+            sum(
+                span(cell.get("colspan", 1))
+                for cell in row.find_all(["td", "th"], recursive=False)
+            )
+            for row in rows
+        ]
+        tables[index] = {
+            "rows": len(rows),
+            "columns": max(widths, default=0),
+            "table_tags": len(soup.find_all("table")),
+        }
+    return {
+        "element_indices": [
+            index for index, element in enumerate(elements) if isinstance(element, dict)
+        ],
+        "table_elements": tables,
+    }
+
+
+def _candidate_index_references(evidence: list[str], valid_indices: set[int]) -> set[int]:
+    references = set()
+    pattern = re.compile(
+        r"(?:candidate|후보)(?:(?![.;]).){0,80}?"
+        r"(?:element\s*)?(?:index|인덱스|요소)\s*#?\s*(\d+)",
+        re.I,
+    )
+    for item in evidence:
+        for match in pattern.finditer(str(item)):
+            index = int(match.group(1))
+            if index in valid_indices:
+                references.add(index)
+    return references
+
+
+def structural_evidence_supported(
+    issue: str, evidence: list[str], facts: dict | None
+) -> bool:
+    if facts is None:
+        return bool(evidence)
+    valid_indices = set(facts.get("element_indices") or [])
+    references = _candidate_index_references(evidence, valid_indices)
+    if issue in {"wrong_order", "toc_structure"}:
+        return len(references) >= 2
+    if issue == "table_structure":
+        table_indices = set((facts.get("table_elements") or {}).keys())
+        geometry = re.compile(
+            r"\b\d+\s*(?:rows?|columns?|cols?|행|열|table\s*tags?)\b",
+            re.I,
+        )
+        return bool(
+            references & table_indices
+            and any(geometry.search(str(item)) for item in evidence)
+        )
+    return bool(evidence)
+
+
+def stabilize_verdict(
+    verdict: dict, structured_text: str, structure_facts: dict | None = None
+) -> dict:
     """Reduce obvious VLM-judge false positives without hiding hard failures."""
     verdict = dict(verdict or {})
     issues = list(verdict.get("issue_types") or [])
@@ -488,6 +590,17 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
     structural_types = {"wrong_order", "table_structure", "toc_structure"}
     if not structure_evidence:
         issues = [item for item in issues if item not in structural_types]
+    elif structure_facts is not None:
+        issues = [
+            item
+            for item in issues
+            if item not in structural_types
+            or structural_evidence_supported(
+                item, structure_evidence, structure_facts
+            )
+        ]
+        if not set(issues) & structural_types:
+            structure_evidence = []
     score = int(verdict.get("score", 0) or 0)
     evidenced_structure = bool(set(issues) & structural_types and structure_evidence)
     hard_metadata = "empty_or_low_confidence" in issues
@@ -518,7 +631,11 @@ def stabilize_verdict(verdict: dict, structured_text: str) -> dict:
     return verdict
 
 
-def validated_review_issue_types(review: dict, structured_text: str = "") -> list[str]:
+def validated_review_issue_types(
+    review: dict,
+    structured_text: str = "",
+    structure_facts: dict | None = None,
+) -> list[str]:
     """Accept review categories only when their required evidence is checkable."""
     raw_types = list((review or {}).get("confirmed_issue_types") or [])
     nstruct = norm_text(structured_text)
@@ -580,6 +697,9 @@ def validated_review_issue_types(review: dict, structured_text: str = "") -> lis
             item
             for item in raw_types
             if item in {"wrong_order", "table_structure", "toc_structure"}
+            and structural_evidence_supported(
+                item, structure_evidence, structure_facts
+            )
         )
 
     generic_evidence = [
@@ -593,12 +713,20 @@ def validated_review_issue_types(review: dict, structured_text: str = "") -> lis
     return [item for item in raw_types if item in valid]
 
 
-def apply_failure_review(primary: dict, review: dict, structured_text: str = "") -> dict:
+def apply_failure_review(
+    primary: dict,
+    review: dict,
+    structured_text: str = "",
+    structure_facts: dict | None = None,
+) -> dict:
     """Merge an adjudication while retaining the primary verdict separately."""
     result = dict(primary or {})
     primary_types = list(result.get("issue_types") or [])
     reviewed_types = [
-        item for item in validated_review_issue_types(review, structured_text)
+        item
+        for item in validated_review_issue_types(
+            review, structured_text, structure_facts
+        )
         if item in primary_types
     ]
     confirmed = bool((review or {}).get("confirmed_failure") and reviewed_types)
@@ -644,8 +772,15 @@ def apply_failure_review(primary: dict, review: dict, structured_text: str = "")
     return result
 
 
-def review_failure(client, model: str, structured: str, primary: dict, b64: str,
-                   args: argparse.Namespace) -> dict | None:
+def review_failure(
+    client,
+    model: str,
+    structured: str,
+    primary: dict,
+    b64: str,
+    args: argparse.Namespace,
+    structure_facts: dict | None = None,
+) -> dict | None:
     base_user = (
         "Structured JSON candidate:\n"
         "<structured_json>\n"
@@ -655,6 +790,8 @@ def review_failure(client, model: str, structured: str, primary: dict, b64: str,
         "<claimed_issue_types>\n"
         f"{json.dumps(primary.get('issue_types') or [], ensure_ascii=False)}\n"
         "</claimed_issue_types>\n\n"
+        "Authoritative candidate geometry (indexes and parsed HTML counts):\n"
+        f"<candidate_structure>{json.dumps(structure_facts or {}, ensure_ascii=False)}</candidate_structure>\n\n"
         "Independently determine whether any supplied category is materially true."
     )
     for attempt in range(args.retries + 1):
@@ -663,7 +800,9 @@ def review_failure(client, model: str, structured: str, primary: dict, b64: str,
             if attempt:
                 user += (
                     "\n\nRetry requirement: return one compact JSON object only. "
-                    "Keep every evidence list to at most four items and the reason to one sentence."
+                    "Keep every evidence list to at most four items and the reason to one sentence. "
+                    "For structural claims, use the exact phrase 'candidate element index N' "
+                    "and include the required numeric geometry."
                 )
             resp = client.chat.completions.create(
                 model=model,
@@ -688,6 +827,23 @@ def review_failure(client, model: str, structured: str, primary: dict, b64: str,
             )
             verdict = first_json_obj(resp.choices[0].message.content)
             if verdict is not None:
+                structural_claims = [
+                    issue
+                    for issue in verdict.get("confirmed_issue_types") or []
+                    if issue in {"wrong_order", "table_structure", "toc_structure"}
+                ]
+                evidence = [
+                    str(item)
+                    for item in verdict.get("structure_evidence") or []
+                ]
+                if structural_claims and not any(
+                    structural_evidence_supported(
+                        issue, evidence, structure_facts
+                    )
+                    for issue in structural_claims
+                ):
+                    if attempt < args.retries:
+                        continue
                 return verdict
         except Exception:
             pass
@@ -781,6 +937,25 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
         )
     except Exception:
         structured_data = {}
+    structure_facts = candidate_structure_facts(structured_data)
+    if is_notice_only_page(structured_data):
+        result.update(
+            {
+                "pass": True,
+                "score": 100,
+                "severity": "none",
+                "issue_types": [],
+                "reason": "Deterministic attachment notice is fully represented.",
+                "primary_pass": True,
+                "primary_verdict": {
+                    "pass": True,
+                    "issue_types": [],
+                    "notice_only": True,
+                },
+                "seconds": round(time.time() - started, 2),
+            }
+        )
+        return result
     objective_failures = objective_quality_failures(structured_data)
     if objective_failures:
         result.update(
@@ -807,6 +982,8 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
         "<structured_json>\n"
         f"{structured}\n"
         "</structured_json>\n\n"
+        "Authoritative candidate geometry (indexes and parsed HTML counts):\n"
+        f"<candidate_structure>{json.dumps(structure_facts, ensure_ascii=False)}</candidate_structure>\n\n"
         "Judge this page against the image. Use a concise Korean reason when the document is Korean."
     )
     b64 = encode_image(item["image"], args.max_width)
@@ -817,7 +994,9 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
             if attempt:
                 user += (
                     "\n\nRetry requirement: return one compact JSON object only. "
-                    "Keep every evidence list to at most four items and the reason to one sentence."
+                    "Keep every evidence list to at most four items and the reason to one sentence. "
+                    "For structural claims, use the exact phrase 'candidate element index N' "
+                    "and include the required numeric geometry."
                 )
             resp = client.chat.completions.create(
                 model=model,
@@ -847,7 +1026,22 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
                     + (f" (finish_reason={finish_reason})" if finish_reason else "")
                 )
             plain_text = structured_plain_text(item["structured"])
-            verdict = stabilize_verdict(verdict, plain_text)
+            raw_structural = [
+                issue
+                for issue in verdict.get("issue_types") or []
+                if issue in {"wrong_order", "table_structure", "toc_structure"}
+            ]
+            raw_evidence = [
+                str(item) for item in verdict.get("structure_evidence") or []
+            ]
+            if raw_structural and not any(
+                structural_evidence_supported(
+                    issue, raw_evidence, structure_facts
+                )
+                for issue in raw_structural
+            ) and attempt < args.retries:
+                continue
+            verdict = stabilize_verdict(verdict, plain_text, structure_facts)
             primary = dict(verdict)
             result["primary_pass"] = bool(primary.get("pass"))
             result["primary_verdict"] = primary
@@ -856,11 +1050,21 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
                 and args.review_failures
                 and "empty_or_low_confidence" not in (primary.get("issue_types") or [])
             ):
-                review = review_failure(client, model, structured, primary, b64, args)
+                review = review_failure(
+                    client,
+                    model,
+                    structured,
+                    primary,
+                    b64,
+                    args,
+                    structure_facts,
+                )
                 if review is not None:
                     result["reviewed"] = True
                     result["review_verdict"] = review
-                    verdict = apply_failure_review(primary, review, plain_text)
+                    verdict = apply_failure_review(
+                        primary, review, plain_text, structure_facts
+                    )
             result.update(
                 {
                     "pass": bool(verdict.get("pass")),
