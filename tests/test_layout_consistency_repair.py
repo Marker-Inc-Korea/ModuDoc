@@ -128,6 +128,52 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
 
         self.assertTrue(repair._reassignment_only(original, corrected))
 
+    def test_merge_restores_original_bullet_spelling_after_vlm_reformatting(self):
+        original = {
+            "elements": [
+                {
+                    "type": "text",
+                    "content": "Search\n• Query",
+                    "_source": "vlm_page",
+                },
+                {
+                    "type": "text",
+                    "content": "Privacy\n• Shield\n• History",
+                },
+            ]
+        }
+        reformatted = {
+            "elements": [
+                {"type": "text", "content": "Search\n- Query\n- History"},
+                {"type": "text", "content": "Privacy\n- Shield"},
+            ]
+        }
+
+        merged = repair._merge_reassignment(original, reformatted)
+
+        self.assertIsNotNone(merged)
+        self.assertEqual(
+            merged["elements"][0]["content"],
+            "Search\n• Query\n• History",
+        )
+        self.assertEqual(merged["elements"][0]["_source"], "vlm_page")
+
+    def test_merge_rejects_rewritten_bullet_text_during_canonicalization(self):
+        original = {
+            "elements": [
+                {"type": "text", "content": "Search\n• Query"},
+                {"type": "text", "content": "Privacy\n• History"},
+            ]
+        }
+        rewritten = {
+            "elements": [
+                {"type": "text", "content": "Search\n- Queries"},
+                {"type": "text", "content": "Privacy\n- History"},
+            ]
+        }
+
+        self.assertIsNone(repair._merge_reassignment(original, rewritten))
+
 
 if __name__ == "__main__":
     unittest.main()

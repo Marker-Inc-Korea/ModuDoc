@@ -30,7 +30,7 @@ Return ONLY valid JSON with this schema:
   "pass": true|false,
   "score": 0-100,
   "severity": "none|minor|major|critical",
-  "issue_types": ["missing_text|wrong_text|wrong_order|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
+  "issue_types": ["missing_text|wrong_text|wrong_order|panel_assignment|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
   "missing_visible_text": ["short exact snippets"],
   "text_mismatches": [{"image_text": "exact image text", "candidate_text": "exact candidate text"}],
   "hallucinated_candidate_text": ["exact candidate-only snippets"],
@@ -65,6 +65,9 @@ alone. Numbered section markers take priority: an unnumbered heading between
 two numbered sections can remain a subsection of the earlier numbered section
 even when it begins the next column. For bounded peer cards or tiles, use row
 order left-to-right and keep each card's title and bullets together.
+When a card's body is attached to another card title or one candidate element
+mixes text from visually separate cards, report panel_assignment rather than
+wrong_order.
 For tables, exact HTML tags may differ, but cells/rows/headers and merged-cell
 meaning must be preserved. Before claiming that the candidate split or merged
 tables, count its actual top-level table elements and <table> tags and cite the
@@ -72,6 +75,8 @@ relevant element index. A full-width section or phase row inside one continuous,
 aligned outer grid does not split that grid into multiple tables; it is valid as
 one colspan row followed by the next section's rows. For figures/screenshots/
 charts, visible labels/data and a reasonable description must be present.
+Always include every visible header row in both image and candidate row counts.
+If useful, state header and body row counts separately before comparing totals.
 
 Each candidate element includes an explicit zero-based "index". That index is
 the authoritative JSON sequence. Quote the relevant indexes before reporting
@@ -81,14 +86,16 @@ Evidence is mandatory for a failure:
 - Every wrong_text claim needs an image_text/candidate_text pair. Never cite
   candidate text by itself. The normalized pair must actually differ.
 - Every hallucination claim needs an exact candidate-only snippet.
-- Every wrong_order/table_structure/toc_structure claim needs concrete
+- Every wrong_order/panel_assignment/table_structure/toc_structure claim needs concrete
   structure_evidence describing both image and candidate, including short
   candidate snippets in their actual JSON sequence. Read that sequence before
   claiming an ordering difference.
 - Write every candidate reference in structural evidence exactly as
   "candidate element index N". Order evidence must cite at least two candidate
-  indexes. Table evidence must cite its candidate table index and numeric image
-  versus candidate row/column counts.
+  indexes. Panel-assignment evidence must cite the affected candidate index and
+  both the visible card title and misplaced body snippet. Table evidence must
+  cite its candidate table index and numeric image versus candidate row/column
+  counts.
 - Text present in any candidate element is not missing merely because its
   element type differs. Do not require a figure description to repeat text
   already preserved in separate text/table elements.
@@ -104,13 +111,13 @@ may be wrong; do not assume that any supplied category is present.
 Return ONLY valid JSON:
 {
   "confirmed_failure": true|false,
-  "confirmed_issue_types": ["missing_text|wrong_text|wrong_order|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
+  "confirmed_issue_types": ["missing_text|wrong_text|wrong_order|panel_assignment|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
   "missing_visible_text": ["short exact image snippets absent from candidate"],
   "text_mismatches": [{"image_text": "exact image text", "candidate_text": "exact candidate text"}],
   "hallucinated_candidate_text": ["exact candidate-only snippets"],
   "structure_evidence": ["specific image-vs-candidate structural fact"],
   "evidence": ["specific non-text evidence for figure_description or other"],
-  "rejected_claims": ["short explanation"],
+  "rejected_claims": ["indexed image-vs-candidate refutation"],
   "reason": "short final reason"
 }
 Keep every evidence list to at most four decisive items and the reason to one
@@ -127,12 +134,15 @@ Count the candidate's actual top-level table elements and <table> tags before
 confirming any split/merge claim. Treat caption as metadata with no above/below
 position. Do not confirm a failure merely because a heading, formula, numbered
 item, or footnote is represented by a text element.
+Always include every visible header row in both image and candidate row counts;
+state header and body row counts separately when an off-by-one claim is possible.
 For continuous multi-column prose, expect the full left column before the next
 column and derive heading hierarchy from numbering and typography. An
 unnumbered heading between two numbered sections can belong to the earlier
 section even at the top of the next column. For bounded peer cards or tiles,
 expect row order left-to-right and verify that each card's body remains attached
-to its own title.
+to its own title. Classify a body/title attachment error as panel_assignment,
+not merely wrong_order.
 Each candidate element includes an explicit zero-based "index" that defines its
 sequence. Cite those indexes before confirming wrong_order. A full-width section
 or phase row inside one continuous, aligned outer grid is valid as a colspan row
@@ -140,9 +150,14 @@ within one table and does not by itself prove that separate tables were merged.
 Whitespace and punctuation-style variants are not wrong_text. Page counters,
 repeated headers, and repeated footers are not missing_text.
 Write every structural candidate reference exactly as "candidate element index
-N". Order evidence must cite at least two candidate indexes. Table evidence
-must cite its candidate table index and numeric image-versus-candidate row or
-column counts.
+N". Order evidence must cite at least two candidate indexes. A card-body/title
+association error is panel_assignment and must cite the affected candidate
+index plus the visible card title and body snippet. Table evidence must cite its
+candidate table index and numeric image-versus-candidate row or column counts.
+When rejecting a structural claim, rejected_claims must meet the same grounding
+standard: exact candidate indexes and concrete image/candidate facts, including
+numeric geometry for a table claim. A generic statement that the sequence or
+structure matches is not enough to overturn an evidenced failure.
 When evidence is ambiguous, set confirmed_failure=false rather than guessing."""
 
 
@@ -152,6 +167,13 @@ OBJECTIVE_QUALITY_ISSUES = {
     "ragged_rows",
     "nested_table",
     "quality_check_error",
+}
+
+STRUCTURAL_ISSUE_TYPES = {
+    "wrong_order",
+    "panel_assignment",
+    "table_structure",
+    "toc_structure",
 }
 
 
@@ -478,6 +500,9 @@ def candidate_structure_facts(data: dict) -> dict:
         ]
         tables[index] = {
             "rows": len(rows),
+            "header_rows": sum(
+                bool(row.find_all("th", recursive=False)) for row in rows
+            ),
             "columns": max(widths, default=0),
             "table_tags": len(soup.find_all("table")),
         }
@@ -504,6 +529,73 @@ def _candidate_index_references(evidence: list[str], valid_indices: set[int]) ->
     return references
 
 
+def _geometry_values(text: str, unit: str) -> list[int]:
+    suffix = {
+        "rows": r"(?:rows?|행(?:\s*수)?)",
+        "columns": r"(?:columns?|cols?|열(?:\s*수)?)",
+        "table_tags": r"(?:table\s*tags?|표(?:\s*개수)?)",
+    }[unit]
+    return [
+        int(match.group(1))
+        for match in re.finditer(rf"\b(\d+)\s*{suffix}\b", text, re.I)
+    ]
+
+
+def _candidate_geometry_claim(text: str, index: int, unit: str) -> int | None:
+    reference = re.compile(
+        rf"(?:candidate|후보)(?:(?![.;]).){{0,80}}?"
+        rf"(?:element\s*)?(?:index|인덱스|요소)\s*#?\s*{index}\b",
+        re.I,
+    )
+    for match in reference.finditer(text):
+        candidate_clause = text[match.end() : match.end() + 180]
+        boundary = re.search(
+            r"\b(?:but|while|whereas|image|page|raster)\b|이미지|원본|페이지|반면",
+            candidate_clause,
+            re.I,
+        )
+        if boundary:
+            candidate_clause = candidate_clause[: boundary.start()]
+        values = _geometry_values(candidate_clause, unit)
+        if values:
+            return values[0]
+    return None
+
+
+def _table_geometry_evidence_supported(
+    evidence: object, table_index: int, facts: dict
+) -> bool:
+    text = str(evidence)
+    declared = {
+        unit: _candidate_geometry_claim(text, table_index, unit)
+        for unit in ("rows", "columns", "table_tags")
+    }
+    for unit, value in declared.items():
+        if value is not None and value != facts.get(unit):
+            return False
+
+    mismatched_units = []
+    for unit in ("rows", "columns", "table_tags"):
+        values = _geometry_values(text, unit)
+        if declared[unit] is not None and len(set(values)) >= 2:
+            mismatched_units.append(unit)
+    if not mismatched_units:
+        return False
+
+    if "rows" in mismatched_units:
+        rows = int(facts.get("rows") or 0)
+        header_rows = int(facts.get("header_rows") or 0)
+        values = set(_geometry_values(text, "rows"))
+        if (
+            header_rows > 0
+            and rows in values
+            and rows - header_rows in values
+            and not re.search(r"\bheader\b|헤더|제목\s*행", text, re.I)
+        ):
+            return False
+    return True
+
+
 def structural_evidence_supported(
     issue: str, evidence: list[str], facts: dict | None
 ) -> bool:
@@ -513,17 +605,38 @@ def structural_evidence_supported(
     references = _candidate_index_references(evidence, valid_indices)
     if issue in {"wrong_order", "toc_structure"}:
         return len(references) >= 2
-    if issue == "table_structure":
-        table_indices = set((facts.get("table_elements") or {}).keys())
-        geometry = re.compile(
-            r"\b\d+\s*(?:rows?|columns?|cols?|행|열|table\s*tags?)\b",
+    if issue == "panel_assignment":
+        association = re.compile(
+            r"\b(?:card|panel|tile|box|title|body|bullet)s?\b|"
+            r"카드|패널|타일|상자|박스|제목|본문|불릿|글머리표",
             re.I,
         )
-        return bool(
-            references & table_indices
-            and any(geometry.search(str(item)) for item in evidence)
+        return bool(references and any(association.search(str(item)) for item in evidence))
+    if issue == "table_structure":
+        table_indices = set((facts.get("table_elements") or {}).keys())
+        return any(
+            _table_geometry_evidence_supported(item, table_index, table_facts)
+            for item in evidence
+            for table_index, table_facts in (facts.get("table_elements") or {}).items()
+            if table_index in references & table_indices
         )
     return bool(evidence)
+
+
+def grounded_structural_rejection(
+    issue: str, evidence: list[str], facts: dict | None
+) -> bool:
+    """Require a review overturn to compare indexed candidate facts to the image."""
+    if not structural_evidence_supported(issue, evidence, facts):
+        return False
+    comparison = " ".join(str(item) for item in evidence)
+    return bool(
+        re.search(
+            r"\b(?:image|page|visible|raster)\b|이미지|원본|페이지|화면",
+            comparison,
+            re.I,
+        )
+    )
 
 
 def stabilize_verdict(
@@ -587,7 +700,7 @@ def stabilize_verdict(
         issues = [item for item in issues if item != "wrong_text"]
     if not hallucinated:
         issues = [item for item in issues if item != "hallucination"]
-    structural_types = {"wrong_order", "table_structure", "toc_structure"}
+    structural_types = STRUCTURAL_ISSUE_TYPES
     if not structure_evidence:
         issues = [item for item in issues if item not in structural_types]
     elif structure_facts is not None:
@@ -696,7 +809,7 @@ def validated_review_issue_types(
         valid.update(
             item
             for item in raw_types
-            if item in {"wrong_order", "table_structure", "toc_structure"}
+            if item in STRUCTURAL_ISSUE_TYPES
             and structural_evidence_supported(
                 item, structure_evidence, structure_facts
             )
@@ -729,7 +842,43 @@ def apply_failure_review(
         )
         if item in primary_types
     ]
+    if not (review or {}).get("confirmed_failure"):
+        reviewed_types = []
+    primary_structure_evidence = [
+        str(item).strip()
+        for item in result.get("structure_evidence") or []
+        if str(item).strip()
+    ]
+    evidenced_primary_structural = [
+        issue
+        for issue in primary_types
+        if structure_facts is not None
+        and issue in STRUCTURAL_ISSUE_TYPES
+        and structural_evidence_supported(
+            issue, primary_structure_evidence, structure_facts
+        )
+    ]
+    rejected_claims = [
+        str(item).strip()
+        for item in (review or {}).get("rejected_claims") or []
+        if str(item).strip()
+    ]
+    grounded_rejections = {
+        issue
+        for issue in evidenced_primary_structural
+        if grounded_structural_rejection(issue, rejected_claims, structure_facts)
+    }
+    retained_structural = [
+        issue
+        for issue in evidenced_primary_structural
+        if issue not in reviewed_types and issue not in grounded_rejections
+    ]
+    reviewed_types.extend(
+        issue for issue in retained_structural if issue not in reviewed_types
+    )
     confirmed = bool((review or {}).get("confirmed_failure") and reviewed_types)
+    if retained_structural:
+        confirmed = True
     if confirmed:
         if reviewed_types:
             result["issue_types"] = reviewed_types
@@ -739,7 +888,7 @@ def apply_failure_review(
             result["text_mismatches"] = []
         if "hallucination" not in reviewed_types:
             result["hallucinated_candidate_text"] = []
-        if not set(reviewed_types) & {"wrong_order", "table_structure", "toc_structure"}:
+        if not set(reviewed_types) & STRUCTURAL_ISSUE_TYPES:
             result["structure_evidence"] = []
         result["wrong_or_hallucinated_text"] = [
             item.get("candidate_text", "")
@@ -763,7 +912,12 @@ def apply_failure_review(
                 "wrong_or_hallucinated_text": [],
             }
         )
-    if confirmed and (review or {}).get("reason"):
+    if retained_structural:
+        result["reason"] = str(
+            (primary or {}).get("reason")
+            or "Primary structural failure retained because the review supplied no grounded refutation."
+        )
+    elif confirmed and (review or {}).get("reason"):
         result["reason"] = str(review["reason"])
     elif not (review or {}).get("confirmed_failure") and (review or {}).get("reason"):
         result["reason"] = str(review["reason"])
@@ -794,6 +948,20 @@ def review_failure(
         f"<candidate_structure>{json.dumps(structure_facts or {}, ensure_ascii=False)}</candidate_structure>\n\n"
         "Independently determine whether any supplied category is materially true."
     )
+    primary_structure_evidence = [
+        str(item).strip()
+        for item in primary.get("structure_evidence") or []
+        if str(item).strip()
+    ]
+    evidenced_primary_structural = [
+        issue
+        for issue in primary.get("issue_types") or []
+        if structure_facts is not None
+        and issue in STRUCTURAL_ISSUE_TYPES
+        and structural_evidence_supported(
+            issue, primary_structure_evidence, structure_facts
+        )
+    ]
     for attempt in range(args.retries + 1):
         try:
             user = base_user
@@ -802,7 +970,8 @@ def review_failure(
                     "\n\nRetry requirement: return one compact JSON object only. "
                     "Keep every evidence list to at most four items and the reason to one sentence. "
                     "For structural claims, use the exact phrase 'candidate element index N' "
-                    "and include the required numeric geometry."
+                    "and include the required numeric geometry. When rejecting one, put an "
+                    "equally indexed, concrete image/candidate refutation in rejected_claims."
                 )
             resp = client.chat.completions.create(
                 model=model,
@@ -830,17 +999,35 @@ def review_failure(
                 structural_claims = [
                     issue
                     for issue in verdict.get("confirmed_issue_types") or []
-                    if issue in {"wrong_order", "table_structure", "toc_structure"}
+                    if issue in STRUCTURAL_ISSUE_TYPES
                 ]
                 evidence = [
                     str(item)
                     for item in verdict.get("structure_evidence") or []
                 ]
-                if structural_claims and not any(
-                    structural_evidence_supported(
+                supported_claims = {
+                    issue
+                    for issue in structural_claims
+                    if verdict.get("confirmed_failure")
+                    and structural_evidence_supported(
                         issue, evidence, structure_facts
                     )
-                    for issue in structural_claims
+                }
+                rejected_claims = [
+                    str(item)
+                    for item in verdict.get("rejected_claims") or []
+                ]
+                unresolved_primary = [
+                    issue
+                    for issue in evidenced_primary_structural
+                    if issue not in supported_claims
+                    and not grounded_structural_rejection(
+                        issue, rejected_claims, structure_facts
+                    )
+                ]
+                if (
+                    (structural_claims and len(supported_claims) < len(structural_claims))
+                    or unresolved_primary
                 ):
                     if attempt < args.retries:
                         continue
@@ -1029,7 +1216,7 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
             raw_structural = [
                 issue
                 for issue in verdict.get("issue_types") or []
-                if issue in {"wrong_order", "table_structure", "toc_structure"}
+                if issue in STRUCTURAL_ISSUE_TYPES
             ]
             raw_evidence = [
                 str(item) for item in verdict.get("structure_evidence") or []

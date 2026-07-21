@@ -4169,12 +4169,24 @@ class DocumentProcessor:
                                     _native_prep = table_validate.prepare_native(json.load(_nf))
                             except Exception:
                                 _native_prep = []
+                        deduped = table_validate.restore_uniquely_supported_native_parents(
+                            deduped, _native_prep, source_text_layer
+                        )
                         deduped = table_validate.merge_adjacent_native_table_fragments(
                             deduped, _native_prep
                         )
                         rebuilt = []
                         for e in deduped:
                             if e.get("type") == "table" and e.get("content"):
+                                if e.get("_native"):
+                                    q = table_validate.assess_table_quality(
+                                        e["content"], e.get("caption"), allow_nested=True
+                                    )
+                                    rebuilt.append(_mark_element(
+                                        e, "native_table",
+                                        min(0.99, q.get("confidence", 0.99)),
+                                        q.get("issues")))
+                                    continue
                                 # 네이티브 우선: 내용일치하면 정답구조로 교체(검증/수리 생략 — 이미 정확).
                                 _nh = (table_validate.native_substitute(e["content"], _native_prep)
                                        if _native_prep else None)

@@ -2521,6 +2521,245 @@ def _raster_evidenced_flattened_section_rebuild(
     return candidate, [change]
 
 
+def _raster_evidenced_header_colspan_completion(
+    image_path: Path, data: dict
+) -> tuple[dict | None, list[dict]]:
+    """Complete one deficient grouped-header span from an unambiguous raster grid."""
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("L")
+    except Exception:
+        return None, []
+
+    horizontal_lines = _horizontal_grid_lines(image)
+    if len(horizontal_lines) < 5:
+        return None, []
+    endpoint_tolerance = max(8, int(image.width * 0.012))
+    y_tolerance = max(4, int(image.height * 0.003))
+    candidates = []
+    table_number = -1
+    for element_index, element in enumerate(data.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        table_number += 1
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        geometry = _table_geometry(element)
+        widths = geometry.get("expanded_row_widths") or []
+        target_width = geometry.get("most_frequent_width") or 0
+        if (
+            len(rows) < 4
+            or target_width < 4
+            or len(widths) != len(rows)
+            or widths[0] != target_width - 1
+            or any(width != target_width for width in widths[1:])
+        ):
+            continue
+        first_cells = rows[0].find_all(["td", "th"], recursive=False)
+        current_spans = [
+            table_validate._span_int(cell, "colspan") for cell in first_cells
+        ]
+        if len(first_cells) < 3 or sum(current_spans) != target_width - 1:
+            continue
+
+        endpoint_groups = []
+        for line in horizontal_lines:
+            matching = []
+            for group_index, group in enumerate(endpoint_groups):
+                left = round(sum(item[1] for item in group) / len(group))
+                right = round(sum(item[2] for item in group) / len(group))
+                if (
+                    abs(line[1] - left) <= endpoint_tolerance
+                    and abs(line[2] - right) <= endpoint_tolerance
+                ):
+                    matching.append(
+                        (abs(line[1] - left) + abs(line[2] - right), group_index)
+                    )
+            if matching:
+                endpoint_groups[min(matching)[1]].append(line)
+            else:
+                endpoint_groups.append([line])
+
+        raster_matches = []
+        for endpoint_group in endpoint_groups:
+            deduplicated = []
+            for line in sorted(endpoint_group):
+                if deduplicated and line[0] - deduplicated[-1][0] <= y_tolerance:
+                    if line[3] > deduplicated[-1][3]:
+                        deduplicated[-1] = line
+                    continue
+                deduplicated.append(line)
+            # A two-row header has one partial separator, so its full-width
+            # boundary family contains exactly one fewer line than rows + 1.
+            if len(deduplicated) != len(rows):
+                continue
+            left = round(sum(item[1] for item in deduplicated) / len(deduplicated))
+            right = round(sum(item[2] for item in deduplicated) / len(deduplicated))
+            if right - left < max(180, int(image.width * 0.30)):
+                continue
+            boundaries_y = [item[0] for item in deduplicated]
+            if any(
+                lower - upper < 12
+                for upper, lower in zip(boundaries_y, boundaries_y[1:])
+            ):
+                continue
+            partial = [
+                line
+                for line in horizontal_lines
+                if boundaries_y[0] + 8 < line[0] < boundaries_y[1] - 8
+                and line[1] > left + endpoint_tolerance
+                and abs(line[2] - right) <= endpoint_tolerance
+                and line[3] >= (right - left) * 0.35
+            ]
+            partial_y = _dedupe_positions(
+                [line[0] for line in partial], y_tolerance
+            )
+            if len(partial_y) != 1:
+                continue
+            separator_y = partial_y[0]
+            representative = min(partial, key=lambda line: abs(line[0] - separator_y))
+
+            body_lines = []
+            for upper, lower in zip(deduplicated[1:], deduplicated[2:]):
+                positions = _dedupe_positions(
+                    _vertical_grid_lines(image, left, right, upper[0], lower[0]),
+                    max(4, int((right - left) * 0.006)),
+                )
+                positions = [
+                    left,
+                    *[
+                        value
+                        for value in positions
+                        if abs(value - left) > endpoint_tolerance
+                        and abs(value - right) > endpoint_tolerance
+                    ],
+                    right,
+                ]
+                if len(positions) == target_width + 1:
+                    body_lines.append(positions)
+            if len(body_lines) < 2:
+                continue
+            tolerance = max(6, int((right - left) * 0.012))
+            base_boundaries = [
+                round(sum(lines[index] for lines in body_lines) / len(body_lines))
+                for index in range(target_width + 1)
+            ]
+            if any(
+                abs(lines[index] - base_boundaries[index]) > tolerance
+                for lines in body_lines
+                for index in range(target_width + 1)
+            ):
+                continue
+
+            top_lines = _dedupe_positions(
+                _vertical_grid_lines(
+                    image, left, right, boundaries_y[0], separator_y
+                ),
+                max(4, int((right - left) * 0.006)),
+            )
+            top_lines = [
+                left,
+                *[
+                    value
+                    for value in top_lines
+                    if abs(value - left) > endpoint_tolerance
+                    and abs(value - right) > endpoint_tolerance
+                ],
+                right,
+            ]
+            mapped = []
+            for position in top_lines:
+                nearest = min(
+                    range(len(base_boundaries)),
+                    key=lambda index: abs(base_boundaries[index] - position),
+                )
+                if abs(base_boundaries[nearest] - position) > tolerance:
+                    mapped = []
+                    break
+                if not mapped or mapped[-1] != nearest:
+                    mapped.append(nearest)
+            if (
+                len(mapped) != len(first_cells) + 1
+                or mapped[0] != 0
+                or mapped[-1] != target_width
+            ):
+                continue
+            observed_spans = [right - left for left, right in zip(mapped, mapped[1:])]
+            differences = [
+                index
+                for index, (current, observed) in enumerate(
+                    zip(current_spans, observed_spans)
+                )
+                if current != observed
+            ]
+            if (
+                len(differences) != 1
+                or observed_spans[differences[0]]
+                != current_spans[differences[0]] + 1
+            ):
+                continue
+
+            partial_edges = [representative[1], representative[2]]
+            mapped_partial = []
+            for position in partial_edges:
+                nearest = min(
+                    range(len(base_boundaries)),
+                    key=lambda index: abs(base_boundaries[index] - position),
+                )
+                if abs(base_boundaries[nearest] - position) > tolerance:
+                    mapped_partial = []
+                    break
+                mapped_partial.append(nearest)
+            if (
+                len(mapped_partial) != 2
+                or not (0 < mapped_partial[0] < mapped_partial[1] == target_width)
+            ):
+                continue
+            raster_matches.append((observed_spans, differences[0]))
+
+        if len(raster_matches) != 1:
+            continue
+        observed_spans, changed_cell = raster_matches[0]
+        for cell, colspan in zip(first_cells, observed_spans):
+            if colspan == 1:
+                cell.attrs.pop("colspan", None)
+            else:
+                cell["colspan"] = str(colspan)
+        patched = copy.deepcopy(data)
+        patched_element = patched["elements"][element_index]
+        patched_element["content"] = str(table)
+        for key in ("_source", "_confidence", "_issues", "_native"):
+            patched_element.pop(key, None)
+        if _table_geometry(patched_element).get("expanded_row_widths") != [
+            target_width
+        ] * len(rows):
+            continue
+        candidates.append(
+            (
+                patched,
+                {
+                    "element_index": element_index,
+                    "table_index": table_number,
+                    "strategy": "raster_header_colspan_completed",
+                    "cell_index": changed_cell,
+                    "old_colspan": current_spans[changed_cell],
+                    "new_colspan": observed_spans[changed_cell],
+                    "columns": target_width,
+                },
+            )
+        )
+
+    if len(candidates) != 1:
+        return None, []
+    candidate, change = candidates[0]
+    return candidate, [change]
+
+
 def _raster_evidenced_header_rebuild(
     image_path: Path, data: dict
 ) -> tuple[dict | None, list[dict]]:
@@ -3005,6 +3244,10 @@ def _validated_deterministic_geometry_repair(
         )
         corrected, changes = _raster_evidenced_flattened_section_rebuild(
             image_path, original, source_text
+        )
+    if corrected is None:
+        corrected, changes = _raster_evidenced_header_colspan_completion(
+            image_path, original
         )
     if corrected is None:
         corrected, changes = _raster_evidenced_header_rebuild(image_path, original)

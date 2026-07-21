@@ -405,11 +405,20 @@ def _cell_set(html):
 def prepare_native(native_list):
     """네이티브 표 목록(dict: html,rows,cols)에 매칭용 셀집합·셀수 부착(빈표 제외)."""
     out = []
-    for nt in native_list or []:
+    for index, nt in enumerate(native_list or []):
         h = (nt.get("html") or "").strip()
         cs = _cell_set(h)
         if len(cs) >= 2:
-            out.append({"html": h, "_set": cs, "_n": len(cs)})
+            prepared = {
+                "html": h,
+                "_set": cs,
+                "_n": len(cs),
+                "_index": index,
+            }
+            for key in ("rows", "cols"):
+                if isinstance(nt.get(key), int) and nt[key] > 0:
+                    prepared[key] = nt[key]
+            out.append(prepared)
     return out
 
 def _split_header_body(html):
@@ -806,6 +815,150 @@ def _native_header_geometry(native_html):
     ):
         return None
     return labels, spans, counts[0][0], width
+
+
+def restore_uniquely_supported_native_parents(
+    elements, native_prepared, source_text
+):
+    """Restore one omitted outer native grid around its adjacent child table.
+
+    This is intentionally strict: every outer-cell label must occur on the
+    current page, none may already be represented, and the child must be the
+    unique near-exact structured-table match for the next native entry.
+    """
+    source = list(elements or [])
+    normalized_source = _ncell(source_text)
+    if not native_prepared or len(normalized_source) < 40:
+        return source
+
+    represented = _ncell(
+        " ".join(
+            BeautifulSoup(str(element.get("content") or ""), "html.parser")
+            .get_text(" ", strip=True)
+            for element in source
+            if isinstance(element, dict)
+        )
+    )
+    by_index = {item.get("_index"): item for item in native_prepared}
+    candidates = []
+    for parent in native_prepared:
+        child = by_index.get(parent.get("_index", -2) + 1)
+        if child is None:
+            continue
+        parent_set = set(parent.get("_set") or [])
+        if (
+            len(parent_set) < 6
+            or sum(map(len, parent_set)) < 40
+            or any(value not in normalized_source for value in parent_set)
+            or any(value in represented for value in parent_set)
+        ):
+            continue
+        try:
+            parent_soup = BeautifulSoup(parent.get("html") or "", "html.parser")
+            parent_table = parent_soup.find("table")
+            child_table = BeautifulSoup(
+                child.get("html") or "", "html.parser"
+            ).find("table")
+        except Exception:
+            continue
+        if (
+            parent_table is None
+            or child_table is None
+            or parent_table.find("table") is not None
+        ):
+            continue
+        direct_cells = [
+            cell
+            for cell in parent_table.find_all(["td", "th"])
+            if cell.find_parent("table") is parent_table
+        ]
+        empty_cells = [
+            cell
+            for cell in direct_cells
+            if not _cell_own_text(cell) and cell.find("table") is None
+        ]
+        parent_values = {
+            value
+            for cell in direct_cells
+            if (value := _cell_own_text(cell))
+        }
+        if (
+            len(empty_cells) != 1
+            or _span_int(empty_cells[0], "colspan") < 2
+            or len(parent_values) < 6
+            or sum(map(len, parent_values)) < 40
+            or any(value not in normalized_source for value in parent_values)
+            or any(value in represented for value in parent_values)
+        ):
+            continue
+
+        parent_rows = _rows_of(parent_table)
+        _, parent_widths, _, parent_columns = _build_grid(parent_rows)
+        child_rows = _rows_of(child_table)
+        _, child_widths, _, child_columns = _build_grid(child_rows)
+        if (
+            not parent_widths
+            or len(set(parent_widths)) != 1
+            or parent_columns < 2
+            or not child_widths
+            or len(set(child_widths)) != 1
+            or child_columns < _span_int(empty_cells[0], "colspan")
+        ):
+            continue
+
+        child_matches = []
+        for element_index, element in enumerate(source):
+            if not isinstance(element, dict) or element.get("type") != "table":
+                continue
+            existing_html = element.get("content") or ""
+            existing_set = _cell_set(existing_html)
+            overlap = len(existing_set & child["_set"])
+            if (
+                not existing_set
+                or overlap / len(child["_set"]) < 0.90
+                or overlap / len(existing_set) < 0.90
+            ):
+                continue
+            existing_text = _ordered_table_text(existing_html)
+            child_text = _ordered_table_text(child.get("html"))
+            if (
+                min(len(existing_text), len(child_text))
+                / max(1, max(len(existing_text), len(child_text)))
+                < 0.90
+                or SequenceMatcher(
+                    None, existing_text, child_text, autojunk=False
+                ).ratio()
+                < 0.95
+            ):
+                continue
+            child_matches.append(element_index)
+        if len(child_matches) != 1:
+            continue
+
+        target = empty_cells[0]
+        target.append(copy.copy(child_table))
+        restored_html = str(parent_table)
+        quality = assess_table_quality(restored_html, allow_nested=True)
+        if set(quality.get("issues") or []) & {
+            "no_table",
+            "empty_table",
+            "ragged_rows",
+            "quality_check_error",
+        }:
+            continue
+        candidates.append((child_matches[0], restored_html, quality))
+
+    if len(candidates) != 1:
+        return source
+    element_index, restored_html, quality = candidates[0]
+    restored = copy.deepcopy(source)
+    element = restored[element_index]
+    element["content"] = restored_html
+    element["_native"] = True
+    element["_source"] = "native_nested_parent_restored"
+    element["_confidence"] = min(0.99, quality.get("confidence", 0.99))
+    element.pop("_issues", None)
+    return restored
 
 
 def merge_adjacent_native_table_fragments(elements, native_prepared):

@@ -9,7 +9,7 @@ import json
 import os
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 from PIL import Image
@@ -79,6 +79,26 @@ def _normalized_text_lines(data: dict) -> Counter:
             if normalized:
                 lines.append(normalized)
     return Counter(lines)
+
+
+def _atomic_text_segments(content: object) -> list[tuple[tuple[str, ...], str]]:
+    """Split movable text while retaining the parser's exact source spelling."""
+    segments = []
+    for raw in re.split(
+        r"(?:\r?\n)+|(?=[•◦▪■□※])",
+        str(content or ""),
+    ):
+        source = raw.strip()
+        signature = tuple(
+            re.findall(
+                r"\w+",
+                unicodedata.normalize("NFKC", source).casefold(),
+                flags=re.UNICODE,
+            )
+        )
+        if source:
+            segments.append((signature, source))
+    return segments
 
 
 def _normalized_word_inventory(data: dict) -> Counter:
@@ -247,10 +267,74 @@ def _reassignment_only(original: dict, candidate: dict) -> bool:
     )
 
 
+def _canonicalized_reassignment(original: dict, candidate: dict) -> dict | None:
+    """Replace VLM list-marker rewrites with the exact original text segments."""
+    if not isinstance(original, dict) or not isinstance(candidate, dict):
+        return None
+    old_elements = original.get("elements") or []
+    new_elements = candidate.get("elements") or []
+    if (
+        not isinstance(old_elements, list)
+        or not isinstance(new_elements, list)
+        or len(old_elements) != len(new_elements)
+        or not old_elements
+        or not all(
+            isinstance(element, dict) for element in old_elements + new_elements
+        )
+        or [element.get("type") for element in old_elements]
+        != [element.get("type") for element in new_elements]
+    ):
+        return None
+
+    source_by_signature = defaultdict(deque)
+    source_signatures = Counter()
+    candidate_signatures = Counter()
+    candidate_segments = []
+    for element in old_elements:
+        if element.get("type") != "text":
+            continue
+        for signature, source in _atomic_text_segments(element.get("content")):
+            if not signature:
+                return None
+            source_by_signature[signature].append(source)
+            source_signatures[signature] += 1
+    for element in new_elements:
+        segments = (
+            _atomic_text_segments(element.get("content"))
+            if element.get("type") == "text"
+            else []
+        )
+        if any(not signature for signature, _ in segments):
+            return None
+        candidate_segments.append(segments)
+        candidate_signatures.update(signature for signature, _ in segments)
+    if not source_signatures or source_signatures != candidate_signatures:
+        return None
+
+    canonical = copy.deepcopy(candidate)
+    segment_index = 0
+    for element in canonical["elements"]:
+        segments = candidate_segments[segment_index]
+        segment_index += 1
+        if element.get("type") != "text":
+            continue
+        exact = []
+        for signature, _ in segments:
+            if not source_by_signature[signature]:
+                return None
+            exact.append(source_by_signature[signature].popleft())
+        element["content"] = "\n".join(exact)
+    if any(values for values in source_by_signature.values()):
+        return None
+    return canonical if _reassignment_only(original, canonical) else None
+
+
 def _merge_reassignment(original: dict, candidate: dict) -> dict | None:
     """Apply validated text moves while retaining parser metadata and evidence."""
     if not _reassignment_only(original, candidate):
-        return None
+        candidate = _canonicalized_reassignment(original, candidate)
+        if candidate is None:
+            return None
     merged = copy.deepcopy(original)
     for old, new in zip(merged["elements"], candidate["elements"]):
         if old.get("type") == "text":
@@ -309,7 +393,7 @@ def repair_layout_consistency(
                 image_path,
                 VERIFY_SYSTEM,
                 f"Structured candidate:\n<candidate>{public}</candidate>",
-                1024,
+                LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
             )
         except Exception as exc:
             record["error"] = f"initial review failed: {type(exc).__name__}: {exc}"
@@ -361,7 +445,7 @@ def repair_layout_consistency(
                 image_path,
                 VERIFY_SYSTEM,
                 f"Structured candidate:\n<candidate>{final_public}</candidate>",
-                1024,
+                LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
             )
         except Exception as exc:
             record["error"] = f"final review failed: {type(exc).__name__}: {exc}"

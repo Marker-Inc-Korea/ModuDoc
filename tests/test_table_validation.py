@@ -1062,6 +1062,59 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIsNone(repaired)
         self.assertEqual(changes, [])
 
+    def test_raster_completes_one_deficient_grouped_header_colspan(self):
+        original = {
+            "page_number": 1,
+            "elements": [
+                {
+                    "type": "table",
+                    "content": (
+                        "<table>"
+                        "<tr><th rowspan='2'>Stub</th><th colspan='2'>Group A</th>"
+                        "<th>Group B</th></tr>"
+                        "<tr><th>A1</th><th>A2</th><th>B1</th><th>B2</th></tr>"
+                        "<tr><td>R1</td><td>1</td><td>2</td><td>3</td><td>4</td></tr>"
+                        "<tr><td>R2</td><td>5</td><td>6</td><td>7</td><td>8</td></tr>"
+                        "<tr><td>R3</td><td>9</td><td>10</td><td>11</td><td>12</td></tr>"
+                        "<tr><td>R4</td><td>13</td><td>14</td><td>15</td><td>16</td></tr>"
+                        "</table>"
+                    ),
+                }
+            ],
+        }
+        image = Image.new("RGB", (900, 640), "white")
+        draw = ImageDraw.Draw(image)
+        x_lines = [50, 210, 370, 530, 690, 850]
+        full_y = [80, 240, 320, 400, 480, 560]
+        for y in full_y:
+            draw.line((x_lines[0], y, x_lines[-1], y), fill="black", width=3)
+        draw.line((x_lines[1], 160, x_lines[-1], 160), fill="black", width=3)
+        for x in (x_lines[0], x_lines[1], x_lines[3], x_lines[-1]):
+            draw.line((x, full_y[0], x, 160), fill="black", width=3)
+        for x in x_lines:
+            draw.line((x, 160, x, full_y[-1]), fill="black", width=3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "header-grid.png"
+            image.save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(changes[0]["strategy"], "raster_header_colspan_completed")
+        self.assertTrue(metrics["text_inventory_preserved"])
+        geometry = table_quality_repair._table_geometry(repaired["elements"][0])
+        self.assertEqual(geometry["expanded_row_widths"], [5] * 6)
+        soup = BeautifulSoup(repaired["elements"][0]["content"], "html.parser")
+        first = table_validate._rows_of(soup.find("table"))[0]
+        self.assertEqual(
+            [table_validate._span_int(cell, "colspan") for cell in first.find_all(["td", "th"], recursive=False)],
+            [1, 2, 2],
+        )
+
     def test_raster_evidenced_repair_rebuilds_a_shifted_two_row_header(self):
         original = {
             "page_number": 1,
@@ -1446,6 +1499,78 @@ class GenericTableRepairTests(unittest.TestCase):
         )
         self.assertNotIn("ragged_rows", quality["issues"])
         self.assertEqual(quality["cols"], 5)
+
+    def test_source_supported_missing_native_parent_wraps_unique_child(self):
+        parent = (
+            "<table>"
+            "<tr><td>Outer category alpha</td><td>Outer category beta</td>"
+            "<td>Outer category gamma</td><td>Outer category delta</td></tr>"
+            "<tr><td>Review scope one</td><td>Review scope two</td>"
+            "<td>Review scope three</td><td>Review scope four</td></tr>"
+            "<tr><td>Detailed schedule</td><td colspan='3'></td></tr>"
+            "</table>"
+        )
+        child = (
+            "<table><tr><td>Item</td><td>Plan</td><td>Actual</td><td>Note</td></tr>"
+            "<tr><td>North</td><td>10</td><td>9</td><td>Stable</td></tr>"
+            "<tr><td>South</td><td>12</td><td>11</td><td>Stable</td></tr></table>"
+        )
+        elements = [{"type": "table", "content": child, "caption": "Schedule"}]
+        source_text = " ".join(
+            [
+                "Outer category alpha",
+                "Outer category beta",
+                "Outer category gamma",
+                "Outer category delta",
+                "Review scope one",
+                "Review scope two",
+                "Review scope three",
+                "Review scope four",
+                "Detailed schedule",
+                "Item Plan Actual Note North 10 9 Stable South 12 11 Stable",
+            ]
+        )
+
+        restored = table_validate.restore_uniquely_supported_native_parents(
+            elements,
+            table_validate.prepare_native(
+                [{"html": parent, "rows": 3, "cols": 4}, {"html": child, "rows": 3, "cols": 4}]
+            ),
+            source_text,
+        )
+
+        self.assertEqual(restored[0]["content"].count("<table"), 2)
+        self.assertIn("Outer category alpha", restored[0]["content"])
+        self.assertIn("North", restored[0]["content"])
+        self.assertTrue(restored[0]["_native"])
+        self.assertEqual(restored[0]["_source"], "native_nested_parent_restored")
+
+    def test_missing_native_parent_requires_complete_page_text_support(self):
+        parent = (
+            "<table><tr><td>Alpha group label</td><td>Beta group label</td>"
+            "<td>Gamma group label</td></tr>"
+            "<tr><td>First scope label</td><td>Second scope label</td>"
+            "<td>Third scope label</td></tr>"
+            "<tr><td>Detail schedule label</td><td colspan='2'></td></tr></table>"
+        )
+        child = (
+            "<table><tr><td>Item</td><td>Value</td></tr>"
+            "<tr><td>North</td><td>10</td></tr></table>"
+        )
+        elements = [{"type": "table", "content": child}]
+        incomplete_source = (
+            "Alpha group label Beta group label Gamma group label "
+            "First scope label Second scope label Detail schedule label "
+            "Item Value North 10"
+        )
+
+        restored = table_validate.restore_uniquely_supported_native_parents(
+            elements,
+            table_validate.prepare_native([{"html": parent}, {"html": child}]),
+            incomplete_source,
+        )
+
+        self.assertEqual(restored, elements)
 
     def test_formula_demote_is_blocked_when_a_grid_is_visible(self):
         original = {
