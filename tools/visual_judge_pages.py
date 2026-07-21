@@ -1098,7 +1098,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=int(os.environ.get("JUDGE_WORKERS", "4")))
     parser.add_argument("--max-width", type=int, default=int(os.environ.get("JUDGE_IMG_MAXW", "1400")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("JUDGE_TIMEOUT", "180")))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("JUDGE_MAX_TOKENS", "1536")))
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.environ.get("JUDGE_MAX_TOKENS", "16384")),
+    )
     parser.add_argument("--structured-limit", type=int, default=int(os.environ.get("JUDGE_STRUCTURED_LIMIT", "14000")))
     parser.add_argument("--retries", type=int, default=int(os.environ.get("JUDGE_RETRIES", "1")))
     parser.add_argument(
@@ -1109,7 +1113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--review-max-tokens",
         type=int,
-        default=int(os.environ.get("JUDGE_REVIEW_MAX_TOKENS", "1536")),
+        default=int(os.environ.get("JUDGE_REVIEW_MAX_TOKENS", "16384")),
     )
     parser.add_argument(
         "--review-timeout",

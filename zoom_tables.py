@@ -18,9 +18,9 @@ ZOOM_MIN_TEXT_SIMILARITY = min(
 ZOOM_JUDGES = int(os.environ.get("ZOOM_JUDGES", "5"))
 ZOOM_WIN_FRAC = float(os.environ.get("ZOOM_WIN_FRAC", "0.8"))
 ZOOM_VLM_TIMEOUT = int(os.environ.get("ZOOM_VLM_TIMEOUT", "180"))
-ZOOM_VLM_MAX_TOKENS = max(1024, int(os.environ.get("ZOOM_VLM_MAX_TOKENS", "4096")))
+ZOOM_VLM_MAX_TOKENS = max(1024, int(os.environ.get("ZOOM_VLM_MAX_TOKENS", "16384")))
 ZOOM_JUDGE_TIMEOUT = int(os.environ.get("ZOOM_JUDGE_TIMEOUT", "60"))
-ZOOM_JUDGE_MAX_TOKENS = max(128, int(os.environ.get("ZOOM_JUDGE_MAX_TOKENS", "256")))
+ZOOM_JUDGE_MAX_TOKENS = max(128, int(os.environ.get("ZOOM_JUDGE_MAX_TOKENS", "16384")))
 ZOOM_MAX_CANDIDATES = max(0, int(os.environ.get("ZOOM_MAX_CANDIDATES", "16")))
 ZOOM_DOC_BUDGET_SEC = max(0.0, float(os.environ.get("ZOOM_DOC_BUDGET_SEC", "900")))
 

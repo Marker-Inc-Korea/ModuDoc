@@ -32,7 +32,9 @@ VLM_STREAM_ABORT_BASE_CHARS = max(4096, int(os.environ.get("VLM_STREAM_ABORT_BAS
 VLM_STREAM_ABORT_INPUT_RATIO = max(2.0, float(os.environ.get("VLM_STREAM_ABORT_INPUT_RATIO", "8")))
 VLM_COVERAGE_VERIFY = os.environ.get("VLM_COVERAGE_VERIFY", "1") == "1"   # 낮은 coverage 페이지를 이미지 기준 VLM 판정으로 재검증
 VLM_COVERAGE_VERIFY_TIMEOUT = int(os.environ.get("VLM_COVERAGE_VERIFY_TIMEOUT", "180"))
-VLM_COVERAGE_VERIFY_MAX_TOKENS = max(256, int(os.environ.get("VLM_COVERAGE_VERIFY_MAX_TOKENS", "768")))
+VLM_COVERAGE_VERIFY_MAX_TOKENS = max(
+    256, int(os.environ.get("VLM_COVERAGE_VERIFY_MAX_TOKENS", "16384"))
+)
 VLM_COVERAGE_VERIFY_IMG_MAXW = max(768, int(os.environ.get("VLM_COVERAGE_VERIFY_IMG_MAXW", "1600")))
 VLM_COVERAGE_REPAIR = os.environ.get("VLM_COVERAGE_REPAIR", "1") == "1"   # verifier 실패 시 이미지 기준 재추출 1회
 VLM_COVERAGE_REPAIR_TIMEOUT = int(os.environ.get("VLM_COVERAGE_REPAIR_TIMEOUT", "300"))
@@ -40,7 +42,9 @@ VLM_COVERAGE_REPAIR_MAX_TOKENS = max(512, int(os.environ.get("VLM_COVERAGE_REPAI
 VLM_COVERAGE_REPAIR_IMG_MAXW = max(768, int(os.environ.get("VLM_COVERAGE_REPAIR_IMG_MAXW", "1600")))
 VLM_COMPACT_RETRY = os.environ.get("VLM_COMPACT_RETRY", "1") == "1"       # 반복/타임아웃 페이지를 간결 모드로 1회 구조화
 VLM_COMPACT_RETRY_TIMEOUT = int(os.environ.get("VLM_COMPACT_RETRY_TIMEOUT", "240"))
-VLM_COMPACT_RETRY_MAX_TOKENS = max(512, int(os.environ.get("VLM_COMPACT_RETRY_MAX_TOKENS", "2048")))
+VLM_COMPACT_RETRY_MAX_TOKENS = max(
+    512, int(os.environ.get("VLM_COMPACT_RETRY_MAX_TOKENS", "16384"))
+)
 VLM_COMPACT_RETRY_IMG_MAXW = max(768, int(os.environ.get("VLM_COMPACT_RETRY_IMG_MAXW", "1400")))
 DOC_VLM_BUDGET_SEC = float(os.environ.get("DOC_VLM_BUDGET_SEC", "0"))     # 문서 전체 VLM 시간 상한(초). 0=비활성
 VLM_PAGE_CONCURRENCY = max(1, int(os.environ.get("VLM_PAGE_CONCURRENCY", "16")))  # 페이지 동시 추출 수(vLLM 배칭으로 가속)
@@ -2712,7 +2716,10 @@ Rules:
                     r = client.chat.completions.create(
                         model=model_name,
                         messages=[{"role": "user", "content": content}],
-                        temperature=0.2, max_tokens=512, timeout=120)
+                        temperature=0.2,
+                        max_tokens=VLM_MAX_TOKENS,
+                        timeout=120,
+                    )
                 return (r.choices[0].message.content or "").strip()
             except Exception as e:
                 logger.warning(f"figure 설명 VLM 에러 (시도 {attempt+1}/2): {e}")
@@ -2777,7 +2784,7 @@ If a field cannot be found, use null.
                         model=model_name,
                         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_payload}],
                         temperature=0.0,
-                        max_tokens=512,
+                        max_tokens=VLM_MAX_TOKENS,
                         timeout=VLM_METADATA_TIMEOUT,
                     )
                 raw = (response.choices[0].message.content or "").strip()
