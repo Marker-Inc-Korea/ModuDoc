@@ -315,7 +315,7 @@ class GenericTableRepairTests(unittest.TestCase):
             candidate, review
         )
         self.assertIn("4 rows by 3 columns", feedback)
-        self.assertIn("parent <td>", feedback)
+        self.assertIn("parent cell's nested_table", feedback)
 
     def test_rejected_layout_feedback_is_sent_to_the_next_repair_attempt(self):
         original = {
@@ -414,6 +414,79 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertEqual(reference["caption"], "Example")
         self.assertEqual(reference["visible_rows"], [["Group", "Value"], ["Second"]])
         self.assertNotIn("rowspan", str(reference))
+
+    def test_recursive_table_tree_renders_nested_rows_without_flattening(self):
+        tree = {
+            "page_number": 1,
+            "tables": [
+                {
+                    "caption": "Synthetic grid",
+                    "rows": [
+                        {
+                            "cells": [
+                                {"text": "A"},
+                                {"text": "B"},
+                                {"text": "C"},
+                            ]
+                        },
+                        {"cells": [{"text": "Section", "colspan": 3}]},
+                        {
+                            "cells": [
+                                {"text": "Left"},
+                                {
+                                    "text": "Detail",
+                                    "nested_table": {
+                                        "rows": [
+                                            {
+                                                "cells": [
+                                                    {"text": "N1"},
+                                                    {"text": "N2"},
+                                                ]
+                                            },
+                                            {
+                                                "cells": [
+                                                    {"text": "1"},
+                                                    {"text": "2"},
+                                                ]
+                                            },
+                                        ]
+                                    },
+                                },
+                                {"text": "Tail & note"},
+                            ]
+                        },
+                    ],
+                }
+            ],
+        }
+
+        candidate = table_quality_repair._table_tree_candidate(tree)
+
+        self.assertIsNotNone(candidate)
+        element = candidate["elements"][0]
+        self.assertEqual(element["caption"], "Synthetic grid")
+        self.assertEqual(
+            table_quality_repair._table_geometry(element)["expanded_row_widths"],
+            [3, 3, 3],
+        )
+        soup = BeautifulSoup(element["content"], "html.parser")
+        outer = soup.find("table")
+        self.assertEqual(len(table_validate._rows_of(outer)), 3)
+        self.assertEqual(len(outer.find("table").find_all("tr")), 2)
+        self.assertIn("Tail &amp; note", element["content"])
+
+    def test_recursive_table_tree_rejects_invalid_spans(self):
+        tree = {
+            "tables": [
+                {
+                    "rows": [
+                        {"cells": [{"text": "A", "colspan": 0}]}
+                    ]
+                }
+            ]
+        }
+
+        self.assertIsNone(table_quality_repair._table_tree_candidate(tree))
 
     def test_geometry_correction_changes_only_spans_and_preserves_text(self):
         candidate = {

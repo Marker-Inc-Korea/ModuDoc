@@ -13,6 +13,7 @@ import re
 import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
+from html import escape
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -80,12 +81,17 @@ Rules:
 
 
 TABLE_ONLY_SYSTEM_PROMPT = """You repair malformed table geometry in document images.
-Return ONLY one valid JSON object:
-{"page_number": int, "elements": [{"type": "table", "content": "<table>...</table>", "caption": ""}]}
+Return ONLY one valid JSON object using this recursive table tree:
+{"page_number": int, "tables": [{"caption": "", "rows": [{"cells": [{"text": "plain visible text", "colspan": 1, "rowspan": 1, "nested_table": {"rows": [{"cells": [{"text": "plain inner text"}]}]}}]}]}]}
 
 Rules:
 - Locate only the grid(s) corresponding to the supplied broken table reference.
-- Return only corrected table elements, not headings or surrounding page prose.
+- Return only corrected tables, not headings or surrounding page prose.
+- The rows directly under each item in `tables` are OUTER rows only. Put every
+  inner-box row under the containing cell's `nested_table`; never append an
+  inner row to the outer `rows` list.
+- Use plain text with `\n` for visible line breaks. Do not write HTML tags. Omit
+  `nested_table` when a cell has no inner grid. Omit spans when they equal 1.
 - Use the image as truth; the supplied cell strings are a text-preservation reference, not a geometry reference.
 - The supplied expanded row widths and most-frequent width are diagnostics from
   the old HTML. Use them to locate malformed colspan/rowspan, but let visible
@@ -94,19 +100,20 @@ Rules:
 - A supplied diagnostic may indicate that the next row's label was appended to
   the preceding row's final cell. Recheck the visible row borders and keep each
   label and value inside its own cell; never copy a row label across a boundary.
-- Use only <table>, <tr>, <td>, <br>, colspan, and rowspan. Do not use <th>.
+- Describe geometry only with `rows`, `cells`, `colspan`, `rowspan`, and
+  `nested_table`; the parser will generate the HTML tags.
 - Count the visible top-level cell regions in each row before assigning spans, then expand every row mentally and ensure it resolves to the same column count.
 - Keep every blank cell bounded by visible grid lines, including leading and trailing blank header cells. Never absorb such a cell into a neighboring colspan.
 - Preserve merged headers and genuinely nested grids with correct colspan/rowspan.
 - Trace the OUTER vertical borders and column borders first. An outer-row
   boundary meets those borders; it may stop beside a genuine rowspan. A short
   line whose two endpoints remain strictly inside one parent cell is an inner-
-  box or nested-grid boundary and must not create another outer <tr>. Keep all
-  surrounding text in that same parent <td>.
+  box or nested-grid boundary and must not create another outer row. Keep all
+  surrounding text and the `nested_table` in that same parent cell.
 - A full-width section band is its own row with colspan covering every outer column;
   never attach it to one data column or split the data row below it.
 - Separate visually separate grids. Never add an all-empty padding column.
-- If the supplied reference is not a real bordered grid in the image, return an empty elements array.
+- If the supplied reference is not a real bordered grid in the image, return an empty `tables` array.
 - Output no markdown fences or commentary."""
 
 
@@ -603,6 +610,79 @@ def _request_json(client, request: dict) -> dict | None:
     return _first_json(choice.message.content or "")
 
 
+def _render_table_tree(table_spec: dict, depth: int = 0) -> str | None:
+    """Render a bounded recursive table tree into balanced, escaped HTML."""
+    if not isinstance(table_spec, dict) or depth > 3:
+        return None
+    rows = table_spec.get("rows")
+    if not isinstance(rows, list) or not rows or len(rows) > 200:
+        return None
+
+    rendered_rows = []
+    for row in rows:
+        cells = row.get("cells") if isinstance(row, dict) else None
+        if not isinstance(cells, list) or not cells or len(cells) > 100:
+            return None
+        rendered_cells = []
+        for cell in cells:
+            if not isinstance(cell, dict):
+                return None
+            text = cell.get("text", "")
+            if not isinstance(text, str) or len(text) > 100000:
+                return None
+
+            attributes = []
+            for key in ("colspan", "rowspan"):
+                value = cell.get(key, 1)
+                if type(value) is not int or not (1 <= value <= 100):
+                    return None
+                if value != 1:
+                    attributes.append(f' {key}="{value}"')
+
+            content = escape(text).replace("\r\n", "\n").replace("\r", "\n")
+            content = content.replace("\n", "<br>")
+            nested_spec = cell.get("nested_table")
+            if nested_spec is not None:
+                nested = _render_table_tree(nested_spec, depth + 1)
+                if nested is None:
+                    return None
+                if content:
+                    content += "<br>"
+                content += nested
+            rendered_cells.append(
+                f"<td{''.join(attributes)}>{content}</td>"
+            )
+        rendered_rows.append(f"<tr>{''.join(rendered_cells)}</tr>")
+    return f"<table>{''.join(rendered_rows)}</table>"
+
+
+def _table_tree_candidate(value: dict | None) -> dict | None:
+    """Convert model table trees to the page candidate used by repair gates."""
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("elements"), list):
+        return value
+    tables = value.get("tables")
+    if not isinstance(tables, list) or len(tables) > 20:
+        return None
+
+    elements = []
+    for table_spec in tables:
+        if not isinstance(table_spec, dict):
+            return None
+        content = _render_table_tree(table_spec)
+        if content is None:
+            return None
+        element = {"type": "table", "content": content}
+        caption = table_spec.get("caption")
+        if caption not in (None, ""):
+            if not isinstance(caption, str):
+                return None
+            element["caption"] = caption
+        elements.append(element)
+    return {"page_number": value.get("page_number", 0), "elements": elements}
+
+
 def _table_geometry(element: dict) -> dict:
     try:
         table = BeautifulSoup(
@@ -672,8 +752,9 @@ def _nested_review_geometry_feedback(candidate: dict, review: dict) -> str:
         "The visual reviewer counted a rectangular outer grid of "
         f"{reviewed_rows} rows by {reviewed_columns} columns, but an HTML parser "
         f"reads the candidate outer table geometry as {parsed_summary}. "
-        "Keep inner-grid rows inside their parent <td> and return a rectangular "
-        "outer table whose parsed row and column counts match the image."
+        "Move inner-grid rows under their parent cell's nested_table instead of "
+        "the outer rows list, and return a rectangular outer table whose parsed "
+        "row and column counts match the image."
     )
 
 
@@ -1256,7 +1337,7 @@ def _request_table_candidate(
         "extra_body": {"repetition_penalty": 1.08, "no_repeat_ngram_size": 24},
     }
     try:
-        return _request_json(client, request)
+        return _table_tree_candidate(_request_json(client, request))
     except Exception:
         if len(images) <= 1:
             raise
@@ -1267,7 +1348,7 @@ def _request_table_candidate(
             },
             {"type": "text", "text": user_text},
         ]
-        return _request_json(client, request)
+        return _table_tree_candidate(_request_json(client, request))
 
 
 def _needs_nested_layout_review(problems: list[dict]) -> bool:
