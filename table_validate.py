@@ -722,8 +722,95 @@ def native_substitute(vlm_html, native_prepared, min_score=0.6):
     return best["html"]
 
 
+def _source_supported_native_row(row, normalized_source):
+    key = _row_key(row)
+    if len(key) >= 3 and key in normalized_source:
+        return True
+    values = [
+        value
+        for cell in row.find_all(["td", "th"], recursive=False)
+        if (value := _cell_own_text(cell))
+    ]
+    exact = sum(value in normalized_source for value in values)
+    tokens = [
+        token
+        for value in values
+        for token in re.findall(r"[가-힣A-Za-z0-9]{4,}", value)
+    ]
+    supported = sum(token in normalized_source for token in tokens)
+    return bool(
+        exact >= 2
+        or (
+            exact >= 1
+            and supported >= 8
+            and supported / max(1, len(tokens)) >= 0.55
+        )
+    )
+
+
+def slice_native_to_source_page(native_html, source_text):
+    """Trim a long native table to the uniquely supported page-row run."""
+    normalized_source = _ncell(source_text)
+    if len(normalized_source) < 40:
+        return native_html
+    try:
+        soup = BeautifulSoup(native_html or "", "html.parser")
+        table = soup.find("table")
+    except Exception:
+        return native_html
+    rows = _rows_of(table) if table else []
+    if len(rows) < 8:
+        return native_html
+
+    header_count = 0
+    for row in rows:
+        if row.find("th", recursive=False) is None:
+            break
+        header_count += 1
+    supported = [
+        index
+        for index, row in enumerate(rows[header_count:], start=header_count)
+        if _source_supported_native_row(row, normalized_source)
+    ]
+    if len(supported) < 2:
+        return native_html
+
+    runs = []
+    for index in supported:
+        if not runs or index - runs[-1][-1] > 3:
+            runs.append([])
+        runs[-1].append(index)
+    ranked = sorted(
+        runs,
+        key=lambda run: (len(run), -(run[-1] - run[0] + 1)),
+        reverse=True,
+    )
+    best = ranked[0]
+    if len(best) < 2 or (
+        len(ranked) > 1 and len(best) < len(ranked[1]) + 2
+    ):
+        return native_html
+    start, end = best[0], best[-1]
+    keep = [*range(header_count), *range(start, end + 1)]
+    if len(rows) - len(set(keep)) < 2:
+        return native_html
+
+    rebuilt = soup.new_tag("table")
+    for index in keep:
+        rebuilt.append(copy.copy(rows[index]))
+    quality = assess_table_quality(str(rebuilt), allow_nested=True)
+    if set(quality.get("issues") or []) & {
+        "no_table",
+        "empty_table",
+        "ragged_rows",
+        "quality_check_error",
+    }:
+        return native_html
+    return str(rebuilt)
+
+
 def strip_caption_duplicate_metadata_row(html, caption):
-    """Remove a bracketed full-width metadata row already retained in caption."""
+    """Remove a full-width title/metadata row already retained in caption."""
     if not html or not caption:
         return html
     try:
@@ -741,13 +828,24 @@ def strip_caption_duplicate_metadata_row(html, caption):
         ):
             return html
         metadata = first_cells[0].get_text(" ", strip=True)
-        if not re.fullmatch(
+        bracketed = bool(re.fullmatch(
             r"\s*[\(\[\{（［｛【].{1,100}[\)\]\}）］｝】]\s*",
             metadata,
             flags=re.DOTALL,
+        ))
+        exact_caption = bool(
+            _ncell(metadata) and _ncell(metadata) == _ncell(caption)
+        )
+        next_cells = _direct_cells(rows[1])
+        if not (
+            (bracketed and _ncell(metadata) in _ncell(caption))
+            or (
+                exact_caption
+                and len(next_cells) >= 2
+                and sum(bool(cell.get_text(" ", strip=True)) for cell in next_cells)
+                >= 2
+            )
         ):
-            return html
-        if _ncell(metadata) not in _ncell(caption):
             return html
         rows[0].decompose()
         return str(table)

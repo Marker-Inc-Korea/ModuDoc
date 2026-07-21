@@ -76,6 +76,25 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertEqual(facts["table_elements"][0]["rows"], 1)
         self.assertEqual(facts["table_elements"][0]["columns"], 1)
 
+    def test_structure_facts_identify_leading_rows_already_in_caption(self):
+        data = {
+            "elements": [
+                {
+                    "type": "table",
+                    "caption": "Funding plan (USD millions)",
+                    "content": (
+                        "<table><tr><th colspan='2'>Funding plan</th></tr>"
+                        "<tr><th>(USD millions)</th><th></th></tr>"
+                        "<tr><td>Use</td><td>Amount</td></tr></table>"
+                    ),
+                }
+            ]
+        }
+
+        facts = visual_judge_pages.candidate_structure_facts(data)
+
+        self.assertEqual(facts["table_elements"][0]["caption_prefix_rows"], 2)
+
     def test_visible_attachment_notice_is_reviewed_instead_of_hard_failed(self):
         data = {
             "low_confidence": True,
@@ -347,6 +366,53 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertTrue(result["pass"])
         self.assertEqual(result["issue_types"], [])
 
+    def test_table_row_claim_cannot_silently_exclude_caption_rows(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "Candidate element index 1 has 14 rows, but the image has 13 rows."
+            ],
+        }
+        facts = {
+            "element_indices": [0, 1],
+            "table_elements": {
+                1: {
+                    "rows": 14,
+                    "header_rows": 2,
+                    "columns": 4,
+                    "table_tags": 1,
+                    "caption_prefix_rows": 2,
+                }
+            },
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Funding plan table", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_orphan_hallucination_evidence_does_not_create_an_undeclared_issue(self):
+        verdict = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "hallucinated_candidate_text": ["Visible footnote"],
+            "structure_evidence": [],
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Visible footnote"
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["hallucinated_candidate_text"], [])
+
     def test_indexed_order_claim_requires_two_candidate_element_references(self):
         verdict = {
             "pass": False,
@@ -373,7 +439,7 @@ class VisualJudgeTests(unittest.TestCase):
             "severity": "major",
             "issue_types": ["panel_assignment"],
             "structure_evidence": [
-                "In the image the Search card owns the lookup bullet, but candidate element index 2 places that body under the Privacy card title."
+                "In the image the Search card owns the lookup bullet, but candidate element index 2 places that body under the wrong Privacy card title."
             ],
         }
         facts = {"element_indices": [0, 1, 2], "table_elements": {}}
@@ -385,16 +451,35 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(result["issue_types"], ["panel_assignment"])
 
-    def test_ungrounded_review_cannot_overturn_indexed_order_failure(self):
-        primary = {
+    def test_mixed_panel_text_is_reclassified_from_generic_wrong_order(self):
+        verdict = {
             "pass": False,
             "score": 55,
             "severity": "major",
             "issue_types": ["wrong_order"],
             "structure_evidence": [
-                "The image shows First before Second, while candidate element index 1 precedes candidate element index 0."
+                "Candidate element index 2 contains text from multiple distinct feature panels, causing incorrect grouping."
             ],
-            "reason": "The indexed sequence is reversed.",
+        }
+        facts = {"element_indices": [0, 1, 2], "table_elements": {}}
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Feature one Feature two", facts
+        )
+
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["issue_types"], ["panel_assignment"])
+
+    def test_ungrounded_review_cannot_overturn_indexed_panel_failure(self):
+        primary = {
+            "pass": False,
+            "score": 55,
+            "severity": "major",
+            "issue_types": ["panel_assignment"],
+            "structure_evidence": [
+                "The image shows the Search card body separately, while candidate element index 1 mixes it under a distinct Privacy card title."
+            ],
+            "reason": "The indexed card body is misassigned.",
         }
         review = {
             "confirmed_failure": False,
@@ -409,7 +494,7 @@ class VisualJudgeTests(unittest.TestCase):
         )
 
         self.assertFalse(result["pass"])
-        self.assertEqual(result["issue_types"], ["wrong_order"])
+        self.assertEqual(result["issue_types"], ["panel_assignment"])
         self.assertEqual(result["reason"], primary["reason"])
 
     def test_false_review_flag_cannot_use_stale_confirmed_types_to_overturn(self):
@@ -417,16 +502,16 @@ class VisualJudgeTests(unittest.TestCase):
             "pass": False,
             "score": 55,
             "severity": "major",
-            "issue_types": ["wrong_order"],
+            "issue_types": ["panel_assignment"],
             "structure_evidence": [
-                "The image shows First before Second, while candidate element index 1 precedes candidate element index 0."
+                "The image shows the Search card body separately, while candidate element index 1 mixes it under a distinct Privacy card title."
             ],
         }
         review = {
             "confirmed_failure": False,
-            "confirmed_issue_types": ["wrong_order"],
+            "confirmed_issue_types": ["panel_assignment"],
             "structure_evidence": [
-                "Candidate element index 1 precedes candidate element index 0 in the image."
+                "Candidate element index 1 mixes a distinct card body in the image."
             ],
             "rejected_claims": [],
         }
@@ -437,30 +522,62 @@ class VisualJudgeTests(unittest.TestCase):
         )
 
         self.assertFalse(result["pass"])
-        self.assertEqual(result["issue_types"], ["wrong_order"])
+        self.assertEqual(result["issue_types"], ["panel_assignment"])
 
-    def test_grounded_review_can_overturn_indexed_order_failure(self):
+    def test_grounded_review_can_overturn_indexed_panel_failure(self):
         primary = {
             "pass": False,
             "score": 55,
             "severity": "major",
-            "issue_types": ["wrong_order"],
+            "issue_types": ["panel_assignment"],
             "structure_evidence": [
-                "The image shows First before Second, while candidate element index 1 precedes candidate element index 0."
+                "The image shows the Search card body separately, while candidate element index 1 mixes it under a distinct Privacy card title."
             ],
         }
         review = {
             "confirmed_failure": False,
             "confirmed_issue_types": [],
             "rejected_claims": [
-                "The page image shows First then Second, matching candidate element index 0 followed by candidate element index 1."
+                "The page image shows the Search body under its Search card title, so candidate element index 1 does not mix distinct card bodies."
             ],
-            "reason": "The indexed sequence matches the image.",
+            "reason": "The indexed panel assignment matches the image.",
         }
         facts = {"element_indices": [0, 1], "table_elements": {}}
 
         result = visual_judge_pages.apply_failure_review(
             primary, review, "First Second", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_equal_indexed_table_geometry_can_refute_a_primary_failure(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has 4 rows, but candidate element index 1 has 3 rows."
+            ],
+        }
+        review = {
+            "confirmed_failure": False,
+            "confirmed_issue_types": [],
+            "rejected_claims": [
+                "Candidate element index 1 has 3 rows and 2 columns, matching the visual image with 3 rows and 2 columns."
+            ],
+            "reason": "The indexed geometry matches the image.",
+        }
+        facts = {
+            "element_indices": [0, 1],
+            "table_elements": {
+                1: {"rows": 3, "header_rows": 1, "columns": 2, "table_tags": 1}
+            },
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "Header A B", facts
         )
 
         self.assertTrue(result["pass"])

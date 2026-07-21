@@ -1455,6 +1455,29 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertNotIn("Unit: millions", _visible_text(cleaned))
 
+    def test_exact_caption_title_row_is_removed_before_real_headers(self):
+        html = (
+            "<table><tr><th colspan='2'>Sustainability goals</th></tr>"
+            "<tr><th>Goal</th><th>Description</th></tr>"
+            "<tr><td>Health</td><td>Healthy lives</td></tr></table>"
+        )
+
+        cleaned = table_validate.strip_caption_duplicate_metadata_row(
+            html, "Sustainability goals"
+        )
+
+        rows = table_validate._rows_of(
+            BeautifulSoup(cleaned, "html.parser").find("table")
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [
+                cell.get_text(" ", strip=True)
+                for cell in rows[0].find_all(["td", "th"], recursive=False)
+            ],
+            ["Goal", "Description"],
+        )
+
     def test_adjacent_native_fragments_merge_without_losing_inner_details(self):
         native = (
             "<table><tr><th colspan='2'>Kind</th><th colspan='2'>Coverage</th><th>Notes</th></tr>"
@@ -1571,6 +1594,53 @@ class GenericTableRepairTests(unittest.TestCase):
         )
 
         self.assertEqual(restored, elements)
+
+    def test_long_native_table_is_sliced_to_unique_source_row_run(self):
+        native = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td colspan='2'>Construction period</td></tr>"
+            "<tr><td>Alpha coverage</td><td>Alpha details for current page</td></tr>"
+            "<tr><td>Beta coverage</td><td>Beta details for current page</td></tr>"
+            "<tr><td>Gamma coverage</td><td>Gamma details for current page</td></tr>"
+            "<tr><td colspan='2'>Operation period</td></tr>"
+            "<tr><td>Delta coverage</td><td>Delta details for later page</td></tr>"
+            "<tr><td>Epsilon coverage</td><td>Epsilon details for later page</td></tr>"
+            "<tr><td>Zeta coverage</td><td>Zeta details for later page</td></tr>"
+            "<tr><td>Eta coverage</td><td>Eta details for later page</td></tr></table>"
+        )
+        source = (
+            "Category Details Construction period Alpha coverage "
+            "Alpha details for current page Beta coverage Beta details for current page "
+            "Gamma coverage Gamma details for current page"
+        )
+
+        sliced = table_validate.slice_native_to_source_page(native, source)
+        rows = table_validate._rows_of(
+            BeautifulSoup(sliced, "html.parser").find("table")
+        )
+
+        self.assertEqual(len(rows), 5)
+        self.assertIn("Gamma coverage", sliced)
+        self.assertNotIn("Operation period", sliced)
+        self.assertNotIn("Delta coverage", sliced)
+
+    def test_native_page_slice_requires_multiple_supported_body_rows(self):
+        native = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            + "".join(
+                f"<tr><td>Coverage {index}</td><td>Unique later-page details {index}</td></tr>"
+                for index in range(1, 9)
+            )
+            + "</table>"
+        )
+        source = (
+            "Category Details Coverage 1 Unique later-page details 1 "
+            "unrelated page prose that is deliberately long enough for review"
+        )
+
+        self.assertEqual(
+            table_validate.slice_native_to_source_page(native, source), native
+        )
 
     def test_formula_demote_is_blocked_when_a_grid_is_visible(self):
         original = {

@@ -4191,6 +4191,9 @@ class DocumentProcessor:
                                 _nh = (table_validate.native_substitute(e["content"], _native_prep)
                                        if _native_prep else None)
                                 if _nh and _nh.strip() and "</table>" in _nh:
+                                    _nh = table_validate.slice_native_to_source_page(
+                                        _nh, source_text_layer
+                                    )
                                     _nh = table_validate.strip_caption_duplicate_metadata_row(
                                         _nh, e.get("caption")
                                     )

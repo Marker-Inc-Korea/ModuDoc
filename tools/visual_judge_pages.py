@@ -176,6 +176,12 @@ STRUCTURAL_ISSUE_TYPES = {
     "toc_structure",
 }
 
+GROUNDED_OVERTURN_ISSUE_TYPES = {
+    "panel_assignment",
+    "table_structure",
+    "toc_structure",
+}
+
 
 def encode_image(path: str, max_width: int) -> str:
     with Image.open(path) as img:
@@ -498,6 +504,24 @@ def candidate_structure_facts(data: dict) -> dict:
             )
             for row in rows
         ]
+        caption = norm_text(element.get("caption"))
+        caption_prefix_rows = 0
+        caption_prefix = ""
+        if caption:
+            for row in rows[:3]:
+                row_text = norm_text(
+                    " ".join(
+                        cell.get_text(" ", strip=True)
+                        for cell in row.find_all(["td", "th"], recursive=False)
+                    )
+                )
+                proposed = caption_prefix + row_text
+                if not row_text or not caption.startswith(proposed):
+                    break
+                caption_prefix = proposed
+                caption_prefix_rows += 1
+                if caption_prefix == caption:
+                    break
         tables[index] = {
             "rows": len(rows),
             "header_rows": sum(
@@ -505,6 +529,7 @@ def candidate_structure_facts(data: dict) -> dict:
             ),
             "columns": max(widths, default=0),
             "table_tags": len(soup.find_all("table")),
+            "caption_prefix_rows": caption_prefix_rows,
         }
     return {
         "element_indices": [
@@ -585,12 +610,20 @@ def _table_geometry_evidence_supported(
     if "rows" in mismatched_units:
         rows = int(facts.get("rows") or 0)
         header_rows = int(facts.get("header_rows") or 0)
+        caption_prefix_rows = int(facts.get("caption_prefix_rows") or 0)
         values = set(_geometry_values(text, "rows"))
         if (
             header_rows > 0
             and rows in values
             and rows - header_rows in values
             and not re.search(r"\bheader\b|헤더|제목\s*행", text, re.I)
+        ):
+            return False
+        if (
+            caption_prefix_rows > 0
+            and rows in values
+            and any(rows - count in values for count in range(1, caption_prefix_rows + 1))
+            and not re.search(r"\b(?:caption|title)\b|캡션|표\s*제목", text, re.I)
         ):
             return False
     return True
@@ -607,11 +640,26 @@ def structural_evidence_supported(
         return len(references) >= 2
     if issue == "panel_assignment":
         association = re.compile(
-            r"\b(?:card|panel|tile|box|title|body|bullet)s?\b|"
-            r"카드|패널|타일|상자|박스|제목|본문|불릿|글머리표",
+            r"\b(?:card|panel|tile|box|feature|title|body|bullet|grouping|association)s?\b|"
+            r"카드|패널|타일|상자|박스|기능|제목|본문|불릿|글머리표|그룹|귀속",
             re.I,
         )
-        return bool(references and any(association.search(str(item)) for item in evidence))
+        misassigned = re.compile(
+            r"\b(?:mixed|mixes|misassigned|contains\s+text\s+from)\b|"
+            r"\bmultiple\s+(?:distinct\s+)?(?:cards?|panels?|tiles?|features?)\b|"
+            r"\b(?:wrong|another|different|distinct)(?:\s+\S+){0,4}\s+"
+            r"(?:cards?|panels?|tiles?|features?|titles?|bodies?)\b|"
+            r"\battached\s+to\s+(?:the\s+)?(?:wrong|another|different)\b|"
+            r"여러\s*(?:카드|패널|기능)|섞|잘못\s*(?:된\s*)?(?:카드|패널|제목|본문|귀속)|오귀속",
+            re.I,
+        )
+        return bool(
+            references
+            and any(
+                association.search(str(item)) and misassigned.search(str(item))
+                for item in evidence
+            )
+        )
     if issue == "table_structure":
         table_indices = set((facts.get("table_elements") or {}).keys())
         return any(
@@ -627,16 +675,46 @@ def grounded_structural_rejection(
     issue: str, evidence: list[str], facts: dict | None
 ) -> bool:
     """Require a review overturn to compare indexed candidate facts to the image."""
-    if not structural_evidence_supported(issue, evidence, facts):
-        return False
     comparison = " ".join(str(item) for item in evidence)
-    return bool(
+    image_grounded = bool(
         re.search(
-            r"\b(?:image|page|visible|raster)\b|이미지|원본|페이지|화면",
+            r"\b(?:image|page|visible|visual|raster)\b|이미지|원본|페이지|화면",
             comparison,
             re.I,
         )
     )
+    if issue == "table_structure" and facts is not None and image_grounded:
+        table_facts = facts.get("table_elements") or {}
+        references = _candidate_index_references(
+            evidence, set(facts.get("element_indices") or [])
+        )
+        for item in evidence:
+            text = str(item)
+            if not re.search(
+                r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|일치|동일|정확",
+                text,
+                re.I,
+            ):
+                continue
+            for table_index in references & set(table_facts):
+                authoritative = table_facts[table_index]
+                exact_units = []
+                for unit in ("rows", "columns", "table_tags"):
+                    declared = _candidate_geometry_claim(text, table_index, unit)
+                    values = _geometry_values(text, unit)
+                    if (
+                        declared is not None
+                        and declared == authoritative.get(unit)
+                        and values
+                        and all(value == declared for value in values)
+                    ):
+                        exact_units.append(unit)
+                if exact_units:
+                    return True
+        return False
+    if not structural_evidence_supported(issue, evidence, facts):
+        return False
+    return image_grounded
 
 
 def stabilize_verdict(
@@ -659,7 +737,23 @@ def stabilize_verdict(
         " ".join(structure_evidence) + " " + str(verdict.get("reason") or "")
     ):
         structure_evidence = []
+    if (
+        "wrong_order" in issues
+        and structure_facts is not None
+        and structural_evidence_supported(
+            "panel_assignment", structure_evidence, structure_facts
+        )
+    ):
+        issues = [item for item in issues if item != "wrong_order"]
+        if "panel_assignment" not in issues:
+            issues.append("panel_assignment")
     nstruct = norm_text(structured_text)
+    if "missing_text" not in issues:
+        missing = []
+    if "wrong_text" not in issues:
+        mismatches = []
+    if "hallucination" not in issues:
+        hallucinated = []
     missing = [
         item for item in missing
         if norm_text(item)
@@ -853,7 +947,7 @@ def apply_failure_review(
         issue
         for issue in primary_types
         if structure_facts is not None
-        and issue in STRUCTURAL_ISSUE_TYPES
+        and issue in GROUNDED_OVERTURN_ISSUE_TYPES
         and structural_evidence_supported(
             issue, primary_structure_evidence, structure_facts
         )
@@ -957,7 +1051,7 @@ def review_failure(
         issue
         for issue in primary.get("issue_types") or []
         if structure_facts is not None
-        and issue in STRUCTURAL_ISSUE_TYPES
+        and issue in GROUNDED_OVERTURN_ISSUE_TYPES
         and structural_evidence_supported(
             issue, primary_structure_evidence, structure_facts
         )
