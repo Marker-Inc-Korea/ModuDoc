@@ -2,6 +2,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from PIL import Image
 
 from tools import visual_judge_pages
 
@@ -26,6 +30,83 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertEqual(
             [element["index"] for element in compact["elements"]], [0, 1]
         )
+
+    def test_primary_timeout_retries_with_compact_system_and_full_budget(self):
+        calls = []
+
+        class Completions:
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise TimeoutError("simulated timeout")
+                verdict = {
+                    "pass": True,
+                    "score": 100,
+                    "severity": "none",
+                    "issue_types": [],
+                    "missing_visible_text": [],
+                    "text_mismatches": [],
+                    "hallucinated_candidate_text": [],
+                    "structure_evidence": [],
+                    "reason": "The visible content matches.",
+                }
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=json.dumps(verdict)),
+                            finish_reason="stop",
+                        )
+                    ]
+                )
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        args = SimpleNamespace(
+            structured_limit=10000,
+            max_width=1400,
+            retries=1,
+            max_tokens=16384,
+            timeout=1,
+            review_failures=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "page_0001.png"
+            structured_path = root / "page_0001_structured.json"
+            Image.new("RGB", (200, 200), "white").save(image_path)
+            structured_path.write_text(
+                json.dumps(
+                    {
+                        "page_number": 1,
+                        "elements": [{"type": "text", "content": "Visible"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(visual_judge_pages.time, "sleep"):
+                result = visual_judge_pages.judge_one(
+                    client,
+                    "test-model",
+                    {
+                        "doc": "test",
+                        "page": 1,
+                        "image": str(image_path),
+                        "structured": str(structured_path),
+                    },
+                    args,
+                )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0]["messages"][0]["content"], visual_judge_pages.SYSTEM
+        )
+        self.assertEqual(
+            calls[1]["messages"][0]["content"], visual_judge_pages.RETRY_SYSTEM
+        )
+        self.assertEqual([call["max_tokens"] for call in calls], [16384, 16384])
 
     def test_objective_quality_metadata_cannot_be_overturned(self):
         data = {
@@ -75,6 +156,7 @@ class VisualJudgeTests(unittest.TestCase):
 
         self.assertEqual(facts["table_elements"][0]["rows"], 1)
         self.assertEqual(facts["table_elements"][0]["columns"], 1)
+        self.assertEqual(facts["element_types"], {0: "table"})
 
     def test_structure_facts_identify_leading_rows_already_in_caption(self):
         data = {
@@ -451,6 +533,45 @@ class VisualJudgeTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(result["issue_types"], ["panel_assignment"])
 
+    def test_figure_internal_panels_are_not_panel_assignment_evidence(self):
+        verdict = {
+            "pass": False,
+            "score": 55,
+            "severity": "major",
+            "issue_types": ["panel_assignment"],
+            "structure_evidence": [
+                "Candidate element index 2 combines three distinct panels into one figure description."
+            ],
+        }
+        facts = {
+            "element_indices": [0, 1, 2],
+            "element_types": {0: "heading_1", 1: "text", 2: "figure"},
+            "table_elements": {},
+        }
+
+        result = visual_judge_pages.stabilize_verdict(
+            verdict, "Three visible panel descriptions", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_combined_paragraph_is_representation_only_without_card_mix(self):
+        representation = (
+            "Candidate element index 2 combines visible steps into a single paragraph."
+        )
+        material = (
+            "Candidate element index 2 combines text from the Search card under "
+            "the wrong Privacy card title."
+        )
+
+        self.assertTrue(
+            visual_judge_pages.looks_schema_representation_only(representation)
+        )
+        self.assertFalse(
+            visual_judge_pages.looks_schema_representation_only(material)
+        )
+
     def test_mixed_panel_text_is_reclassified_from_generic_wrong_order(self):
         verdict = {
             "pass": False,
@@ -578,6 +699,85 @@ class VisualJudgeTests(unittest.TestCase):
 
         result = visual_judge_pages.apply_failure_review(
             primary, review, "Header A B", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+    def test_complete_ordinal_table_geometry_can_refute_without_indexes(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has 13 rows, but candidate element index 2 has 12 rows."
+            ],
+        }
+        review = {
+            "confirmed_failure": False,
+            "confirmed_issue_types": [],
+            "rejected_claims": [
+                "The page image has two tables: the first has 2 rows including "
+                "the header and 2 columns, and the second has 12 rows including "
+                "the header and 2 columns; the candidate matches both tables."
+            ],
+            "reason": "The ordered table geometry matches the image.",
+        }
+        facts = {
+            "element_indices": [0, 1, 2],
+            "element_types": {0: "table", 1: "heading_2", 2: "table"},
+            "table_elements": {
+                0: {"rows": 2, "columns": 2, "table_tags": 1},
+                2: {"rows": 12, "columns": 2, "table_tags": 1},
+            },
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "First table Second table", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+        review["rejected_claims"][0] = review["rejected_claims"][0].replace(
+            "12 rows", "13 rows"
+        )
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "First table Second table", facts
+        )
+        self.assertFalse(result["pass"])
+
+    def test_matching_review_structure_evidence_can_act_as_refutation(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has 3 columns, but candidate element index 0 has 5 columns."
+            ],
+        }
+        review = {
+            "confirmed_failure": False,
+            "confirmed_issue_types": [],
+            "structure_evidence": [
+                "Candidate element index 0 has 9 rows and 5 columns, matching "
+                "the visual image with 9 rows and 5 columns."
+            ],
+            "rejected_claims": [],
+            "reason": "The indexed table geometry matches.",
+        }
+        facts = {
+            "element_indices": [0],
+            "element_types": {0: "table"},
+            "table_elements": {
+                0: {"rows": 9, "header_rows": 1, "columns": 5, "table_tags": 1}
+            },
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "Header and rows", facts
         )
 
         self.assertTrue(result["pass"])

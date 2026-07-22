@@ -175,6 +175,49 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIsNone(repaired)
         self.assertEqual(changes, [])
 
+    def test_grouped_stub_header_span_completes_after_rowspans_exist(self):
+        source = {
+            "elements": [{"type": "table", "content": self._grouped_stub_table()}]
+        }
+        normalized, _ = table_quality_repair._normalize_grouped_stub_rowspans(
+            source
+        )
+        soup = BeautifulSoup(
+            normalized["elements"][0]["content"], "html.parser"
+        )
+        soup.find("th").attrs.pop("colspan", None)
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "content": str(soup.find("table")),
+                    "_source": "vlm_table_repaired",
+                    "_confidence": 0.65,
+                    "_issues": ["ragged_rows"],
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "blank.png"
+            Image.new("RGB", (800, 800), "white").save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(
+            changes[0]["strategy"], "grouped_stub_header_span_completed"
+        )
+        self.assertTrue(metrics["text_inventory_preserved"])
+        self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+        table = BeautifulSoup(
+            repaired["elements"][0]["content"], "html.parser"
+        ).find("table")
+        self.assertEqual(table.find("th").get("colspan"), "2")
+
     def test_nested_vlm_table_is_selected_for_visual_review(self):
         html = (
             "<table><tr><td colspan='2'>Phase</td></tr>"
@@ -1566,6 +1609,46 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIn("Outer category alpha", restored[0]["content"])
         self.assertIn("North", restored[0]["content"])
         self.assertTrue(restored[0]["_native"])
+        self.assertEqual(restored[0]["_source"], "native_nested_parent_restored")
+
+    def test_missing_native_parent_can_restore_after_late_text_cleanup(self):
+        parent = (
+            "<table>"
+            "<tr><td>Outer category alpha</td><td>Outer category beta</td>"
+            "<td>Outer category gamma</td><td>Outer category delta</td></tr>"
+            "<tr><td>Review scope one</td><td>Review scope two</td>"
+            "<td>Review scope three</td><td>Review scope four</td></tr>"
+            "<tr><td>Detailed schedule</td><td colspan='3'></td></tr>"
+            "</table>"
+        )
+        child = (
+            "<table><tr><td>Item</td><td>Plan</td><td>Actual</td><td>Note</td></tr>"
+            "<tr><td>North</td><td>10</td><td>9</td><td>Stable</td></tr>"
+            "<tr><td>South</td><td>12</td><td>11</td><td>Stable</td></tr></table>"
+        )
+        labels = (
+            "Outer category alpha Outer category beta Outer category gamma "
+            "Outer category delta Review scope one Review scope two "
+            "Review scope three Review scope four Detailed schedule"
+        )
+        source_text = f"{labels} Item Plan Actual Note North 10 9 Stable South 12 11 Stable"
+        native = table_validate.prepare_native([{"html": parent}, {"html": child}])
+        child_element = {"type": "table", "content": child}
+
+        blocked = table_validate.restore_uniquely_supported_native_parents(
+            [
+                {"type": "text", "content": labels},
+                child_element,
+            ],
+            native,
+            source_text,
+        )
+        restored = table_validate.restore_uniquely_supported_native_parents(
+            [child_element], native, source_text
+        )
+
+        self.assertEqual(blocked[1]["content"].count("<table"), 1)
+        self.assertEqual(restored[0]["content"].count("<table"), 2)
         self.assertEqual(restored[0]["_source"], "native_nested_parent_restored")
 
     def test_missing_native_parent_requires_complete_page_text_support(self):

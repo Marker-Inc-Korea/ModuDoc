@@ -4221,6 +4221,12 @@ class DocumentProcessor:
                                 rebuilt.append(e)
                         deduped = _drop_prose_duplicated_by_nearby_tables(rebuilt)
                         deduped = _dedupe_exact_text_elements(deduped)
+                        # Early VLM text can temporarily duplicate native outer-cell
+                        # labels and block the conservative parent restore. Retry only
+                        # after table/prose deduplication sees the final representation.
+                        deduped = table_validate.restore_uniquely_supported_native_parents(
+                            deduped, _native_prep, source_text_layer
+                        )
                     except Exception as te:
                         logger.warning(f"표 검증 실패({stem}): {te}")
                     # figure description 폴백(결정적): 빈 description 으로 RAG 앵커가 사라지지 않게 보정.

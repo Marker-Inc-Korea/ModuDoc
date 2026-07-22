@@ -161,6 +161,22 @@ structure matches is not enough to overturn an evidenced failure.
 When evidence is ambiguous, set confirmed_failure=false rather than guessing."""
 
 
+RETRY_SYSTEM = """You are a compact visual QA fallback for a document parser.
+Compare the PAGE IMAGE with the indexed structured JSON and return ONLY one
+short JSON object using this exact schema:
+{"pass": true|false, "score": 0-100, "severity": "none|minor|major|critical",
+ "issue_types": ["missing_text|wrong_text|wrong_order|panel_assignment|table_structure|toc_structure|figure_description|hallucination|empty_or_low_confidence|other"],
+ "missing_visible_text": [], "text_mismatches": [],
+ "hallucinated_candidate_text": [], "structure_evidence": [], "reason": "one sentence"}
+Do not transcribe matching content. Keep each evidence list to at most four items.
+Ignore styling, whitespace, heading-vs-caption choice, and flattening of panels
+inside one figure description. For tables, count all header rows and use the
+authoritative candidate geometry. A structural failure must cite exactly
+"candidate element index N"; order claims need two indexes, panel claims need
+the wrong card title and body snippet, and table claims need numeric image versus
+candidate row/column counts. When uncertain, pass."""
+
+
 OBJECTIVE_QUALITY_ISSUES = {
     "no_table",
     "empty_table",
@@ -392,6 +408,13 @@ def looks_schema_representation_only(text: object) -> bool:
             "split into multiple text elements",
             "separate text block",
             "standalone line item",
+            "combined text block",
+            "single text block",
+            "large block of text",
+            "single paragraph",
+            "one paragraph",
+            "single ordered list",
+            "spatial arrangement",
             "텍스트 요소로",
             "일반 텍스트로",
             "캡션 위치",
@@ -402,6 +425,11 @@ def looks_schema_representation_only(text: object) -> bool:
         for marker in (
             "grouped under",
             "attached to the wrong",
+            "text from",
+            "misassigned",
+            "wrong panel",
+            "wrong card",
+            "wrong title",
             "wrong row",
             "wrong column",
             "candidate sequence",
@@ -535,6 +563,11 @@ def candidate_structure_facts(data: dict) -> dict:
         "element_indices": [
             index for index, element in enumerate(elements) if isinstance(element, dict)
         ],
+        "element_types": {
+            index: element.get("type")
+            for index, element in enumerate(elements)
+            if isinstance(element, dict)
+        },
         "table_elements": tables,
     }
 
@@ -629,6 +662,53 @@ def _table_geometry_evidence_supported(
     return True
 
 
+def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool:
+    """Accept a complete ordinal image/candidate geometry match as grounding."""
+    table_facts = [
+        value
+        for _, value in sorted((facts.get("table_elements") or {}).items())
+    ]
+    value = str(text or "")
+    if not (1 <= len(table_facts) <= 4) or not all(
+        re.search(pattern, value, re.I)
+        for pattern in (
+            r"\b(?:image|page|visible|visual|raster)\b|이미지|원본|페이지|화면",
+            r"\bcandidate\b|후보",
+            r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|일치|동일|정확",
+            r"\btables?\b|표",
+        )
+    ):
+        return False
+    ordinals = [
+        r"\b(?:first|1st)\b|첫\s*번째|첫째",
+        r"\b(?:second|2nd)\b|두\s*번째|둘째",
+        r"\b(?:third|3rd)\b|세\s*번째|셋째",
+        r"\b(?:fourth|4th)\b|네\s*번째|넷째",
+    ]
+    positions = []
+    for pattern in ordinals[: len(table_facts)]:
+        match = re.search(pattern, value, re.I)
+        if match is None:
+            return False
+        positions.append(match.start())
+    if positions != sorted(positions):
+        return False
+    for index, (start, expected) in enumerate(zip(positions, table_facts)):
+        end = positions[index + 1] if index + 1 < len(positions) else start + 240
+        clause = value[start:end]
+        rows = _geometry_values(clause, "rows")
+        columns = _geometry_values(clause, "columns")
+        if (
+            not rows
+            or not columns
+            or rows[0] != expected.get("rows")
+            or columns[0] != expected.get("columns")
+            or not re.search(r"\bheader\b|헤더|제목\s*행", clause, re.I)
+        ):
+            return False
+    return True
+
+
 def structural_evidence_supported(
     issue: str, evidence: list[str], facts: dict | None
 ) -> bool:
@@ -653,13 +733,21 @@ def structural_evidence_supported(
             r"여러\s*(?:카드|패널|기능)|섞|잘못\s*(?:된\s*)?(?:카드|패널|제목|본문|귀속)|오귀속",
             re.I,
         )
-        return bool(
-            references
-            and any(
-                association.search(str(item)) and misassigned.search(str(item))
-                for item in evidence
+        element_types = facts.get("element_types") or {}
+        for item in evidence:
+            item_text = str(item)
+            item_references = _candidate_index_references(
+                [item_text], valid_indices
             )
-        )
+            if not item_references:
+                continue
+            if element_types and not any(
+                element_types.get(index) == "text" for index in item_references
+            ):
+                continue
+            if association.search(item_text) and misassigned.search(item_text):
+                return True
+        return False
     if issue == "table_structure":
         table_indices = set((facts.get("table_elements") or {}).keys())
         return any(
@@ -684,6 +772,11 @@ def grounded_structural_rejection(
         )
     )
     if issue == "table_structure" and facts is not None and image_grounded:
+        if any(
+            _ordered_table_geometry_refutation_supported(item, facts)
+            for item in evidence
+        ):
+            return True
         table_facts = facts.get("table_elements") or {}
         references = _candidate_index_references(
             evidence, set(facts.get("element_indices") or [])
@@ -957,6 +1050,19 @@ def apply_failure_review(
         for item in (review or {}).get("rejected_claims") or []
         if str(item).strip()
     ]
+    if (review or {}).get("confirmed_failure") is False:
+        rejected_claims.extend(
+            str(item).strip()
+            for item in (review or {}).get("structure_evidence") or []
+            if str(item).strip()
+            and re.search(
+                r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|"
+                r"\bno\s+(?:material\s+)?(?:error|mismatch|difference)\b|"
+                r"일치|동일|정확|오류\s*없",
+                str(item),
+                re.I,
+            )
+        )
     grounded_rejections = {
         issue
         for issue in evidenced_primary_structural
@@ -1282,7 +1388,10 @@ def judge_one(client, model: str, item: dict, args: argparse.Namespace) -> dict:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": SYSTEM},
+                    {
+                        "role": "system",
+                        "content": SYSTEM if not attempt else RETRY_SYSTEM,
+                    },
                     {
                         "role": "user",
                         "content": [

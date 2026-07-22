@@ -3123,6 +3123,102 @@ def _normalize_grouped_stub_rowspans(data: dict) -> tuple[dict | None, list[dict
     return (candidate, changes) if changes else (None, [])
 
 
+def _complete_grouped_stub_header_span(
+    data: dict,
+) -> tuple[dict | None, list[dict]]:
+    """Complete a missing two-column header above proven rowspan groups."""
+    candidate = copy.deepcopy(data)
+    changes = []
+    for element_index, element in enumerate(candidate.get("elements") or []):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        soup = BeautifulSoup(element.get("content") or "", "html.parser")
+        table = soup.find("table")
+        if table is None or table.find("table") is not None:
+            continue
+        rows = table_validate._rows_of(table)
+        if len(rows) < 7:
+            continue
+        geometry = _table_geometry(element)
+        widths = geometry.get("expanded_row_widths") or []
+        target_width = geometry.get("most_frequent_width") or 0
+        if (
+            len(widths) != len(rows)
+            or target_width < 4
+            or widths[0] != target_width - 1
+            or any(width != target_width for width in widths[1:])
+        ):
+            continue
+        header = rows[0].find_all(["td", "th"], recursive=False)
+        if (
+            len(header) != target_width - 1
+            or not all(cell.name == "th" for cell in header)
+            or any(
+                table_validate._span_int(cell, "colspan") != 1
+                or table_validate._span_int(cell, "rowspan") != 1
+                for cell in header
+            )
+            or not header[0].get_text(" ", strip=True)
+        ):
+            continue
+
+        body = rows[1:]
+        anchors = []
+        for row_index, row in enumerate(body):
+            cells = row.find_all(["td", "th"], recursive=False)
+            if not cells:
+                continue
+            rowspan = table_validate._span_int(cells[0], "rowspan")
+            if rowspan >= 2:
+                anchors.append((row_index, rowspan, cells[0]))
+        if len(anchors) < 2:
+            continue
+        group_size = anchors[0][1]
+        if (
+            group_size < 2
+            or any(span != group_size for _, span, _ in anchors)
+            or [start for start, _, _ in anchors]
+            != list(range(0, len(anchors) * group_size, group_size))
+            or any(
+                table_validate._span_int(cell, "colspan") != 1
+                for _, _, cell in anchors
+            )
+        ):
+            continue
+        groups_end = len(anchors) * group_size
+        if len(body) not in {groups_end, groups_end + 1}:
+            continue
+        if len(body) == groups_end + 1:
+            summary = body[-1].find_all(["td", "th"], recursive=False)
+            if (
+                not summary
+                or table_validate._span_int(summary[0], "colspan") != 2
+                or not summary[0].get_text(" ", strip=True)
+            ):
+                continue
+
+        header[0]["colspan"] = "2"
+        patched_element = copy.deepcopy(element)
+        patched_element["content"] = str(table)
+        for key in ("_source", "_confidence", "_issues", "_native"):
+            patched_element.pop(key, None)
+        if _table_geometry(patched_element).get("expanded_row_widths") != [
+            target_width
+        ] * len(rows):
+            continue
+        candidate["elements"][element_index] = patched_element
+        changes.append(
+            {
+                "element_index": element_index,
+                "strategy": "grouped_stub_header_span_completed",
+                "groups": len(anchors),
+                "group_size": group_size,
+                "columns": target_width,
+            }
+        )
+    return (candidate, changes) if changes else (None, [])
+
+
 def _normalize_sparse_continuation_rows(data: dict) -> tuple[dict | None, list[dict]]:
     """Build a text-lossless geometry candidate for common VLM row artifacts."""
     candidate = copy.deepcopy(data)
@@ -3228,6 +3324,8 @@ def _validated_deterministic_geometry_repair(
     image_path: Path, original: dict, text_path: Path | None = None
 ) -> tuple[dict | None, list[dict], dict | None]:
     corrected, changes = _normalize_grouped_stub_rowspans(original)
+    if corrected is None:
+        corrected, changes = _complete_grouped_stub_header_span(original)
     if corrected is None:
         corrected, changes = _raster_evidenced_trailing_note_extraction(
             image_path, original
