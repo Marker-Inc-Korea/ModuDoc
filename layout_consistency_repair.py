@@ -36,8 +36,43 @@ Compare the page image with the structured candidate. Check only material assign
 errors among visible cards, panels, and sibling text blocks. A concrete error means that an exact visible
 line or bullet is attached to the wrong panel, duplicated, or placed out of visual reading order.
 Ignore typography, decorative icons, page-number metadata, and harmless whitespace.
-When uncertain, pass the candidate. Return ONLY valid JSON:
-{"pass": true|false, "reason": "short reason", "evidence": ["concrete image/candidate fact"]}"""
+Each candidate element has an explicit zero-based index and is an independent record. Never infer that
+one text element is attached to the preceding or following text element merely because they are adjacent
+in the JSON array. For bounded peer cards, use row-major order: top-left, top-right, then the next row.
+When failing a candidate, cite the affected element as exactly "candidate element index N", quote a short
+candidate snippet, and name the visible card that contains the line. An order failure must cite at least
+two candidate indexes and their visible row/column positions. When uncertain or unable to provide this
+grounding, pass the candidate. Return ONLY valid JSON:
+{"pass": true|false, "reason": "short reason", "evidence": ["indexed image/candidate fact"]}"""
+
+
+FINAL_VERIFY_SYSTEM = """You are a conservative visual panel-mapping auditor for a document parser.
+Use the page IMAGE as truth. The candidate elements are independent records with explicit zero-based
+indexes; JSON adjacency never means that one element is attached to another. Audit ONLY the supplied
+changed text element indexes. For each changed element, locate the single bounded card or panel containing
+its visible title and body, then report its one-based row and column. Check that every line in that candidate
+element belongs inside that same visible card. For bounded peer cards, reading order is row-major:
+top-left, top-right, then the next row. Ignore typography, icons, whitespace, and unchanged elements.
+
+Return ONLY valid JSON with this schema:
+{
+  "pass": true|false,
+  "reading_order_matches": true|false,
+  "changed_elements": [
+    {
+      "candidate_index": 0,
+      "visible_card_title": "exact short visible title",
+      "image_row": 1,
+      "image_column": 1,
+      "content_matches_visible_card": true|false,
+      "evidence": "short exact image/candidate fact"
+    }
+  ],
+  "reason": "short reason"
+}
+Include exactly one changed_elements entry for every supplied changed index and no others. Set pass=true
+only when every content_matches_visible_card value and reading_order_matches are true. When uncertain,
+set pass=false."""
 
 
 REPAIR_SYSTEM = """You repair structured text assignment on a visually complex document page.
@@ -176,11 +211,14 @@ def _public_candidate(data: dict) -> dict:
         "page_number": data.get("page_number"),
         "elements": [
             {
-                key: element.get(key)
-                for key in ("type", "content", "caption", "description")
-                if element.get(key) not in (None, "")
+                "index": index,
+                **{
+                    key: element.get(key)
+                    for key in ("type", "content", "caption", "description")
+                    if element.get(key) not in (None, "")
+                },
             }
-            for element in data.get("elements") or []
+            for index, element in enumerate(data.get("elements") or [])
             if isinstance(element, dict)
         ],
     }
@@ -371,6 +409,82 @@ def _merge_reassignment(original: dict, candidate: dict) -> dict | None:
     return merged
 
 
+def _changed_text_indexes(original: dict, candidate: dict) -> list[int]:
+    old_elements = original.get("elements") or []
+    new_elements = candidate.get("elements") or []
+    if len(old_elements) != len(new_elements):
+        return []
+    return [
+        index
+        for index, (old, new) in enumerate(zip(old_elements, new_elements))
+        if isinstance(old, dict)
+        and isinstance(new, dict)
+        and old.get("type") == new.get("type") == "text"
+        and old.get("content") != new.get("content")
+    ]
+
+
+def _normalized_words(value: object) -> str:
+    return " ".join(
+        re.findall(
+            r"\w+",
+            unicodedata.normalize("NFKC", str(value or "")).casefold(),
+            flags=re.UNICODE,
+        )
+    )
+
+
+def _final_review_accepts(
+    verdict: object, candidate: dict, changed_indexes: list[int]
+) -> bool:
+    """Accept only a complete, image-grounded mapping of every changed panel."""
+    if (
+        not isinstance(verdict, dict)
+        or verdict.get("pass") is not True
+        or verdict.get("reading_order_matches") is not True
+        or not changed_indexes
+    ):
+        return False
+    mappings = verdict.get("changed_elements")
+    if not isinstance(mappings, list) or len(mappings) != len(changed_indexes):
+        return False
+
+    elements = candidate.get("elements") or []
+    expected = set(changed_indexes)
+    observed = set()
+    positions = {}
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            return False
+        index = mapping.get("candidate_index")
+        if type(index) is not int or index not in expected or index in observed:
+            return False
+        if (
+            mapping.get("content_matches_visible_card") is not True
+            or type(mapping.get("image_row")) is not int
+            or mapping["image_row"] < 1
+            or type(mapping.get("image_column")) is not int
+            or mapping["image_column"] < 1
+            or not str(mapping.get("evidence") or "").strip()
+        ):
+            return False
+        if index >= len(elements) or not isinstance(elements[index], dict):
+            return False
+        segments = _atomic_text_segments(elements[index].get("content"))
+        title = _normalized_words(mapping.get("visible_card_title"))
+        candidate_title = _normalized_words(segments[0][1] if segments else "")
+        if not title or title != candidate_title:
+            return False
+        observed.add(index)
+        position = (mapping["image_row"], mapping["image_column"])
+        if position in positions.values():
+            return False
+        positions[index] = position
+    return observed == expected and [
+        positions[index] for index in sorted(observed)
+    ] == sorted(positions.values())
+
+
 def repair_layout_consistency(
     doc_output_dir: str, api_key: str, model: str, persist_page
 ) -> list[dict]:
@@ -466,14 +580,24 @@ def repair_layout_consistency(
             record["error"] = "repair was not a text-only inventory-preserving reassignment"
             results.append(record)
             continue
+        changed_indexes = _changed_text_indexes(original, repaired)
+        if not changed_indexes:
+            record["error"] = "repair did not change any text assignment"
+            results.append(record)
+            continue
         final_public = json.dumps(_public_candidate(repaired), ensure_ascii=False)
         try:
             final_verdict = _response_json(
                 client,
                 model,
                 image_path,
-                VERIFY_SYSTEM,
-                f"Structured candidate:\n<candidate>{final_public}</candidate>",
+                FINAL_VERIFY_SYSTEM,
+                (
+                    "Changed text element indexes:\n"
+                    f"<changed_indexes>{json.dumps(changed_indexes)}</changed_indexes>\n\n"
+                    "Structured candidate:\n"
+                    f"<candidate>{final_public}</candidate>"
+                ),
                 LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
             )
         except Exception as exc:
@@ -481,8 +605,8 @@ def repair_layout_consistency(
             results.append(record)
             continue
         record["final_review"] = final_verdict
-        if not isinstance(final_verdict, dict) or final_verdict.get("pass") is not True:
-            record["error"] = "repaired candidate failed visual re-review"
+        if not _final_review_accepts(final_verdict, repaired, changed_indexes):
+            record["error"] = "repaired candidate failed grounded visual re-review"
             results.append(record)
             continue
         repaired["layout_consistency_repair"] = True

@@ -230,6 +230,104 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
 
         self.assertIsNone(repair._merge_reassignment(original, rewritten))
 
+    def test_public_candidate_has_authoritative_element_indexes(self):
+        candidate = repair._public_candidate(
+            {
+                "page_number": 4,
+                "elements": [
+                    {"type": "heading_1", "content": "Features"},
+                    {"type": "text", "content": "Search\n• Query"},
+                ],
+            }
+        )
+
+        self.assertEqual(candidate["page_number"], 4)
+        self.assertEqual(
+            [element["index"] for element in candidate["elements"]], [0, 1]
+        )
+
+    def test_grounded_final_review_maps_every_changed_panel(self):
+        original = {
+            "elements": [
+                {"type": "heading_1", "content": "Features"},
+                {"type": "text", "content": "Search"},
+                {
+                    "type": "text",
+                    "content": "Privacy\n• Private period\n• Query options",
+                },
+            ]
+        }
+        candidate = {
+            "elements": [
+                {"type": "heading_1", "content": "Features"},
+                {"type": "text", "content": "Search\n• Query options"},
+                {"type": "text", "content": "Privacy\n• Private period"},
+            ]
+        }
+        changed = repair._changed_text_indexes(original, candidate)
+        verdict = {
+            "pass": True,
+            "reading_order_matches": True,
+            "changed_elements": [
+                {
+                    "candidate_index": 1,
+                    "visible_card_title": "Search",
+                    "image_row": 1,
+                    "image_column": 1,
+                    "content_matches_visible_card": True,
+                    "evidence": "The query-options bullet is inside the Search card.",
+                },
+                {
+                    "candidate_index": 2,
+                    "visible_card_title": "Privacy",
+                    "image_row": 1,
+                    "image_column": 2,
+                    "content_matches_visible_card": True,
+                    "evidence": "The private-period bullet is inside the Privacy card.",
+                },
+            ],
+        }
+
+        self.assertEqual(changed, [1, 2])
+        self.assertTrue(repair._final_review_accepts(verdict, candidate, changed))
+
+        missing_mapping = {
+            **verdict,
+            "changed_elements": verdict["changed_elements"][:1],
+        }
+        self.assertFalse(
+            repair._final_review_accepts(missing_mapping, candidate, changed)
+        )
+
+        wrong_title = {
+            **verdict,
+            "changed_elements": [
+                {**verdict["changed_elements"][0], "visible_card_title": "Privacy"},
+                verdict["changed_elements"][1],
+            ],
+        }
+        self.assertFalse(repair._final_review_accepts(wrong_title, candidate, changed))
+
+        reversed_visual_order = {
+            **verdict,
+            "changed_elements": [
+                {**verdict["changed_elements"][0], "image_column": 2},
+                {**verdict["changed_elements"][1], "image_column": 1},
+            ],
+        }
+        self.assertFalse(
+            repair._final_review_accepts(reversed_visual_order, candidate, changed)
+        )
+
+        ungrounded = {
+            **verdict,
+            "changed_elements": [
+                {**verdict["changed_elements"][0], "evidence": ""},
+                verdict["changed_elements"][1],
+            ],
+        }
+        self.assertFalse(repair._final_review_accepts(ungrounded, candidate, changed))
+
 
 if __name__ == "__main__":
     unittest.main()
