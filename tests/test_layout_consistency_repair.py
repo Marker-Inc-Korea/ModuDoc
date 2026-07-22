@@ -174,6 +174,62 @@ class LayoutConsistencyRepairTests(unittest.TestCase):
 
         self.assertIsNone(repair._merge_reassignment(original, rewritten))
 
+    def test_merge_restores_one_near_typo_while_moving_the_exact_source(self):
+        original = {
+            "elements": [
+                {
+                    "type": "text",
+                    "content": "Search panel\n• Search condition convenience improved",
+                },
+                {"type": "text", "content": "Privacy panel\n• Private period"},
+            ]
+        }
+        candidate = {
+            "elements": [
+                {"type": "text", "content": "Search panel"},
+                {
+                    "type": "text",
+                    "content": (
+                        "Privacy panel\n- Private period\n"
+                        "- Search condition convenience improves"
+                    ),
+                },
+            ]
+        }
+
+        merged = repair._merge_reassignment(original, candidate)
+
+        self.assertIsNotNone(merged)
+        self.assertEqual(
+            merged["elements"][1]["content"],
+            "Privacy panel\n• Private period\n• Search condition convenience improved",
+        )
+
+    def test_merge_rejects_a_semantically_different_single_token_rewrite(self):
+        original = {
+            "elements": [
+                {
+                    "type": "text",
+                    "content": "Search panel\n• Search condition convenience improved",
+                },
+                {"type": "text", "content": "Privacy panel\n• Private period"},
+            ]
+        }
+        rewritten = {
+            "elements": [
+                {"type": "text", "content": "Search panel"},
+                {
+                    "type": "text",
+                    "content": (
+                        "Privacy panel\n- Private period\n"
+                        "- Search condition convenience pricing"
+                    ),
+                },
+            ]
+        }
+
+        self.assertIsNone(repair._merge_reassignment(original, rewritten))
+
 
 if __name__ == "__main__":
     unittest.main()

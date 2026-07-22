@@ -10,6 +10,7 @@ import os
 import re
 import unicodedata
 from collections import Counter, defaultdict, deque
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from PIL import Image
@@ -308,8 +309,35 @@ def _canonicalized_reassignment(original: dict, candidate: dict) -> dict | None:
             return None
         candidate_segments.append(segments)
         candidate_signatures.update(signature for signature, _ in segments)
-    if not source_signatures or source_signatures != candidate_signatures:
+    if not source_signatures:
         return None
+    signature_aliases = {}
+    if source_signatures != candidate_signatures:
+        missing = list((source_signatures - candidate_signatures).elements())
+        added = list((candidate_signatures - source_signatures).elements())
+        if len(missing) != 1 or len(added) != 1:
+            return None
+        source_signature, candidate_signature = missing[0], added[0]
+        matching_positions = sum(
+            source_token == candidate_token
+            for source_token, candidate_token in zip(
+                source_signature, candidate_signature
+            )
+        )
+        if (
+            len(source_signature) != len(candidate_signature)
+            or len(source_signature) < 3
+            or matching_positions != len(source_signature) - 1
+            or SequenceMatcher(
+                None,
+                "".join(source_signature),
+                "".join(candidate_signature),
+                autojunk=False,
+            ).ratio()
+            < 0.85
+        ):
+            return None
+        signature_aliases[candidate_signature] = source_signature
 
     canonical = copy.deepcopy(candidate)
     segment_index = 0
@@ -320,9 +348,10 @@ def _canonicalized_reassignment(original: dict, candidate: dict) -> dict | None:
             continue
         exact = []
         for signature, _ in segments:
-            if not source_by_signature[signature]:
+            source_signature = signature_aliases.get(signature, signature)
+            if not source_by_signature[source_signature]:
                 return None
-            exact.append(source_by_signature[signature].popleft())
+            exact.append(source_by_signature[source_signature].popleft())
         element["content"] = "\n".join(exact)
     if any(values for values in source_by_signature.values()):
         return None
