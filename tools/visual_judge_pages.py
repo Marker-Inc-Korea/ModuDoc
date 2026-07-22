@@ -685,17 +685,22 @@ def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool
         r"\b(?:third|3rd)\b|세\s*번째|셋째",
         r"\b(?:fourth|4th)\b|네\s*번째|넷째",
     ]
-    positions = []
-    for pattern in ordinals[: len(table_facts)]:
-        match = re.search(pattern, value, re.I)
-        if match is None:
+    if len(table_facts) == 1:
+        clauses = [value]
+    else:
+        positions = []
+        for pattern in ordinals[: len(table_facts)]:
+            match = re.search(pattern, value, re.I)
+            if match is None:
+                return False
+            positions.append(match.start())
+        if positions != sorted(positions):
             return False
-        positions.append(match.start())
-    if positions != sorted(positions):
-        return False
-    for index, (start, expected) in enumerate(zip(positions, table_facts)):
-        end = positions[index + 1] if index + 1 < len(positions) else start + 240
-        clause = value[start:end]
+        clauses = [
+            value[start : positions[index + 1] if index + 1 < len(positions) else start + 240]
+            for index, start in enumerate(positions)
+        ]
+    for clause, expected in zip(clauses, table_facts):
         rows = _geometry_values(clause, "rows")
         columns = _geometry_values(clause, "columns")
         if (

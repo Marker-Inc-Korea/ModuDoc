@@ -761,6 +761,59 @@ class VLMResilienceTests(unittest.TestCase):
 
         self.assertEqual(cleaned, elements)
 
+    def test_trailing_table_unit_becomes_caption_and_duplicate_is_removed(self):
+        elements = [
+            {
+                "type": "text",
+                "content": "The facility is split between two sources (USD millions)",
+            },
+            {"type": "footnote", "content": "* Dates may change."},
+            {
+                "type": "table",
+                "content": "<table><tr><td>Period</td><td>Amount</td></tr></table>",
+            },
+            {"type": "text", "content": "(USD millions)"},
+        ]
+
+        repaired = utils._attach_adjacent_table_unit_captions(elements)
+
+        self.assertEqual([item["type"] for item in repaired], ["text", "footnote", "table"])
+        self.assertEqual(repaired[0]["content"], "The facility is split between two sources")
+        self.assertEqual(repaired[2]["caption"], "(USD millions)")
+
+    def test_trailing_table_unit_is_appended_to_existing_caption(self):
+        elements = [
+            {
+                "type": "table",
+                "caption": "Repayment schedule",
+                "content": "<table><tr><td>Period</td><td>Amount</td></tr></table>",
+            },
+            {"type": "text", "content": "[Units: EUR millions]"},
+        ]
+
+        repaired = utils._attach_adjacent_table_unit_captions(elements)
+
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(
+            repaired[0]["caption"],
+            "Repayment schedule [Units: EUR millions]",
+        )
+
+    def test_non_unit_or_malformed_marker_after_table_is_preserved(self):
+        for marker in ("(draft schedule)", "(USD millions]"):
+            with self.subTest(marker=marker):
+                elements = [
+                    {
+                        "type": "table",
+                        "content": "<table><tr><td>Period</td><td>Amount</td></tr></table>",
+                    },
+                    {"type": "text", "content": marker},
+                ]
+
+                repaired = utils._attach_adjacent_table_unit_captions(elements)
+
+                self.assertEqual(repaired, elements)
+
     def test_excessive_stream_uses_semantic_source_ratio(self):
         with (
             patch.object(utils, "VLM_STREAM_ABORT_INPUT_MIN_CHARS", 10),

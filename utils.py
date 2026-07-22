@@ -1467,6 +1467,90 @@ def _backfill_table_captions(elements):
     return elements
 
 
+def _standalone_table_unit_marker(value):
+    marker = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not marker or len(marker) > 48:
+        return ""
+
+    bracketed = len(marker) >= 3 and (
+        (marker[0] == "(" and marker[-1] == ")")
+        or (marker[0] == "[" and marker[-1] == "]")
+    )
+    body = marker[1:-1].strip() if bracketed else marker
+    if re.match(r"^(?:units?|단위)\s*[:：]", body, re.I):
+        return marker
+    if not bracketed:
+        return ""
+
+    if re.search(r"\b(?:USD|KRW|EUR|JPY|CNY|RMB)\b|[$€£¥₩]", body, re.I):
+        return marker
+    if re.fullmatch(
+        r"(?:억|백만|천|만)?\s*(?:원|달러|유로|엔)"
+        r"|(?:millions?|thousands?|billions?)"
+        r"|(?:%|percent|kg|g|t|tonnes?|m[23²³]?|㎡|㎥)",
+        body,
+        re.I,
+    ):
+        return marker
+    return ""
+
+
+def _attach_adjacent_table_unit_captions(elements):
+    """Move a trailing standalone unit label into its adjacent table caption."""
+    if not elements:
+        return elements
+
+    repaired = []
+    index = 0
+    while index < len(elements):
+        element = elements[index]
+        following = elements[index + 1] if index + 1 < len(elements) else None
+        marker = ""
+        if (
+            isinstance(element, dict)
+            and element.get("type") == "table"
+            and isinstance(following, dict)
+            and following.get("type", "text") in {"text", "footnote"}
+        ):
+            marker = _standalone_table_unit_marker(following.get("content"))
+
+        if not marker:
+            repaired.append(element)
+            index += 1
+            continue
+
+        table = dict(element)
+        caption = re.sub(r"\s+", " ", str(table.get("caption") or "")).strip()
+        if marker not in caption:
+            table["caption"] = f"{caption} {marker}".strip()
+
+        # A VLM can append the same visible unit to nearby prose as well as
+        # emit it after the table. Remove only an exact terminal duplicate.
+        for previous_index in range(len(repaired) - 1, max(-1, len(repaired) - 5), -1):
+            previous = repaired[previous_index]
+            if not isinstance(previous, dict):
+                continue
+            previous_type = previous.get("type", "text")
+            if previous_type == "table" or previous_type == "figure" or str(previous_type).startswith("heading"):
+                break
+            if previous_type not in {"text", "footnote"}:
+                continue
+            content = str(previous.get("content") or "").rstrip()
+            if not content.endswith(marker):
+                continue
+            content = content[:-len(marker)].rstrip()
+            if content:
+                repaired[previous_index] = {**previous, "content": content}
+            else:
+                repaired.pop(previous_index)
+            break
+
+        repaired.append(table)
+        index += 2
+
+    return repaired
+
+
 def _reposition_figures_by_anchor(elements, anchors):
     """figure 를 IR 앵커의 직후 텍스트 앞으로 이동(그림만 이동, 텍스트·표 불변).
     anchors: [{'prev':앞문단, 'next':뒷문단}] 문서순. 매칭 실패 그림은 제자리."""
@@ -4144,6 +4228,7 @@ class DocumentProcessor:
                         _page_no_for_artifacts = parsed.get("page_number")
                         deduped = _drop_page_artifact_elements(deduped, _page_no_for_artifacts)
                         deduped = _backfill_table_captions(deduped)
+                        deduped = _attach_adjacent_table_unit_captions(deduped)
                     except Exception as ae:
                         logger.warning(f"페이지 노이즈/표 캡션 보정 실패({stem}): {ae}")
                     # silent-drop 탐지: 이미지엔 잉크가 있는데 추출 본문이 페이지번호/푸터 수준이면 저신뢰 표기.
@@ -4188,12 +4273,13 @@ class DocumentProcessor:
                                         q.get("issues")))
                                     continue
                                 # 네이티브 우선: 내용일치하면 정답구조로 교체(검증/수리 생략 — 이미 정확).
-                                _nh = (table_validate.native_substitute(e["content"], _native_prep)
-                                       if _native_prep else None)
-                                if _nh and _nh.strip() and "</table>" in _nh:
-                                    _nh = table_validate.slice_native_to_source_page(
-                                        _nh, source_text_layer
+                                _nh = (
+                                    table_validate.native_substitute_for_source_page(
+                                        e["content"], _native_prep, source_text_layer
                                     )
+                                    if _native_prep else None
+                                )
+                                if _nh and _nh.strip() and "</table>" in _nh:
                                     _nh = table_validate.strip_caption_duplicate_metadata_row(
                                         _nh, e.get("caption")
                                     )

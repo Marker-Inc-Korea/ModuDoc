@@ -1457,6 +1457,54 @@ class GenericTableRepairTests(unittest.TestCase):
 
         self.assertIsNone(matched)
 
+    def test_source_page_gate_only_rejects_sliced_native_tables(self):
+        full = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td>Visible alpha</td><td>Current page alpha detail</td></tr>"
+            "<tr><td>Visible beta</td><td>Current page beta detail</td></tr>"
+            "<tr><td>Visible gamma</td><td>Current page gamma detail</td></tr></table>"
+        )
+        source = (
+            "Category Details Visible alpha Current page alpha detail "
+            "Visible beta Current page beta detail Visible gamma"
+        )
+
+        matched = table_validate.native_substitute_for_source_page(
+            full, table_validate.prepare_native([{"html": full}]), source
+        )
+
+        self.assertEqual(matched, full)
+
+    def test_source_page_gate_rejects_hidden_text_in_native_fragment(self):
+        native = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td>Earlier alpha</td><td>Earlier page detail</td></tr>"
+            "<tr><td>Earlier beta</td><td>Earlier page detail</td></tr>"
+            "<tr><td>Visible alpha</td><td>Visible detail plus hidden next-page clause</td></tr>"
+            "<tr><td>Visible beta</td><td>Second visible detail</td></tr>"
+            "<tr><td>Visible gamma</td><td>Third visible detail</td></tr>"
+            "<tr><td>Later alpha</td><td>Later page detail</td></tr>"
+            "<tr><td>Later beta</td><td>Later page detail</td></tr></table>"
+        )
+        fragment = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td>Visible alpha</td><td>Visible detail</td></tr>"
+            "<tr><td>Visible beta</td><td>Second visible detail</td></tr>"
+            "<tr><td>Visible gamma</td><td>Third visible detail</td></tr></table>"
+        )
+        source = (
+            "Category Details Visible alpha Visible detail Visible beta "
+            "Second visible detail Visible gamma Third visible detail"
+        )
+
+        matched = table_validate.native_substitute_for_source_page(
+            fragment,
+            table_validate.prepare_native([{"html": native}]),
+            source,
+        )
+
+        self.assertIsNone(matched)
+
     def test_native_slice_aligns_a_keyless_boundary_row_to_stable_spans(self):
         native = (
             "<table><tr><th colspan='2'>Kind</th><th colspan='2'>Coverage</th><th>Notes</th></tr>"
@@ -1706,6 +1754,60 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIn("Gamma coverage", sliced)
         self.assertNotIn("Operation period", sliced)
         self.assertNotIn("Delta coverage", sliced)
+
+    def test_native_source_slice_does_not_reuse_one_repeated_anchor(self):
+        native = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td>Old alpha</td><td>Earlier material</td></tr>"
+            "<tr><td>Old beta</td><td>Earlier material</td></tr>"
+            "<tr><td>Repeated coverage</td><td>Earlier repeated detail</td></tr>"
+            "<tr><td>Current alpha</td><td>Current alpha detail</td></tr>"
+            "<tr><td>Repeated coverage</td><td>Visible repeated detail</td></tr>"
+            "<tr><td>Current beta</td><td>Current beta detail</td></tr>"
+            "<tr><td>Boundary coverage</td><td>Visible boundary detail</td></tr>"
+            "<tr><td>Repeated coverage</td><td>Later repeated detail</td></tr>"
+            "<tr><td>Future alpha</td><td>Future material</td></tr>"
+            "<tr><td>Future beta</td><td>Future material</td></tr></table>"
+        )
+        source = (
+            "Category Details Current alpha Current alpha detail "
+            "Repeated coverage Visible repeated detail Current beta "
+            "Current beta detail Boundary coverage Visible boundary detail"
+        )
+
+        sliced = table_validate.slice_native_to_source_page(native, source)
+
+        self.assertIn("Visible repeated detail", sliced)
+        self.assertNotIn("Earlier repeated detail", sliced)
+        self.assertNotIn("Later repeated detail", sliced)
+        self.assertLess(sliced.index("Current alpha"), sliced.index("Boundary coverage"))
+
+    def test_native_page_slice_rejects_hidden_boundary_text(self):
+        native = (
+            "<table><tr><th>Category</th><th>Details</th></tr>"
+            "<tr><td>Visible coverage</td>"
+            "<td>Visible current-page clause - Hidden next-page condition</td></tr>"
+            "<tr><td>Second coverage</td><td>Second visible detail</td></tr></table>"
+        )
+        partial_source = (
+            "Category Details Visible coverage Visible current-page clause "
+            "Second coverage Second visible detail"
+        )
+        complete_source = (
+            "Category Details Visible coverage Visible current-page clause "
+            "- Hidden next-page condition Second coverage Second visible detail"
+        )
+
+        self.assertFalse(
+            table_validate.native_page_slice_is_source_grounded(
+                native, partial_source
+            )
+        )
+        self.assertTrue(
+            table_validate.native_page_slice_is_source_grounded(
+                native, complete_source
+            )
+        )
 
     def test_native_page_slice_requires_multiple_supported_body_rows(self):
         native = (

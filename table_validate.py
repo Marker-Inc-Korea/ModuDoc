@@ -695,57 +695,101 @@ def _graft_nested_native(vlm_html, native_prepared):
             return None                                    # 실체 다수가 native 부재 → 손실
     return str(ntable)
 
-def native_substitute(vlm_html, native_prepared, min_score=0.6):
-    """내용 일치하는 네이티브 표 HTML 반환(없으면 None).
-    셀집합 포함도(교집합/VLM셀수) 임계 이상, 네이티브가 훨씬 크면 슬라이스."""
+def _native_substitute_with_slice_status(
+    vlm_html, native_prepared, min_score=0.6
+):
+    """Return a native match and whether it was cut from a larger table."""
     if not native_prepared:
-        return None
+        return None, False
     # 중첩표(표 안의 표): native 골격에 중첩표 접합 시도(불가 시 원본 유지).
     try:
         _t = BeautifulSoup(vlm_html or "", "html.parser").find("table")
         if _t is not None and _t.find("table") is not None:
-            return _graft_nested_native(vlm_html, native_prepared)
+            return _graft_nested_native(vlm_html, native_prepared), False
     except Exception:
         pass
     vset = _cell_set(vlm_html)
     if len(vset) < 4:
-        return None
+        return None, False
     best, best_score = None, 0.0
     for nt in native_prepared:
         score = len(vset & nt["_set"]) / len(vset)
         if score > best_score:
             best, best_score = nt, score
     if best is None or best_score < min_score:
-        return _ordered_native_match(vlm_html, native_prepared)
+        return _ordered_native_match(vlm_html, native_prepared), False
     if best["_n"] > len(vset) * 1.5:          # 분할표 → 슬라이스
-        return _slice_native(best["html"], vlm_html)
-    return best["html"]
+        return _slice_native(best["html"], vlm_html), True
+    return best["html"], False
 
 
-def _source_supported_native_row(row, normalized_source):
-    key = _row_key(row)
-    if len(key) >= 3 and key in normalized_source:
-        return True
-    values = [
-        value
-        for cell in row.find_all(["td", "th"], recursive=False)
-        if (value := _cell_own_text(cell))
-    ]
-    exact = sum(value in normalized_source for value in values)
-    tokens = [
-        token
-        for value in values
-        for token in re.findall(r"[가-힣A-Za-z0-9]{4,}", value)
-    ]
-    supported = sum(token in normalized_source for token in tokens)
-    return bool(
-        exact >= 2
-        or (
-            exact >= 1
-            and supported >= 8
-            and supported / max(1, len(tokens)) >= 0.55
-        )
+def native_substitute(vlm_html, native_prepared, min_score=0.6):
+    """내용 일치하는 네이티브 표 HTML 반환(없으면 None).
+    셀집합 포함도(교집합/VLM셀수) 임계 이상, 네이티브가 훨씬 크면 슬라이스."""
+    matched, _ = _native_substitute_with_slice_status(
+        vlm_html, native_prepared, min_score
     )
+    return matched
+
+
+def native_substitute_for_source_page(
+    vlm_html, native_prepared, source_text, min_score=0.6
+):
+    """Return a page-grounded native match, or None to retain the VLM table."""
+    matched, was_sliced = _native_substitute_with_slice_status(
+        vlm_html, native_prepared, min_score
+    )
+    if not matched:
+        return None
+    source_sliced = slice_native_to_source_page(matched, source_text)
+    was_sliced = was_sliced or source_sliced != matched
+    if was_sliced and not native_page_slice_is_source_grounded(
+        source_sliced, source_text
+    ):
+        return None
+    return source_sliced
+
+
+def _ordered_source_supported_rows(rows, normalized_source):
+    """Align native rows to source occurrences without reusing one anchor."""
+    row_candidates = []
+    for index, row in enumerate(rows):
+        values = [
+            value
+            for cell in row.find_all(["td", "th"], recursive=False)
+            if (value := _cell_own_text(cell)) and len(value) >= 3
+        ]
+        exact_values = [value for value in values if value in normalized_source]
+        if not exact_values:
+            row_candidates.append((index, []))
+            continue
+        anchor = max(exact_values, key=len)
+        positions = []
+        start = 0
+        while True:
+            position = normalized_source.find(anchor, start)
+            if position < 0:
+                break
+            positions.append((position, position + len(anchor)))
+            start = position + 1
+        exact_score = sum(len(value) for value in exact_values)
+        row_candidates.append(
+            (index, [(start, end, exact_score) for start, end in positions])
+        )
+
+    # state: last source offset -> (matched rows, exact-text score, row indexes)
+    states = {-1: (0, 0, ())}
+    for row_index, candidates in row_candidates:
+        updated = dict(states)
+        for last_end, state in states.items():
+            for start, end, score in candidates:
+                if start < last_end:
+                    continue
+                candidate = (state[0] + 1, state[1] + score, state[2] + (row_index,))
+                if candidate[:2] > updated.get(end, (-1, -1, ()))[:2]:
+                    updated[end] = candidate
+        states = updated
+    return list(max(states.values(), key=lambda state: state[:2])[2])
 
 
 def slice_native_to_source_page(native_html, source_text):
@@ -768,9 +812,10 @@ def slice_native_to_source_page(native_html, source_text):
             break
         header_count += 1
     supported = [
-        index
-        for index, row in enumerate(rows[header_count:], start=header_count)
-        if _source_supported_native_row(row, normalized_source)
+        header_count + index
+        for index in _ordered_source_supported_rows(
+            rows[header_count:], normalized_source
+        )
     ]
     if len(supported) < 2:
         return native_html
@@ -807,6 +852,31 @@ def slice_native_to_source_page(native_html, source_text):
     }:
         return native_html
     return str(rebuilt)
+
+
+def native_page_slice_is_source_grounded(native_html, source_text):
+    """Reject native page slices that add substantial text absent from the page."""
+    normalized_source = _ncell(source_text)
+    if len(normalized_source) < 40:
+        return False
+    try:
+        table = BeautifulSoup(native_html or "", "html.parser").find("table")
+    except Exception:
+        return False
+    if table is None:
+        return False
+    for cell in table.find_all(["td", "th"]):
+        if cell.find_parent("table") is not table:
+            continue
+        value = _cell_own_text(cell)
+        if len(value) < 8 or value in normalized_source:
+            continue
+        longest = SequenceMatcher(
+            None, value, normalized_source, autojunk=False
+        ).find_longest_match(0, len(value), 0, len(normalized_source)).size
+        if longest / len(value) < 0.90:
+            return False
+    return True
 
 
 def strip_caption_duplicate_metadata_row(html, caption):
