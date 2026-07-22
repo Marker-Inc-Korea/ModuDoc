@@ -790,6 +790,48 @@ class VisualJudgeTests(unittest.TestCase):
         )
         self.assertFalse(result["pass"])
 
+    def test_single_table_exact_geometry_can_be_implicit_in_review(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has 30 rows, but candidate element index 6 has 28 rows."
+            ],
+        }
+        review = {
+            "confirmed_failure": False,
+            "confirmed_issue_types": [],
+            "rejected_claims": [
+                "The table has 28 rows and 7 columns, which matches the image. "
+                "There is one table element (index 6)."
+            ],
+            "reason": "No material table structure error was found.",
+        }
+        facts = {
+            "element_indices": list(range(7)),
+            "element_types": {**{index: "text" for index in range(6)}, 6: "table"},
+            "table_elements": {
+                6: {"rows": 28, "header_rows": 2, "columns": 7, "table_tags": 1}
+            },
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "Table and preceding notes", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+        review["rejected_claims"][0] = review["rejected_claims"][0].replace(
+            "28 rows", "27 rows"
+        )
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "Table and preceding notes", facts
+        )
+        self.assertFalse(result["pass"])
+
     def test_matching_review_structure_evidence_can_act_as_refutation(self):
         primary = {
             "pass": False,

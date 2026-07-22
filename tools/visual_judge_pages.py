@@ -663,7 +663,7 @@ def _table_geometry_evidence_supported(
 
 
 def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool:
-    """Accept a complete ordinal image/candidate geometry match as grounding."""
+    """Accept a complete image/candidate table geometry match as grounding."""
     table_facts = [
         value
         for _, value in sorted((facts.get("table_elements") or {}).items())
@@ -673,10 +673,13 @@ def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool
         re.search(pattern, value, re.I)
         for pattern in (
             r"\b(?:image|page|visible|visual|raster)\b|이미지|원본|페이지|화면",
-            r"\bcandidate\b|후보",
             r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|일치|동일|정확",
             r"\btables?\b|표",
         )
+    ):
+        return False
+    if len(table_facts) > 1 and not re.search(
+        r"\bcandidate\b|후보", value, re.I
     ):
         return False
     ordinals = [
@@ -708,7 +711,10 @@ def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool
             or not columns
             or rows[0] != expected.get("rows")
             or columns[0] != expected.get("columns")
-            or not re.search(r"\bheader\b|헤더|제목\s*행", clause, re.I)
+            or (
+                len(table_facts) > 1
+                and not re.search(r"\bheader\b|헤더|제목\s*행", clause, re.I)
+            )
         ):
             return False
     return True
