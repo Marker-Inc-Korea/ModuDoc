@@ -6,7 +6,8 @@
     <title>ModuDoc · 원본 비교</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
     <style>
-        html, body { height: 100%; }
+        html, body { height: 100%; min-height: 100%; }
+        #appMain, #viewerShell, #viewerWorkspace, .compare-pane { min-height: 0; }
         #parsed table { border-collapse: collapse; width: 100%; margin: .4rem 0; font-size: .78rem; }
         #parsed td, #parsed th { border: 1px solid #d1d5db; padding: 4px 7px; vertical-align: top; }
         #parsed th { background: #f3f4f6; font-weight: 700; }
@@ -15,16 +16,29 @@
         .page-chip { width: 2.35rem; height: 2rem; }
         .element-block { scroll-margin-top: .75rem; }
         .source-image { max-width: none; transform-origin: top left; }
-        .touch-scroll { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; overscroll-behavior: contain; }
+        .touch-scroll { -webkit-overflow-scrolling: touch; touch-action: auto; overscroll-behavior: auto; }
+        .scroll-viewport { flex: 1 1 0%; height: 0; min-height: 0; overflow: auto; }
         @media (max-width: 1023px) {
-            html, body { height: 100dvh; }
-            .compare-pane { height: 100%; }
+            html { height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; }
+            body.compare-body { height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; }
+            #appMain { height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+            #viewerShell { height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
+            #viewerWorkspace {
+                flex: 0 0 auto;
+                height: auto;
+                overflow: visible;
+            }
+            .compare-pane { height: auto; min-height: 0; overflow: visible; }
+            .scroll-viewport { flex: 0 0 auto; height: auto; overflow: visible; }
+            #imagePane { overflow-x: auto; overflow-y: hidden; }
+            #parsedPane { overflow: visible; }
+            #rawJson { height: auto; overflow-x: auto; overflow-y: visible; }
             .compare-pane[data-mobile-active="false"] { display: none; }
             .compare-pane[data-mobile-active="true"] { display: flex; }
         }
     </style>
 </head>
-<body class="bg-gray-50 text-gray-900 lg:flex h-[100dvh] overflow-hidden">
+<body class="compare-body bg-gray-50 text-gray-900 lg:flex h-[100dvh] overflow-hidden">
     <aside class="hidden w-64 bg-gray-900 text-white lg:flex flex-col flex-shrink-0">
         <div class="p-6 font-bold text-xl tracking-wider border-b border-gray-700">ModuDoc</div>
         <nav class="flex-1 p-4 space-y-2">
@@ -35,19 +49,19 @@
     </aside>
 
     <main id="appMain" class="h-[100dvh] flex-1 overflow-hidden lg:grid lg:grid-cols-[19rem_minmax(0,1fr)]">
-        <section class="hidden bg-white border-r border-gray-200 lg:flex flex-col min-w-0">
-            <div class="px-4 py-3 border-b border-gray-200">
+        <section id="documentSidebar" class="hidden min-h-0 overflow-hidden bg-white border-r border-gray-200 lg:flex flex-col min-w-0">
+            <div class="flex-shrink-0 px-4 py-3 border-b border-gray-200">
                 <div class="text-sm font-semibold text-gray-900">문서</div>
                 <div id="docCount" class="text-xs text-gray-500 mt-0.5">-</div>
             </div>
-            <div id="docList" class="flex-1 overflow-y-auto p-3 space-y-2"></div>
+            <div id="docList" class="touch-scroll flex-1 min-h-0 overflow-y-auto p-3 space-y-2"></div>
             <div id="emptyDocs" class="hidden flex-1 items-center justify-center text-sm text-gray-500 px-6 text-center">
                 처리된 문서가 없습니다.
             </div>
         </section>
 
         <section id="viewerShell" class="h-full flex flex-col min-w-0 overflow-hidden">
-            <header class="bg-white border-b border-gray-200 px-3 py-2 lg:px-5 lg:py-3 flex items-center gap-2 lg:gap-3 flex-wrap">
+            <header class="flex-shrink-0 bg-white border-b border-gray-200 px-3 py-2 lg:px-5 lg:py-3 flex items-center gap-2 lg:gap-3 flex-wrap">
                 <div class="min-w-0 w-full lg:w-auto lg:mr-auto">
                     <label for="mobileDocSelect" class="sr-only">문서 선택</label>
                     <select id="mobileDocSelect" class="lg:hidden w-full px-3 py-2 border border-gray-300 rounded text-sm bg-white"></select>
@@ -65,6 +79,7 @@
                 <select id="pageFilter" class="px-3 py-2 border border-gray-300 rounded text-sm bg-white">
                     <option value="all">전체 페이지</option>
                     <option value="flagged">점검 필요</option>
+                    <option value="review">검증 재검토</option>
                     <option value="tables">표 포함</option>
                     <option value="figures">그림 포함</option>
                     <option value="low">저신뢰</option>
@@ -72,30 +87,30 @@
                 </select>
             </header>
 
-            <div id="summaryBar" class="touch-scroll bg-gray-50 border-b border-gray-200 px-5 py-2 flex items-center gap-2 overflow-x-auto text-xs"></div>
-            <div id="pageStrip" class="touch-scroll bg-white border-b border-gray-200 px-4 py-2 flex gap-1 overflow-x-auto"></div>
-            <div class="lg:hidden grid grid-cols-2 border-b border-gray-200 bg-white p-1.5 gap-1.5">
+            <div id="summaryBar" class="touch-scroll flex-shrink-0 bg-gray-50 border-b border-gray-200 px-5 py-2 flex items-center gap-2 overflow-x-auto text-xs"></div>
+            <div id="pageStrip" class="touch-scroll flex-shrink-0 bg-white border-b border-gray-200 px-4 py-2 flex gap-1 overflow-x-auto"></div>
+            <div class="flex-shrink-0 lg:hidden grid grid-cols-2 border-b border-gray-200 bg-white p-1.5 gap-1.5">
                 <button id="mobileSourceBtn" class="px-3 py-2 rounded text-sm font-medium" aria-selected="true">원본</button>
                 <button id="mobileParsedBtn" class="px-3 py-2 rounded text-sm font-medium" aria-selected="false">파싱 결과</button>
             </div>
 
-            <div class="flex-1 min-h-0 overflow-hidden lg:grid lg:grid-cols-2">
-                <section id="sourcePane" class="compare-pane bg-gray-100 border-r border-gray-200 flex flex-col min-w-0" data-mobile-active="true">
-                    <div class="min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 bg-white flex items-center gap-2 lg:gap-3 flex-wrap">
+            <div id="viewerWorkspace" class="flex-1 min-h-0 overflow-hidden lg:grid lg:grid-cols-2">
+                <section id="sourcePane" class="compare-pane min-h-0 overflow-hidden bg-gray-100 border-r border-gray-200 flex flex-col min-w-0" data-mobile-active="true">
+                    <div class="flex-shrink-0 min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 bg-white flex items-center gap-2 lg:gap-3 flex-wrap">
                         <div class="font-semibold text-sm mr-auto">원본 페이지</div>
                         <button id="fitBtn" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">맞춤</button>
                         <input id="zoomRange" type="range" min="60" max="220" value="100" class="w-24 sm:w-32">
                         <span id="zoomLabel" class="text-xs text-gray-500 w-11 text-right tabular-nums">100%</span>
                         <a id="openImageBtn" href="#" target="_blank" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100">열기</a>
                     </div>
-                    <div id="imagePane" class="touch-scroll flex-1 overflow-auto p-2 lg:p-4">
+                    <div id="imagePane" class="touch-scroll scroll-viewport p-2 lg:p-4">
                         <img id="pageImg" class="source-image bg-white border border-gray-300 shadow-sm" alt="원본 페이지">
                         <div id="noImg" class="hidden h-full items-center justify-center text-sm text-gray-500">원본 이미지 없음</div>
                     </div>
                 </section>
 
-                <section id="parsedResultPane" class="compare-pane bg-white flex flex-col min-w-0" data-mobile-active="false">
-                    <div class="min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 flex items-center gap-2 lg:gap-3 flex-wrap">
+                <section id="parsedResultPane" class="compare-pane min-h-0 overflow-hidden bg-white flex flex-col min-w-0" data-mobile-active="false">
+                    <div class="flex-shrink-0 min-h-12 px-3 lg:px-4 py-2 border-b border-gray-200 flex items-center gap-2 lg:gap-3 flex-wrap">
                         <div class="font-semibold text-sm whitespace-nowrap mr-auto">파싱 결과</div>
                         <div class="flex items-center gap-2 flex-wrap justify-end">
                             <input id="searchBox" type="search" placeholder="결과 검색" class="w-36 sm:w-44 px-2.5 py-1.5 border border-gray-300 rounded text-sm">
@@ -106,8 +121,9 @@
                             <button id="copyJsonBtn" class="px-2.5 py-1.5 rounded border border-gray-300 text-xs hover:bg-gray-100 whitespace-nowrap">복사</button>
                         </div>
                     </div>
-                    <div id="pageBadges" class="px-4 py-2 border-b border-gray-200 flex items-center gap-1 overflow-x-auto text-xs"></div>
-                    <div id="parsedPane" class="touch-scroll flex-1 overflow-auto">
+                    <div id="pageBadges" class="touch-scroll flex-shrink-0 px-4 py-2 border-b border-gray-200 flex items-center gap-1 overflow-x-auto text-xs"></div>
+                    <div id="parsedPane" class="touch-scroll scroll-viewport">
+                        <div id="reviewNotice" class="hidden border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs text-gray-800"></div>
                         <div id="parsed" class="p-5 text-sm leading-6"></div>
                         <pre id="rawJson" class="hidden h-full m-0 rounded-none overflow-auto"><code class="language-json text-xs"></code></pre>
                     </div>
@@ -151,7 +167,8 @@ function pageText(page) {
 }
 function pageMatchesFilter(page) {
     if (!page) return false;
-    if (state.filter === 'flagged') return page.failed || page.low_confidence || page.has_issues || (page.warnings || []).length || !page.image;
+    if (state.filter === 'flagged') return Boolean(page.review) || page.failed || page.low_confidence || page.has_issues || (page.warnings || []).length || !page.image;
+    if (state.filter === 'review') return Boolean(page.review);
     if (state.filter === 'tables') return page.has_table;
     if (state.filter === 'figures') return Boolean(page.summary?.types?.figure);
     if (state.filter === 'low') return page.low_confidence || Number(page.summary?.min_confidence || 1) < 0.7;
@@ -190,15 +207,18 @@ function sanitizeTableHtml(html) {
 }
 function renderDocList() {
     $('#docCount').textContent = `${state.docs.length}개 문서`;
-    $('#mobileDocSelect').innerHTML = state.docs.map(d =>
-        `<option value="${escapeHtml(d.name)}">${escapeHtml(d.title || d.name)} · ${d.pages}p</option>`
-    ).join('');
+    $('#mobileDocSelect').innerHTML = state.docs.map(d => {
+        const review = (d.review_pages || []).length;
+        const suffix = review ? ` · 재검토 ${review}` : '';
+        return `<option value="${escapeHtml(d.name)}">${escapeHtml(d.title || d.name)} · ${d.pages}p${suffix}</option>`;
+    }).join('');
     if (state.doc) $('#mobileDocSelect').value = state.doc.name;
     $('#docList').innerHTML = state.docs.map(d => {
         const ps = d.provenance_summary || {};
         const issues = countValues(ps.issues);
         const low = (d.low_confidence_pages || []).length;
         const failed = (d.vlm_failed_pages || []).length;
+        const review = (d.review_pages || []).length;
         const active = state.doc && state.doc.name === d.name;
         return `
             <button data-doc="${escapeHtml(d.name)}" class="doc-btn w-full text-left rounded border px-3 py-2.5 transition ${active ? 'bg-gray-900 text-white border-gray-900' : 'bg-white hover:bg-gray-50 border-gray-200'}">
@@ -209,6 +229,7 @@ function renderDocList() {
                     ${failed ? chip(`fail ${failed}`, 'red') : ''}
                     ${low ? chip(`low ${low}`, 'amber') : ''}
                     ${issues ? chip(`issue ${issues}`, 'amber') : ''}
+                    ${review ? chip(`review ${review}`, 'red') : ''}
                 </div>
             </button>`;
     }).join('');
@@ -221,13 +242,15 @@ function renderSummary() {
     const ps = meta.provenance_summary || {};
     const sources = ps.sources || {};
     const issues = ps.issues || {};
+    const reviewPages = state.docs.find(d => d.name === doc.name)?.review_pages || [];
     const chunks = (doc.chunks || []).map(c => `${c.strategy}${c.count == null ? '' : ` ${c.count}`}`);
     const parts = [
         chip(`pages ${doc.pages.length}`, 'gray'),
         chip(`VLM ${meta.vlm_pages_analyzed ?? '-'} / ${meta.vlm_pages_total ?? '-'}`, 'blue'),
         (meta.vlm_failed_pages || []).length ? chip(`fail ${(meta.vlm_failed_pages || []).join(', ')}`, 'red') : chip('fail 0', 'green'),
-        (meta.low_confidence_pages || []).length ? chip(`low ${(meta.low_confidence_pages || []).join(', ')}`, 'amber') : chip('low 0', 'green')
-    ];
+        (meta.low_confidence_pages || []).length ? chip(`low ${(meta.low_confidence_pages || []).join(', ')}`, 'amber') : chip('low 0', 'green'),
+        reviewPages.length ? chip(`review p${reviewPages.join(', p')}`, 'red') : ''
+    ].filter(Boolean);
     for (const [k, v] of Object.entries(sources).slice(0, 8)) parts.push(chip(`${k} ${v}`, 'slate'));
     for (const [k, v] of Object.entries(issues).slice(0, 8)) parts.push(chip(`${k} ${v}`, 'amber'));
     if (chunks.length) parts.push(chip(`chunks ${chunks.join(' · ')}`, 'blue'));
@@ -240,7 +263,7 @@ function renderPageStrip() {
         const active = i === state.idx;
         const hidden = !visible.has(p.page);
         let cls = active ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50';
-        if (!active && (p.failed || p.low_confidence)) cls = 'bg-red-50 text-red-700 border-red-300';
+        if (!active && (p.review || p.failed || p.low_confidence)) cls = 'bg-red-50 text-red-700 border-red-300';
         else if (!active && (p.has_issues || (p.warnings || []).length || !p.image)) cls = 'bg-amber-50 text-amber-800 border-amber-300';
         else if (!active && p.has_table) cls = 'bg-blue-50 text-blue-700 border-blue-200';
         return `<button data-page-idx="${i}" class="page-chip flex-shrink-0 rounded border text-xs tabular-nums ${cls} ${hidden ? 'opacity-25' : ''}">${p.page}</button>`;
@@ -267,7 +290,37 @@ function renderPageBadges(page) {
     ].filter(Boolean);
     for (const [k, v] of Object.entries(s.issues || {})) badges.push(chip(`${k} ${v}`, 'amber'));
     for (const warning of page.warnings || []) badges.push(chip(warning, 'amber'));
+    if (page.review) {
+        const score = page.review.score == null ? '' : ` ${page.review.score}`;
+        badges.push(chip(`review${score}`, page.review.review_confirmed === true ? 'red' : 'amber'));
+        for (const issue of page.review.issue_types || []) badges.push(chip(issue, 'red'));
+    }
     $('#pageBadges').innerHTML = badges.join('');
+}
+function renderReviewNotice(page) {
+    const notice = $('#reviewNotice');
+    const review = page?.review;
+    if (!review) {
+        notice.className = 'hidden border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs text-gray-800';
+        notice.innerHTML = '';
+        return;
+    }
+    const confirmed = review.review_confirmed === true;
+    const status = confirmed
+        ? '후속 검토에서 오류 확정'
+        : review.review_confirmed === false
+            ? '후속 검토에서 비확정'
+            : review.reviewed ? '후속 검토 판정 누락' : '자동 검증 감지';
+    const tone = confirmed
+        ? 'border-red-200 bg-red-50 text-red-700'
+        : 'border-amber-200 bg-amber-50 text-gray-800';
+    const issueTypes = (review.issue_types || []).join(', ');
+    const primary = review.reason ? `<div class="mt-1"><span class="font-semibold">1차:</span> ${escapeHtml(review.reason)}</div>` : '';
+    const followup = review.review_reason && review.review_reason !== review.reason
+        ? `<div class="mt-1"><span class="font-semibold">후속:</span> ${escapeHtml(review.review_reason)}</div>`
+        : '';
+    notice.className = `border-b px-4 py-3 text-xs ${tone}`;
+    notice.innerHTML = `<div class="font-semibold">${escapeHtml(status)}${issueTypes ? ` · ${escapeHtml(issueTypes)}` : ''}</div>${primary}${followup}`;
 }
 function renderElement(el, i) {
     if (!el || typeof el !== 'object') {
@@ -365,6 +418,7 @@ function render() {
     renderSummary();
     renderPageStrip();
     renderPageBadges(page);
+    renderReviewNotice(page);
     renderImage(page);
     renderElements(page);
     renderRaw(page);
@@ -375,9 +429,12 @@ async function loadDoc(name) {
     const res = await fetch(`/api/doc/${encodeURIComponent(name)}`);
     state.doc = await res.json();
     state.idx = 0;
+    const firstVisible = visiblePages()[0];
+    if (firstVisible) state.idx = state.doc.pages.indexOf(firstVisible);
     render();
 }
 async function init() {
+    if (window.matchMedia('(max-width: 1023px)').matches) state.zoom = 140;
     state.docs = await (await fetch('/api/docs')).json();
     if (!state.docs.length) {
         $('#docList').classList.add('hidden');
@@ -395,7 +452,12 @@ $('#pageInput').onchange = () => {
     const i = (state.doc?.pages || []).findIndex(p => Number(p.page) === target);
     if (i >= 0) { state.idx = i; render(); }
 };
-$('#pageFilter').onchange = () => { state.filter = $('#pageFilter').value; renderPageStrip(); };
+$('#pageFilter').onchange = () => {
+    state.filter = $('#pageFilter').value;
+    const firstVisible = visiblePages()[0];
+    if (firstVisible && !pageMatchesFilter(currentPage())) state.idx = state.doc.pages.indexOf(firstVisible);
+    render();
+};
 $('#mobileDocSelect').onchange = () => loadDoc($('#mobileDocSelect').value);
 $('#mobileSourceBtn').onclick = () => { state.mobilePane = 'source'; renderMobilePane(); };
 $('#mobileParsedBtn').onclick = () => { state.mobilePane = 'parsed'; renderMobilePane(); };

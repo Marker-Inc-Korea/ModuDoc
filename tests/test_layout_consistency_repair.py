@@ -8,6 +8,90 @@ import layout_consistency_repair as repair
 
 
 class LayoutConsistencyRepairTests(unittest.TestCase):
+    def test_prompts_scope_review_to_anchored_cards_not_table_duplicates(self):
+        self.assertIn("do not transpose", repair.VERIFY_SYSTEM)
+        self.assertIn("expected representation", repair.VERIFY_SYSTEM)
+        self.assertIn("outside this audit", repair.VERIFY_SYSTEM)
+        self.assertIn("first non-bullet line", repair.REPAIR_SYSTEM)
+        self.assertIn("immutable table", repair.REPAIR_SYSTEM)
+
+    def test_repair_prompt_does_not_repeat_unreliable_review_claims(self):
+        prompt = repair._repair_user_prompt('{"elements": []}', "raw layer")
+
+        self.assertIn("Re-evaluate the image independently", prompt)
+        self.assertIn("table/text duplication", prompt)
+        self.assertIn('<candidate>{"elements": []}</candidate>', prompt)
+        self.assertIn("<raw_text>raw layer</raw_text>", prompt)
+        self.assertNotIn("Visual QA failure", prompt)
+
+    def test_immutable_segment_assignment_moves_only_source_bullets(self):
+        original = {
+            "elements": [
+                {"type": "heading_1", "content": "Features"},
+                {"type": "text", "content": "Search"},
+                {
+                    "type": "text",
+                    "content": "Privacy\n• Private period\n• Search options",
+                },
+                {"type": "text", "content": "Reports\n• Daily report"},
+                {"type": "text", "content": "Export\n• CSV file"},
+                {"type": "heading_1", "content": "Next"},
+            ]
+        }
+        spec = repair._card_segment_spec(original)
+
+        self.assertIsNotNone(spec)
+        self.assertEqual(
+            [item["candidate_index"] for item in spec["anchors"]],
+            [1, 2, 3, 4],
+        )
+        response = {
+            "assignments": [
+                {"segment_id": "e2s1", "candidate_index": 2},
+                {"segment_id": "e2s2", "candidate_index": 1},
+                {"segment_id": "e3s1", "candidate_index": 3},
+                {"segment_id": "e4s1", "candidate_index": 4},
+            ]
+        }
+        repaired = repair._apply_card_segment_assignment(original, spec, response)
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(
+            repaired["elements"][1]["content"], "Search\n• Search options"
+        )
+        self.assertEqual(
+            repaired["elements"][2]["content"], "Privacy\n• Private period"
+        )
+        self.assertTrue(repair._reassignment_only(original, repaired))
+
+        missing = {"assignments": response["assignments"][:-1]}
+        self.assertIsNone(
+            repair._apply_card_segment_assignment(original, spec, missing)
+        )
+        outside = {
+            "assignments": [
+                {**item, "candidate_index": 99}
+                if item["segment_id"] == "e2s2"
+                else item
+                for item in response["assignments"]
+            ]
+        }
+        self.assertIsNone(
+            repair._apply_card_segment_assignment(original, spec, outside)
+        )
+
+    def test_card_segment_spec_rejects_duplicate_title_runs(self):
+        data = {
+            "elements": [
+                {"type": "text", "content": "Before\nAlpha"},
+                {"type": "text", "content": "Before\nBeta"},
+                {"type": "text", "content": "Before\nGamma"},
+                {"type": "text", "content": "Before\nDelta"},
+            ]
+        }
+
+        self.assertIsNone(repair._card_segment_spec(data))
+
     def test_panel_candidate_requires_dense_raster_and_a_text_run(self):
         data = {
             "elements": [

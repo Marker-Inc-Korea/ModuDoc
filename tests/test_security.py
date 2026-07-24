@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import tempfile
 import unittest
@@ -87,6 +88,49 @@ class ViewerSecurityTests(unittest.TestCase):
         with app_module.app.test_request_context():
             with self.assertRaises(NotFound):
                 app_module._doc_dir("../sample")
+
+    def test_optional_review_report_marks_documents_and_pages(self):
+        doc_dir = os.path.join(self.tempdir.name, "sample")
+        os.mkdir(doc_dir)
+        with open(
+            os.path.join(doc_dir, "page_0001_structured.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump({"page_number": 1, "elements": []}, handle)
+
+        report_path = os.path.join(self.tempdir.name, "review.json")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "failed_pages": [
+                        {
+                            "doc": "sample",
+                            "page": 1,
+                            "score": 60,
+                            "severity": "major",
+                            "issue_types": ["table_structure"],
+                            "reason": "primary finding",
+                            "reviewed": True,
+                            "review_verdict": {
+                                "confirmed_failure": False,
+                                "reason": "follow-up finding",
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+
+        with mock.patch.object(app_module, "VIEWER_REVIEW_REPORT", report_path):
+            docs = self.client.get("/api/docs").get_json()
+            detail = self.client.get("/api/doc/sample").get_json()
+
+        self.assertEqual(docs[0]["review_pages"], [1])
+        review = detail["pages"][0]["review"]
+        self.assertEqual(review["issue_types"], ["table_structure"])
+        self.assertIs(review["review_confirmed"], False)
+        self.assertEqual(review["review_reason"], "follow-up finding")
 
 
 if __name__ == "__main__":

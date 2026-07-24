@@ -31,6 +31,7 @@ VLM_BASE_URL = os.environ.get("VLM_BASE_URL", "http://localhost:8000/v1")
 API_KEY = os.environ.get("VLM_API_KEY", "local-vllm-noauth-key")
 VIEWER_AUTH_USER = os.environ.get("VIEWER_AUTH_USER", "")
 VIEWER_AUTH_PASSWORD = os.environ.get("VIEWER_AUTH_PASSWORD", "")
+VIEWER_REVIEW_REPORT = os.environ.get("VIEWER_REVIEW_REPORT", "")
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 ALLOW_UNAUTHENTICATED_REMOTE = os.environ.get(
     "ALLOW_UNAUTHENTICATED_REMOTE", ""
@@ -419,6 +420,51 @@ def _element_summary(elements):
         "low_confidence_elements": low_elements,
     }
 
+def _review_index():
+    """Load optional page-level review findings keyed by output directory and page."""
+    if not VIEWER_REVIEW_REPORT:
+        return {}
+    report = _load_json_file(VIEWER_REVIEW_REPORT, {})
+    if isinstance(report, dict):
+        findings = report.get("failed_pages", [])
+    elif isinstance(report, list):
+        findings = report
+    else:
+        findings = []
+
+    index = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        doc = finding.get("doc") or finding.get("document")
+        try:
+            page = int(finding.get("page"))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(doc, str) or not doc or page < 1:
+            continue
+
+        review_verdict = finding.get("review_verdict")
+        if not isinstance(review_verdict, dict):
+            review_verdict = {}
+        review_confirmed = review_verdict.get("confirmed_failure")
+        if not isinstance(review_confirmed, bool):
+            review_confirmed = None
+        issue_types = finding.get("issue_types") or []
+        if not isinstance(issue_types, list):
+            issue_types = [issue_types]
+
+        index.setdefault(doc, {})[page] = {
+            "score": finding.get("score"),
+            "severity": finding.get("severity"),
+            "issue_types": [str(item) for item in issue_types if item],
+            "reason": finding.get("reason"),
+            "reviewed": bool(finding.get("reviewed")),
+            "review_confirmed": review_confirmed,
+            "review_reason": review_verdict.get("reason"),
+        }
+    return index
+
 @app.route('/compare')
 def compare_page():
     return render_template('compare.html')
@@ -427,6 +473,7 @@ def compare_page():
 def api_docs():
     """파싱 결과(_structured.json)가 있는 문서 목록."""
     root = app.config['OUTPUT_FOLDER']
+    review_index = _review_index()
     docs = []
     if os.path.isdir(root):
         for name in sorted(os.listdir(root)):
@@ -444,6 +491,7 @@ def api_docs():
                 meta = _load_json_file(mp, {}) or {}
                 title = meta.get('doc_title') or name
             stat = os.stat(d)
+            review_pages = sorted(review_index.get(name, {}))
             docs.append({
                 "name": name,
                 "title": title,
@@ -455,6 +503,7 @@ def api_docs():
                 "vlm_pages_total": meta.get("vlm_pages_total"),
                 "vlm_pages_analyzed": meta.get("vlm_pages_analyzed"),
                 "provenance_summary": meta.get("provenance_summary") or {},
+                "review_pages": review_pages,
             })
     return jsonify(docs)
 
@@ -467,6 +516,7 @@ def api_doc(name):
     meta = meta or {}
     low_pages = set(int(p) for p in (meta.get("low_confidence_pages") or []) if str(p).isdigit())
     failed_pages = set(int(p) for p in (meta.get("vlm_failed_pages") or []) if str(p).isdigit())
+    review_pages = _review_index().get(name, {})
     pages = []
     structured = sorted((x for x in os.listdir(d) if x.endswith('_structured.json')), key=_page_no)
     for fname in structured:
@@ -492,6 +542,7 @@ def api_doc(name):
             "summary": summary,
             "has_table": bool(summary["types"].get("table")),
             "has_issues": bool(summary["issues"]),
+            "review": review_pages.get(page_no),
             "json_file": fname,
         })
     chunks = []

@@ -673,7 +673,7 @@ def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool
         re.search(pattern, value, re.I)
         for pattern in (
             r"\b(?:image|page|visible|visual|raster)\b|이미지|원본|페이지|화면",
-            r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|일치|동일|정확",
+            r"\b(?:match(?:es|ing)?|same|equal|correct(?:ly)?|accurate(?:ly)?)\b|일치|동일|정확",
             r"\btables?\b|표",
         )
     ):
@@ -718,6 +718,68 @@ def _ordered_table_geometry_refutation_supported(text: str, facts: dict) -> bool
         ):
             return False
     return True
+
+
+def _indexed_multi_table_geometry_refutation_supported(text: str, facts: dict) -> bool:
+    """Ground a distinct-table refutation against every indexed table it names."""
+    value = str(text or "")
+    table_facts = facts.get("table_elements") or {}
+    if not all(
+        re.search(pattern, value, re.I)
+        for pattern in (
+            r"\b(?:image|page|visible|visual|raster)\b|이미지|원본|페이지|화면",
+            r"\b(?:match(?:es|ing)?|same|equal|correct(?:ly)?|accurate(?:ly)?)\b|일치|동일|정확",
+            r"\b(?:two|three|four|five|\d+)\s+(?:(?:distinct|separate)\s+)?tables?\b|"
+            r"\b(?:distinct|separate)\s+tables?\b|"
+            r"(?:분리된|별도의|서로\s*다른)\s*표|표\s*[2-9]\s*개",
+        )
+    ):
+        return False
+
+    reference = re.compile(
+        r"(?:candidate|후보)(?:(?![.;]).){0,80}?"
+        r"(?:element\s*)?(?:index|인덱스|요소)\s*#?\s*(\d+)",
+        re.I,
+    )
+    matches = [
+        (match, int(match.group(1)))
+        for match in reference.finditer(value)
+        if int(match.group(1)) in table_facts
+    ]
+    referenced = {index for _, index in matches}
+    if len(referenced) < 2:
+        return False
+    count_match = re.search(
+        r"\b(two|three|four|five|\d+)\s+(?:(?:distinct|separate)\s+)?tables?\b",
+        value,
+        re.I,
+    )
+    if count_match:
+        declared_count = {
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+        }.get(count_match.group(1).casefold())
+        declared_count = declared_count or int(count_match.group(1))
+        if declared_count != len(referenced):
+            return False
+
+    exact = set()
+    for position, (match, table_index) in enumerate(matches):
+        end = matches[position + 1][0].start() if position + 1 < len(matches) else len(value)
+        clause = value[match.end() : end]
+        rows = _geometry_values(clause, "rows")
+        columns = _geometry_values(clause, "columns")
+        if not rows or not columns:
+            continue
+        authoritative = table_facts[table_index]
+        if any(row != authoritative.get("rows") for row in rows) or any(
+            column != authoritative.get("columns") for column in columns
+        ):
+            return False
+        exact.add(table_index)
+    return exact == referenced
 
 
 def structural_evidence_supported(
@@ -785,6 +847,7 @@ def grounded_structural_rejection(
     if issue == "table_structure" and facts is not None and image_grounded:
         if any(
             _ordered_table_geometry_refutation_supported(item, facts)
+            or _indexed_multi_table_geometry_refutation_supported(item, facts)
             for item in evidence
         ):
             return True
@@ -795,7 +858,7 @@ def grounded_structural_rejection(
         for item in evidence:
             text = str(item)
             if not re.search(
-                r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|일치|동일|정확",
+                r"\b(?:match(?:es|ing)?|same|equal|correct(?:ly)?|accurate(?:ly)?)\b|일치|동일|정확",
                 text,
                 re.I,
             ):
@@ -1067,7 +1130,7 @@ def apply_failure_review(
             for item in (review or {}).get("structure_evidence") or []
             if str(item).strip()
             and re.search(
-                r"\b(?:match|matches|matching|same|equal|correct|accurate)\b|"
+                r"\b(?:match(?:es|ing)?|same|equal|correct(?:ly)?|accurate(?:ly)?)\b|"
                 r"\bno\s+(?:material\s+)?(?:error|mismatch|difference)\b|"
                 r"일치|동일|정확|오류\s*없",
                 str(item),

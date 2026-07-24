@@ -123,6 +123,77 @@ class GenericTableRepairTests(unittest.TestCase):
             draw.line((300, y, 900, y), fill="black", width=3)
         return image
 
+    @staticmethod
+    def _native_external_rows_image(extra_grid_row=False):
+        image = Image.new("L", (1000, 700), "white")
+        draw = ImageDraw.Draw(image)
+        rows = [100, 200, 300, 400]
+        if extra_grid_row:
+            rows.append(500)
+        for y in rows:
+            draw.line((100, y, 900, y), fill="black", width=3)
+        for top, bottom in zip(rows, rows[1:]):
+            for x in (350, 650):
+                draw.line((x, top, x, bottom), fill="black", width=3)
+        return image
+
+    @staticmethod
+    def _stacked_nested_image(include_inner_grid=True):
+        image = Image.new("L", (1000, 1100), "white")
+        draw = ImageDraw.Draw(image)
+        columns = [100, 300, 750, 900]
+        rows = [100, 180, 260, 700, 900, 1000]
+        for y in rows:
+            draw.line((columns[0], y, columns[-1], y), fill="black", width=3)
+        for row_index, (top, bottom) in enumerate(zip(rows, rows[1:])):
+            if row_index == 1:
+                continue
+            for x in columns[1:-1]:
+                draw.line((x, top, x, bottom), fill="black", width=3)
+        if include_inner_grid:
+            for y in (400, 500, 600):
+                draw.line((360, y, 700, y), fill="black", width=3)
+            for x in (360, 450, 700):
+                draw.line((x, 400, x, 600), fill="black", width=3)
+        return image
+
+    @staticmethod
+    def _stacked_nested_elements():
+        metadata = {
+            "caption": "Coverage schedule",
+            "_source": "vlm_table_repaired",
+            "_issues": ["stacked_tables_split"],
+        }
+        return [
+            {
+                "type": "table",
+                "content": (
+                    "<table><tr><th>Kind</th><th>Terms</th><th>Coverage</th></tr>"
+                    "<tr><td colspan='3'>Build period</td></tr></table>"
+                ),
+                **metadata,
+            },
+            {
+                "type": "table",
+                "content": (
+                    "<table>"
+                    "<tr><td rowspan='2'>Build all risks</td>"
+                    "<td colspan='2'>Period<br>Deductible</td>"
+                    "<td rowspan='2'>Covered assets</td></tr>"
+                    "<tr><td>A</td><td>Alpha amount</td></tr>"
+                    "<tr><td></td><td>B</td><td>Beta amount</td>"
+                    "<td>Physical damage</td></tr>"
+                    "<tr><td>Delay</td><td colspan='2'>Delay terms</td>"
+                    "<td>Delay coverage</td></tr>"
+                    "<tr><td>Third party</td>"
+                    "<td colspan='2'>Limit text<br>Third-party loss</td>"
+                    "<td>Third-party loss</td></tr>"
+                    "</table>"
+                ),
+                **metadata,
+            },
+        ]
+
     def test_grouped_stub_rowspans_are_restored_without_text_changes(self):
         original = {
             "page_number": 1,
@@ -475,12 +546,21 @@ class GenericTableRepairTests(unittest.TestCase):
                 original,
                 problems,
                 reviewer_feedback="A short inner line was treated as an outer row.",
+                raster_hints={
+                    0: {
+                        "outer_rows": 4,
+                        "leaf_columns": 3,
+                        "visible_row_colspans": {"0": [1, 2]},
+                    }
+                },
             )
 
         request = request_json.call_args.args[1]
         user_text = request["messages"][1]["content"][-1]["text"]
         self.assertIn("independent layout reviewer rejected", user_text)
         self.assertIn("short inner line", user_text)
+        self.assertIn('"raster_geometry_hint"', user_text)
+        self.assertIn('"leaf_columns": 3', user_text)
 
     def test_tall_table_encoding_adds_overlapping_detail_bands(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -741,6 +821,192 @@ class GenericTableRepairTests(unittest.TestCase):
         self.assertIsNone(corrected)
         self.assertIn("colspan='3'", candidate["elements"][0]["content"])
 
+    def test_raster_hint_overrides_a_missing_modal_leaf_column(self):
+        malformed = {
+            "type": "table",
+            "content": (
+                "<table>"
+                "<tr><td rowspan='2'>Code</td><td rowspan='2'>Subject</td>"
+                "<td colspan='4'>Criteria</td><td rowspan='2'>Phase</td></tr>"
+                "<tr>" + "".join(
+                    f"<td>Header {index}</td>" for index in range(8)
+                ) + "</tr>"
+                + "".join(
+                    "<tr>" + "".join(
+                        f"<td>{row_index}-{column_index}</td>"
+                        for column_index in range(10)
+                    ) + "</tr>"
+                    for row_index in range(6)
+                )
+                + "</table>"
+            ),
+        }
+        corrected = {
+            "type": "table",
+            "content": (
+                "<table>"
+                "<tr><td>Code</td><td>Subject</td><td></td>"
+                "<td colspan='3'>Criteria</td><td></td><td></td>"
+                "<td colspan='2'>Phase</td><td></td></tr>"
+                "<tr>" + "".join(
+                    f"<td>Header {index}</td>" for index in range(11)
+                ) + "</tr>"
+                + "".join(
+                    "<tr>" + "".join(
+                        f"<td>{row_index}-{column_index}</td>"
+                        for column_index in range(11)
+                    ) + "</tr>"
+                    for row_index in range(6)
+                )
+                + "</table>"
+            ),
+        }
+        image = Image.new("RGB", (1200, 900), "white")
+        draw = ImageDraw.Draw(image)
+        x_lines = [50 + 100 * index for index in range(12)]
+        y_lines = [50 + 100 * index for index in range(9)]
+        for y in y_lines:
+            draw.line((x_lines[0], y, x_lines[-1], y), fill="black", width=3)
+        for row_index, (upper, lower) in enumerate(zip(y_lines, y_lines[1:])):
+            visible = (
+                [x_lines[index] for index in (0, 1, 2, 3, 6, 7, 8, 10, 11)]
+                if row_index == 0
+                else x_lines
+            )
+            for x in visible:
+                draw.line((x, upper, x, lower), fill="black", width=3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "grid.png"
+            image.save(image_path)
+            hint = table_quality_repair._raster_table_geometry_hint(
+                image_path, malformed
+            )
+
+        self.assertEqual(hint["outer_rows"], 8)
+        self.assertEqual(hint["leaf_columns"], 11)
+        self.assertEqual(
+            hint["visible_row_colspans"]["0"],
+            [1, 1, 1, 3, 1, 1, 2, 1],
+        )
+        self.assertFalse(
+            table_quality_repair._table_matches_raster_geometry(malformed, hint)
+        )
+        self.assertTrue(
+            table_quality_repair._table_matches_raster_geometry(corrected, hint)
+        )
+
+    def test_raster_evidenced_candidate_requires_source_supported_new_text(self):
+        original_table = {
+            "type": "table",
+            "content": (
+                "<table><tr><td colspan='2'>Summary</td></tr>"
+                "<tr><td>Item</td><td>Value</td></tr>"
+                "<tr><td>A</td><td>1</td></tr></table>"
+            ),
+            "_issues": ["ragged_rows"],
+        }
+        repaired_table = {
+            "type": "table",
+            "content": (
+                "<table><tr><td colspan='3'>Summary</td></tr>"
+                "<tr><td>Item</td><td>New</td><td>Value</td></tr>"
+                "<tr><td>A</td><td></td><td>1</td></tr></table>"
+            ),
+        }
+        original = {"elements": [original_table]}
+        candidate = {"elements": [repaired_table]}
+        hint = {
+            0: {
+                "outer_rows": 3,
+                "leaf_columns": 3,
+                "visible_row_colspans": {
+                    "0": [3],
+                    "1": [1, 1, 1],
+                },
+            }
+        }
+
+        self.assertEqual(
+            table_quality_repair._raster_evidenced_table_pairs(
+                original, candidate, hint, "New"
+            ),
+            [(0, 0)],
+        )
+        self.assertEqual(
+            table_quality_repair._raster_evidenced_table_pairs(
+                original, candidate, hint, "Unrelated source text"
+            ),
+            [],
+        )
+        diagnostics = table_quality_repair._raster_candidate_diagnostics(
+            original, candidate, hint, "New"
+        )
+        self.assertEqual(len(diagnostics), 1)
+        self.assertTrue(diagnostics[0]["raster_geometry_matched"])
+        self.assertTrue(diagnostics[0]["source_supported_additions"])
+        self.assertEqual(diagnostics[0]["geometry"]["expanded_row_widths"], [3] * 3)
+
+    def test_leaf_expanded_header_is_rebuilt_from_raster_ink_regions(self):
+        top_values = [
+            "Code", "Subject", "Group A", "", "", "", "",
+            "Group B", "", "", "",
+        ]
+        second_values = [
+            "", "", "A", "B", "C", "D", "E", "F", "G", "H", "I",
+        ]
+        body_values = [str(index) for index in range(11)]
+
+        def row(values):
+            return "<tr>" + "".join(f"<td>{value}</td>" for value in values) + "</tr>"
+
+        table = {
+            "type": "table",
+            "content": (
+                "<table>" + row(top_values) + row(second_values)
+                + row(body_values) + "</table>"
+            ),
+        }
+        original = {"elements": [{**table, "_issues": ["ragged_rows"]}]}
+        candidate = {"elements": [table]}
+        hint = {
+            0: {
+                "outer_rows": 3,
+                "leaf_columns": 11,
+                "visible_row_colspans": {
+                    "0": [1, 1, 1, 3, 1, 1, 2, 1],
+                    "1": [1] * 11,
+                    "2": [1] * 11,
+                },
+                "visible_row_ink": {
+                    "0": [False, False, False, True, False, False, True, False],
+                    "1": [True] * 11,
+                    "2": [True] * 11,
+                },
+            }
+        }
+
+        repaired, changes = table_quality_repair._raster_evidenced_leaf_scaffold(
+            original, candidate, hint
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(changes[0]["labels_moved_to_next_row"], 2)
+        element = repaired["elements"][0]
+        self.assertTrue(
+            table_quality_repair._table_matches_raster_geometry(element, hint[0])
+        )
+        soup = BeautifulSoup(element["content"], "html.parser")
+        rows = table_validate._rows_of(soup.find("table"))
+        self.assertEqual(
+            [cell.get_text(" ", strip=True) for cell in rows[0].find_all(["td", "th"], recursive=False)],
+            ["", "", "", "Group A", "", "", "Group B", ""],
+        )
+        self.assertEqual(
+            [cell.get_text(" ", strip=True) for cell in rows[1].find_all(["td", "th"], recursive=False)][:3],
+            ["Code", "Subject", "A"],
+        )
+
     def test_raster_evidenced_repair_merges_wrap_and_drops_phantom_column(self):
         top = (
             "<tr><td></td><td></td><td></td><td colspan='4'>Rating criteria</td>"
@@ -981,6 +1247,128 @@ class GenericTableRepairTests(unittest.TestCase):
         )
         self.assertTrue(metrics["text_inventory_preserved"])
         self.assertEqual(table_quality_repair._problem_tables(repaired), [])
+
+    def test_native_caption_and_note_rows_are_removed_only_outside_raster_grid(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "caption": "Quarterly limits",
+                    "content": (
+                        "<table><tr><td colspan='3'>Quarterly limits</td></tr>"
+                        "<tr><th>Kind</th><th>Used</th><th>Left</th></tr>"
+                        "<tr><td>Alpha</td><td>10</td><td>90</td></tr>"
+                        "<tr><td>Beta</td><td>20</td><td>80</td></tr>"
+                        "<tr><td colspan='3'>Note alpha visible details plus "
+                        "hidden appendix</td></tr></table>"
+                    ),
+                    "_source": "native_table",
+                    "_native": True,
+                },
+                {"type": "footnote", "content": "Note alpha visible details"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            self._native_external_rows_image().save(image_path)
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(
+            changes[0]["strategy"], "raster_native_external_rows_removed"
+        )
+        self.assertTrue(metrics["raster_boundary_evidenced"])
+        table = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(table)["expanded_row_widths"],
+            [3, 3, 3],
+        )
+        self.assertNotIn("hidden appendix", table["content"])
+        self.assertEqual(table["caption"], "Quarterly limits")
+        self.assertEqual(repaired["elements"][1]["content"], "Note alpha visible details")
+
+    def test_native_external_row_cleanup_requires_matching_raster_row_count(self):
+        original = {
+            "elements": [
+                {
+                    "type": "table",
+                    "caption": "Quarterly limits",
+                    "content": (
+                        "<table><tr><td colspan='3'>Quarterly limits</td></tr>"
+                        "<tr><td>A</td><td>B</td><td>C</td></tr>"
+                        "<tr><td>D</td><td>E</td><td>F</td></tr>"
+                        "<tr><td>G</td><td>H</td><td>I</td></tr>"
+                        "<tr><td colspan='3'>A sufficiently long visible note "
+                        "with hidden suffix</td></tr></table>"
+                    ),
+                    "_source": "native_table",
+                },
+                {"type": "text", "content": "A sufficiently long visible note"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            self._native_external_rows_image(extra_grid_row=True).save(image_path)
+            repaired, changes = (
+                table_quality_repair._raster_evidenced_native_edge_cleanup(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
+
+    def test_adjacent_stacked_fragments_rejoin_as_one_nested_outer_grid(self):
+        original = {"elements": self._stacked_nested_elements()}
+        source_text = (
+            "Kind Terms Coverage Build period Build all risks Period Deductible "
+            "Covered assets A Alpha amount B Beta amount Physical damage Delay "
+            "Delay terms Delay coverage Third party Limit text Third-party loss"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            text_path = Path(directory) / "page.txt"
+            self._stacked_nested_image().save(image_path)
+            text_path.write_text(source_text, encoding="utf-8")
+            repaired, changes, metrics = (
+                table_quality_repair._validated_deterministic_geometry_repair(
+                    image_path, original, text_path
+                )
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(len(repaired["elements"]), 1)
+        self.assertEqual(
+            changes[0]["strategy"], "raster_stacked_nested_table_rebuilt"
+        )
+        self.assertEqual(changes[0]["duplicate_cells_removed"], 1)
+        self.assertEqual(metrics["output_table_count"], 1)
+        table = repaired["elements"][0]
+        self.assertEqual(
+            table_quality_repair._table_geometry(table)["expanded_row_widths"],
+            [3, 3, 3, 3, 3],
+        )
+        soup = BeautifulSoup(table["content"], "html.parser")
+        self.assertEqual(len(soup.find_all("table")), 2)
+        self.assertEqual(soup.get_text(" ", strip=True).count("Third-party loss"), 1)
+
+    def test_stacked_fragment_rejoin_requires_internal_raster_grid(self):
+        original = {"elements": self._stacked_nested_elements()}
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.png"
+            self._stacked_nested_image(include_inner_grid=False).save(image_path)
+            repaired, changes = (
+                table_quality_repair._raster_evidenced_stacked_nested_rebuild(
+                    image_path, original
+                )
+            )
+
+        self.assertIsNone(repaired)
+        self.assertEqual(changes, [])
 
     def test_repeated_column_groups_are_rebuilt_only_with_source_copies(self):
         html = (

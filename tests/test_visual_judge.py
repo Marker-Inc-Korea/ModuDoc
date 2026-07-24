@@ -748,6 +748,59 @@ class VisualJudgeTests(unittest.TestCase):
         )
         self.assertFalse(result["pass"])
 
+    def test_indexed_distinct_tables_can_refute_a_false_merge_claim(self):
+        primary = {
+            "pass": False,
+            "score": 60,
+            "severity": "major",
+            "issue_types": ["table_structure"],
+            "structure_evidence": [
+                "The image has one table with 5 rows and 8 columns, but candidate element "
+                "index 2 has 5 rows and 8 columns and candidate element index 3 "
+                "is a separate table with 2 rows and 10 columns."
+            ],
+        }
+        review = {
+            "confirmed_failure": False,
+            "confirmed_issue_types": [],
+            "rejected_claims": [
+                "The page image contains two distinct tables. The first table "
+                "(candidate element index 2) has 5 rows and 8 columns, and the "
+                "second table (candidate element index 3) has 2 rows and 10 "
+                "columns. The candidate correctly represents both tables."
+            ],
+            "reason": "The indexed table geometry matches the image.",
+        }
+        facts = {
+            "element_indices": list(range(8)),
+            "element_types": {
+                **{index: "text" for index in range(8)},
+                2: "table",
+                3: "table",
+                6: "table",
+            },
+            "table_elements": {
+                2: {"rows": 5, "columns": 8, "table_tags": 1},
+                3: {"rows": 2, "columns": 10, "table_tags": 1},
+                6: {"rows": 4, "columns": 3, "table_tags": 1},
+            },
+        }
+
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "First table Second table Other table", facts
+        )
+
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["issue_types"], [])
+
+        review["rejected_claims"][0] = review["rejected_claims"][0].replace(
+            "2 rows and 10 columns", "2 rows and 9 columns"
+        )
+        result = visual_judge_pages.apply_failure_review(
+            primary, review, "First table Second table Other table", facts
+        )
+        self.assertFalse(result["pass"])
+
     def test_complete_single_table_geometry_can_refute_without_an_index(self):
         primary = {
             "pass": False,

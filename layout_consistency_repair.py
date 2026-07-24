@@ -39,6 +39,13 @@ Ignore typography, decorative icons, page-number metadata, and harmless whitespa
 Each candidate element has an explicit zero-based index and is an independent record. Never infer that
 one text element is attached to the preceding or following text element merely because they are adjacent
 in the JSON array. For bounded peer cards, use row-major order: top-left, top-right, then the next row.
+First count the visible card grid as ROWS top-to-bottom and COLUMNS left-to-right; do not transpose those
+counts. A standalone text element whose first line is a visible card title is the expected representation
+of that card, not an ordering error. Ignore duplicated representation between text elements and an
+immutable table element; table/text deduplication is outside this audit.
+Fail a text-card assignment only when an exact subordinate line from candidate element index N is visibly
+inside a differently titled bounded card. Cite both the candidate's card title and the destination card
+title. Do not propose moving a correctly anchored card title merely because one of its bullets is missing.
 When failing a candidate, cite the affected element as exactly "candidate element index N", quote a short
 candidate snippet, and name the visible card that contains the line. An order failure must cite at least
 two candidate indexes and their visible row/column positions. When uncertain or unable to provide this
@@ -83,10 +90,27 @@ Rules:
 - Use the IMAGE as truth. The PDF text layer is noisy support only.
 - Change only content fields of elements whose type is text.
 - Keep every heading, table, figure, footnote, caption, description, and their order byte-for-byte unchanged.
+- Ignore any review claim about duplication between text and an immutable table; this repair only moves
+  text between bounded peer cards.
+- When a text element's first non-bullet line exactly matches its visible card title, keep that title as the
+  element's anchor. Move only subordinate lines or bullets that visibly belong under another anchored title.
 - Preserve exactly the same visible character inventory across all text elements: move existing lines or
   bullets between text elements, but do not add, remove, rewrite, summarize, or duplicate any character.
 - Assign each line to the card or panel whose visible border contains it and keep row-wise panel order.
 - Output no markdown fences or commentary."""
+
+
+SEGMENT_ASSIGN_SYSTEM = """You assign immutable text segments to visibly bounded peer cards.
+Return ONLY one valid JSON object:
+{"assignments": [{"segment_id": "e1s1", "candidate_index": 1}]}
+
+Rules:
+- Use the image as truth and the supplied card-title anchors as destinations.
+- Assign every supplied segment_id exactly once to one supplied candidate_index.
+- A segment belongs to the card whose visible border contains that exact line or bullet.
+- Do not assign or rewrite card titles. Do not edit segment text. Do not discuss tables.
+- Count rows top-to-bottom and columns left-to-right; preserve row-major card order.
+- Output no extra keys, prose, or markdown."""
 
 
 def _normalized_inventory(data: dict) -> Counter:
@@ -135,6 +159,124 @@ def _atomic_text_segments(content: object) -> list[tuple[tuple[str, ...], str]]:
         if source:
             segments.append((signature, source))
     return segments
+
+
+def _card_segment_spec(data: dict) -> dict | None:
+    """Select one unambiguous run of independently titled peer-card texts."""
+    elements = data.get("elements") or []
+    runs = []
+    current = []
+    for index, element in enumerate(elements):
+        if isinstance(element, dict) and element.get("type") == "text":
+            current.append((index, element))
+            continue
+        if current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+
+    eligible = []
+    for run in runs:
+        if not (4 <= len(run) <= 12):
+            continue
+        parsed = [
+            (index, _atomic_text_segments(element.get("content")))
+            for index, element in run
+        ]
+        if any(not segments for _, segments in parsed):
+            continue
+        titles = [segments[0][0] for _, segments in parsed]
+        if any(not title for title in titles) or len(set(titles)) != len(titles):
+            continue
+        if sum(len(segments) > 1 for _, segments in parsed) * 2 < len(parsed):
+            continue
+
+        anchors = []
+        segments = []
+        source_order = 0
+        for index, parts in parsed:
+            anchors.append(
+                {
+                    "candidate_index": index,
+                    "title": parts[0][1],
+                }
+            )
+            for segment_index, (_, source) in enumerate(parts[1:], 1):
+                segments.append(
+                    {
+                        "segment_id": f"e{index}s{segment_index}",
+                        "source_index": index,
+                        "source_order": source_order,
+                        "text": source,
+                    }
+                )
+                source_order += 1
+        if len(segments) >= 2:
+            eligible.append({"anchors": anchors, "segments": segments})
+    return eligible[0] if len(eligible) == 1 else None
+
+
+def _segment_assignment_user_prompt(spec: dict) -> str:
+    public = {
+        "card_title_anchors": spec["anchors"],
+        "immutable_segments": [
+            {"segment_id": item["segment_id"], "text": item["text"]}
+            for item in spec["segments"]
+        ],
+    }
+    return (
+        "Map every immutable segment to the bounded card that visibly contains "
+        "it. Candidate indexes refer only to the supplied title anchors.\n\n"
+        f"<assignment_input>{json.dumps(public, ensure_ascii=False)}</assignment_input>"
+    )
+
+
+def _apply_card_segment_assignment(
+    original: dict, spec: dict, response: object
+) -> dict | None:
+    if not isinstance(response, dict) or not isinstance(
+        response.get("assignments"), list
+    ):
+        return None
+    expected = {item["segment_id"]: item for item in spec["segments"]}
+    destinations = {item["candidate_index"] for item in spec["anchors"]}
+    assignments = {}
+    for item in response["assignments"]:
+        if not isinstance(item, dict):
+            return None
+        segment_id = item.get("segment_id")
+        destination = item.get("candidate_index")
+        if (
+            type(segment_id) is not str
+            or type(destination) is not int
+            or segment_id not in expected
+            or destination not in destinations
+            or segment_id in assignments
+        ):
+            return None
+        assignments[segment_id] = destination
+    if set(assignments) != set(expected):
+        return None
+
+    candidate = copy.deepcopy(original)
+    by_destination = defaultdict(list)
+    for segment_id, destination in assignments.items():
+        by_destination[destination].append(expected[segment_id])
+    for anchor in spec["anchors"]:
+        destination = anchor["candidate_index"]
+        parts = [anchor["title"]]
+        parts.extend(
+            item["text"]
+            for item in sorted(
+                by_destination[destination], key=lambda value: value["source_order"]
+            )
+        )
+        candidate["elements"][destination]["content"] = "\n".join(parts)
+    merged = _merge_reassignment(original, candidate)
+    if merged is None or not _changed_text_indexes(original, merged):
+        return None
+    return merged
 
 
 def _normalized_word_inventory(data: dict) -> Counter:
@@ -222,6 +364,20 @@ def _public_candidate(data: dict) -> dict:
             if isinstance(element, dict)
         ],
     }
+
+
+def _repair_user_prompt(public: str, raw_text: str) -> str:
+    """Keep an unreliable initial review from steering the constrained repair."""
+    return (
+        "An initial visual checker found a possible card-assignment error, but its "
+        "explanation may contain out-of-scope claims. Re-evaluate the image "
+        "independently under the system rules. Ignore claims about standalone "
+        "elements, table/text duplication, or transposed row/column counts. Move "
+        "only exact subordinate lines that visibly belong under another anchored "
+        "card title.\n\n"
+        f"Candidate:\n<candidate>{public}</candidate>\n\n"
+        f"Noisy PDF text layer:\n<raw_text>{raw_text[:16000]}</raw_text>"
+    )
 
 
 def _response_json(client, model: str, image_path: Path, system: str, user: str, max_tokens: int):
@@ -553,29 +709,53 @@ def repair_layout_consistency(
             raw_text = text_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             raw_text = ""
-        repair_user = (
-            f"Visual QA failure: {json.dumps(verdict, ensure_ascii=False)}\n\n"
-            f"Candidate:\n<candidate>{public}</candidate>\n\n"
-            f"Noisy PDF text layer:\n<raw_text>{raw_text[:16000]}</raw_text>"
-        )
-        try:
-            repaired = _response_json(
-                client,
-                model,
-                image_path,
-                REPAIR_SYSTEM,
-                repair_user,
-                LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
-            )
-        except Exception as exc:
-            record["error"] = f"repair request failed: {type(exc).__name__}: {exc}"
-            results.append(record)
-            continue
-        if not isinstance(repaired, dict):
-            record["error"] = "repair returned invalid JSON"
-            results.append(record)
-            continue
-        repaired = _merge_reassignment(original, repaired)
+        repaired = None
+        segment_spec = _card_segment_spec(original)
+        if segment_spec is not None:
+            try:
+                assignment = _response_json(
+                    client,
+                    model,
+                    image_path,
+                    SEGMENT_ASSIGN_SYSTEM,
+                    _segment_assignment_user_prompt(segment_spec),
+                    LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
+                )
+            except Exception as exc:
+                record["segment_assignment_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                repaired = _apply_card_segment_assignment(
+                    original, segment_spec, assignment
+                )
+                if repaired is not None:
+                    record["repair_mode"] = "immutable_segment_assignment"
+
+        if repaired is None:
+            repair_user = _repair_user_prompt(public, raw_text)
+            try:
+                generated = _response_json(
+                    client,
+                    model,
+                    image_path,
+                    REPAIR_SYSTEM,
+                    repair_user,
+                    LAYOUT_CONSISTENCY_REPAIR_MAX_TOKENS,
+                )
+            except Exception as exc:
+                record["error"] = (
+                    f"repair request failed: {type(exc).__name__}: {exc}"
+                )
+                results.append(record)
+                continue
+            if not isinstance(generated, dict):
+                record["error"] = "repair returned invalid JSON"
+                results.append(record)
+                continue
+            repaired = _merge_reassignment(original, generated)
+            if repaired is not None:
+                record["repair_mode"] = "full_text_reassignment"
         if repaired is None:
             record["error"] = "repair was not a text-only inventory-preserving reassignment"
             results.append(record)
